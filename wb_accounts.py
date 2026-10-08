@@ -239,6 +239,36 @@ CN_REALM_MARKERS = ("copilot.tencent.com", "codebuddy.cn", "workbuddy.cn")
 INTL_REALM_MARKERS = ("workbuddy.ai", "codebuddy.ai")
 REALM_MARKERS = {"cn": CN_REALM_MARKERS, "intl": INTL_REALM_MARKERS}
 
+#: 上游用一个远超任何真实计费周期的抵扣截止时间表示「不会过期」。实测
+#: （2026-10-08，31 行真实包数据）Free Plan Subscription 与个人体验版的
+#: DeductionEndTime 落在 2034/2035 年，而真实包周期是 14 天或 1 个月。超过
+#: 这个天数就按「不过期」处理，不再参与到期倒计时与临期判定。
+EXPIRY_SENTINEL_DAYS = 730
+
+
+def deduction_end_text(acc):
+    """包的「抵扣截止时间」——积分到这个点就不能再抵扣，即作废时刻。
+
+    取上游的 DeductionEndTime（epoch 毫秒）。上游没给就返回空串，调用方
+    回退到 CycleEndTime。实测 Bonus Pack / 裂变包 / 体验版的 CycleEndTime
+    与 DeductionEndTime 完全一致，但免费包/体验版这类包的 CycleEndTime 只是
+    每月的计费周期边界，两者能差 8 年——所以到期要认这个字段。
+    """
+    raw = acc.get("DeductionEndTime")
+    if raw in (None, "", 0, "0"):
+        return ""
+    try:
+        stamp = float(raw)
+    except (TypeError, ValueError):
+        return ""
+    if stamp > 1e11:
+        stamp /= 1000.0
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp))
+    except (OSError, ValueError):
+        return ""
+
+
 def realm_evidence(token, domain=None):
     """从 token / 域名里看区域，看不出返回 None（不要瞎猜成 intl）。
 
@@ -465,6 +495,12 @@ class Account(object):
         # what makes the upstream start sending nagging SMS). Resolved from the
         # global setting by AccountPool.apply_reserve_credits(); 0 disables it.
         self.reserve_credits = 0
+        # Expiring-credits preference: while this account's soonest-expiring
+        # credit package is inside this many days, the pool hands the account
+        # out before accounts whose credits lapse later, so credits about to
+        # be written off get spent first. Resolved from the global setting by
+        # AccountPool.apply_expiring_window(); 0 disables the preference.
+        self.expiring_window_days = 0
         # Daily token guard: an account that already burned this many tokens
         # today stops being handed out, so a client that would burn the rest
         # of the day's quota rotates to another account instead of hitting
@@ -500,6 +536,12 @@ class Account(object):
         # minted token can be overwritten by a stale snapshot.
         self._refresh_lock = threading.Lock()
         self._save_lock = threading.Lock()
+        # Guards fetch_credits(). The background refresher and the sign-in /
+        # daily-activity tasks all call it, and two overlapping fetches would
+        # each spend an upstream billing call and then race to publish the
+        # result. Separate from _refresh_lock (token refresh) and _save_lock
+        # (file write) so the three never nest into each other.
+        self._credits_lock = threading.Lock()
         # The dashboard snapshots this state while request threads update it.
         # Keep it separate from _refresh_lock, which spans network requests.
         self._throttle_lock = threading.Lock()
@@ -661,6 +703,62 @@ class Account(object):
         except (TypeError, ValueError):
             return False
         return remain <= reserve
+
+    def soonest_expiring_days(self):
+        """Days until the earliest credit package that still has credits left.
+
+        None when nothing can be said: no credit data, no package with a
+        usable remainder, or an end date the upstream never gave.
+
+        Packages the upstream never really expires are skipped. The enterprise
+        quota resets its allowance rather than voiding it, and the free plan /
+        trial packs carry a deduction deadline years out, so both are marked
+        `no_expiry` where they are built. Treating either as an expiry would
+        make those accounts look permanently "about to lapse" - the free plan
+        would even look urgent at every month end, when its billing cycle rolls
+        over but its credits keep working.
+        """
+        credits = self.credits
+        if not isinstance(credits, dict):
+            return None
+        soonest = None
+        for package in (credits.get("packages") or []):
+            if not isinstance(package, dict):
+                continue
+            # `no_expiry` is the general rule; the package_code check is a
+            # belt-and-braces guard for credit blobs written before the flag
+            # existed, which are still on disk until the next refresh.
+            if package.get("no_expiry"):
+                continue
+            if package.get("package_code") == "enterprise":
+                continue
+            if package.get("is_expired"):
+                continue
+            days = package.get("days_left")
+            remain = package.get("remain")
+            if not isinstance(days, (int, float)) or days < 0:
+                continue
+            if not isinstance(remain, (int, float)) or remain <= 0:
+                continue
+            if soonest is None or days < soonest:
+                soonest = float(days)
+        return soonest
+
+    def in_expiring_window(self):
+        """True when this account should jump the dispatch queue.
+
+        Unknown or missing credit data is never a preference: an account the
+        gateway cannot judge keeps its plain round-robin turn instead of being
+        pushed to the front on a guess.
+        """
+        try:
+            window = int(self.expiring_window_days or 0)
+        except (TypeError, ValueError):
+            window = 0
+        if window <= 0:
+            return False
+        soonest = self.soonest_expiring_days()
+        return soonest is not None and soonest <= window
 
     def daily_limit_blocked(self):
         """True when today's counted usage has reached the configured limit.
@@ -1182,15 +1280,23 @@ class Account(object):
                 create_time = str(raw_create)
 
         end_time_str = acc.get("CycleEndTime") or acc.get("ExpiredTime") or ""
+        # 到期认「抵扣截止时间」而不是「周期结束时间」：周期结束只是计费周期
+        # 的边界，积分未必跟着作废。免费包/体验版这两个字段能差 8 年，只认
+        # CycleEndTime 会让这类账号每到月底都被误判成「即将到期」。
+        expire_time_str = deduction_end_text(acc) or end_time_str
         days_left = None
         is_expired = False
-        if end_time_str:
+        no_expiry = False
+        if expire_time_str:
             try:
-                clean_time = end_time_str.replace("T", " ")[:19]
+                clean_time = expire_time_str.replace("T", " ")[:19]
                 end_ts = time.mktime(time.strptime(clean_time, "%Y-%m-%d %H:%M:%S"))
                 diff_sec = end_ts - time.time()
-                days_left = round(diff_sec / 86400.0, 1)
-                is_expired = diff_sec < 0
+                if diff_sec > EXPIRY_SENTINEL_DAYS * 86400.0:
+                    no_expiry = True
+                else:
+                    days_left = round(diff_sec / 86400.0, 1)
+                    is_expired = diff_sec < 0
             except Exception:
                 pass
 
@@ -1215,6 +1321,8 @@ class Account(object):
             "auto_renew": bool(acc.get("AutoRenewFlag") or acc.get("SupportAutoRenew")),
             "cycle_start_time": acc.get("CycleStartTime") or "",
             "cycle_end_time": end_time_str,
+            "expire_time": expire_time_str,
+            "no_expiry": no_expiry,
             "days_left": days_left,
             "is_expired": is_expired,
             "status": acc.get("Status", 0),
@@ -1460,16 +1568,12 @@ class Account(object):
 
         cycle_start = str(data.get("cycleStartTime") or "")
         cycle_end = str(data.get("cycleEndTime") or data.get("cycleResetTime") or "")
+        # 企业额度按周期重置（额度回满），不是到期作废：cycleEndTime 到期后
+        # 额度是回满而不是清零。所以它不参与到期倒计时——把它算成「即将到期」
+        # 会让企业账号永远落在临期窗口里。
         days_left = None
         is_expired = False
-        if cycle_end:
-            try:
-                clean = cycle_end.replace("T", " ")[:19]
-                end_ts = time.mktime(time.strptime(clean, "%Y-%m-%d %H:%M:%S"))
-                days_left = round((end_ts - time.time()) / 86400.0, 1)
-                is_expired = (end_ts - time.time()) < 0
-            except Exception:
-                pass
+        no_expiry = True
 
         package = {
             "name": "企业额度" if size else "企业周期额度",
@@ -1488,6 +1592,8 @@ class Account(object):
             "auto_renew": True,
             "cycle_start_time": cycle_start,
             "cycle_end_time": cycle_end,
+            "expire_time": "",
+            "no_expiry": no_expiry,
             "days_left": days_left,
             "is_expired": is_expired,
             "status": 0,
@@ -1501,13 +1607,7 @@ class Account(object):
             "is_paid_user": True,
             "is_enterprise": True,
             "checkin": None,
-            "earliest_expiring": ({
-                "name": package["name"],
-                "package_code": "enterprise",
-                "remain": remain,
-                "cycle_end_time": cycle_end,
-                "days_left": days_left,
-            } if cycle_end else None),
+            "earliest_expiring": None,
             "packages": [package] if size > 0 else [],
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1518,11 +1618,18 @@ class Account(object):
 
     def fetch_credits(self):
         """Refresh the balance; a refresh that shows credits again also lifts
-        an early 402 park (revive_balance_cooldown)."""
-        res = self._fetch_credits_raw()
-        if isinstance(res, dict) and res.get("ok"):
-            self.revive_balance_cooldown()
-        return res
+        an early 402 park (revive_balance_cooldown).
+
+        Serialised per account: the background refresher and the sign-in /
+        daily-activity tasks all land here, and without the lock two
+        overlapping calls would each spend an upstream billing request and
+        then race to publish whichever answer came back second.
+        """
+        with self._credits_lock:
+            res = self._fetch_credits_raw()
+            if isinstance(res, dict) and res.get("ok"):
+                self.revive_balance_cooldown()
+            return res
 
     def _fetch_credits_raw(self):
         if self.realm == "cn":
@@ -1737,6 +1844,144 @@ def _realm_limit(values, realm):
         return 0
 
 
+class CreditsRefresher(threading.Thread):
+    """Keep account credit balances fresh, off the request path.
+
+    The dispatch preference reads `account.credits`, which only the sign-in and
+    daily-activity tasks used to refresh: an account could go days without an
+    update, and a restart inherited whatever balance was on disk. Every tick
+    this refreshes the single stalest account that is past the TTL, so the
+    upstream billing calls stay bounded - one per tick - and land spread across
+    the pool instead of arriving as a burst. A failed account is parked for six
+    hours so a broken credential cannot be retried on every tick.
+
+    The request volume is capped by the tick, not by the pool size: at the
+    default half-hour tick that is at most 48 billing calls a day however many
+    accounts there are. With a 12-hour TTL a 28-account pool wants 56 calls a
+    day, so the tick - not the TTL - is the binding limit and the effective
+    refresh age settles a little above the TTL. That is the intended trade:
+    the preference is measured in days, so a few extra hours of drift is worth
+    far less than the calls it saves.
+    """
+
+    def __init__(self, pool, interval_seconds=1800):
+        super().__init__(daemon=True, name="credits-refresher")
+        self.pool = pool
+        self.interval_seconds = max(60.0, float(interval_seconds))
+        self.last_run = None
+        self.last_uid = None
+        self.last_error = None
+        self.logs = []
+        self._stop_event = threading.Event()
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+        self._parked = {}          # uid -> epoch until which we skip it
+        self._failed_cooldown = 6 * 3600.0
+
+    def log(self, msg):
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.logs.append("[%s] %s" % (stamp, msg))
+        if len(self.logs) > 40:
+            self.logs = self.logs[-40:]
+
+    def stop(self):
+        self._stop_event.set()
+        self._wake.set()
+
+    def wake(self):
+        self._wake.set()
+
+    def ttl_seconds(self):
+        """The current TTL in seconds - the one place the unit is applied."""
+        try:
+            import wb_settings
+            hours = wb_settings.credits_refresh_hours(self.pool.dir)
+        except Exception:
+            return 0.0
+        try:
+            return max(0.0, float(hours)) * 3600.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def stalest_account(self, ttl_seconds, now=None):
+        """The account whose balance is oldest and past the TTL, or None.
+
+        A balance that was never fetched counts as infinitely old, so a fresh
+        install fills in its accounts before any timed-out one is revisited.
+        """
+        now = time.time() if now is None else now
+        with self.pool._lock:
+            accounts = list(self.pool.accounts)
+        chosen = None
+        chosen_age = None
+        for account in accounts:
+            if not account.enabled or not account.access_token:
+                continue
+            if self._parked.get(account.uid, 0) > now:
+                continue
+            credits = account.credits
+            updated = credits.get("updated_at") if isinstance(credits, dict) else None
+            if isinstance(updated, (int, float)):
+                age = now - updated
+            else:
+                age = float("inf")
+            if age < ttl_seconds:
+                continue
+            if chosen_age is None or age > chosen_age:
+                chosen, chosen_age = account, age
+        return chosen
+
+    def refresh_once(self, now=None):
+        """Refresh one stale account; returns its uid, or None when none was due."""
+        ttl = self.ttl_seconds()
+        if ttl <= 0:
+            return None
+        with self._lock:
+            account = self.stalest_account(ttl, now=now)
+            if account is None:
+                return None
+            try:
+                result = account.fetch_credits()
+            except Exception as exc:
+                result = {"ok": False, "error": str(exc)}
+            if not isinstance(result, dict) or not result.get("ok"):
+                error = (result or {}).get("error") or "unknown error"
+                self._parked[account.uid] = \
+                    (time.time() if now is None else now) + self._failed_cooldown
+                self.last_error = str(error)
+                self.log("刷新 %s 积分失败，暂缓一小时: %s"
+                         % (account.uid[:8], error))
+                return None
+            self.last_run = time.time() if now is None else now
+            self.last_uid = account.uid
+            self.last_error = None
+            self.log("已刷新 %s 的积分（%s）"
+                     % (account.uid[:8], (account.credits or {}).get("updated_iso")))
+            return account.uid
+
+    def run(self):
+        while not self._stop_event.is_set():
+            self._wake.wait(timeout=self.interval_seconds)
+            if self._stop_event.is_set():
+                break
+            self._wake.clear()
+            try:
+                self.refresh_once()
+            except Exception as exc:
+                self.last_error = str(exc)
+                self.log("刷新循环异常: %s" % exc)
+
+    def status(self):
+        return {
+            "ttl_hours": round(self.ttl_seconds() / 3600.0, 2),
+            "interval_seconds": self.interval_seconds,
+            "last_run": self.last_run,
+            "last_uid": self.last_uid,
+            "last_error": self.last_error,
+            "logs": self.logs[-10:],
+        }
+
+
 class AccountPool(object):
     def __init__(self, directory, log=None):
         self.dir = directory
@@ -1745,6 +1990,10 @@ class AccountPool(object):
         self.logins = {}
         self._lock = threading.RLock()
         self._cursor = 0
+        # Smooth weighted round-robin state for the expiring-credits window,
+        # keyed by uid (see _weighted_pick). Runtime-only: a restart just
+        # restarts the rotation.
+        self._expiry_weights = {}
         self.affinity = SessionAffinity()
 
     def load(self):
@@ -1763,6 +2012,7 @@ class AccountPool(object):
                 if account.uid:
                     self.accounts.append(account)
             self.apply_reserve_credits()
+            self.apply_expiring_window()
             return self.accounts
 
     def list_public(self, realm=None):
@@ -1798,6 +2048,7 @@ class AccountPool(object):
             account.save(self.dir)
             self.apply_proxy_slots()
             self.apply_reserve_credits()
+            self.apply_expiring_window()
             return account
 
     def remove(self, uid):
@@ -1939,6 +2190,24 @@ class AccountPool(object):
         with self._lock:
             for account in self.accounts:
                 account.reserve_credits = _realm_limit(values, account.realm)
+        return values
+
+    def apply_expiring_window(self, values=None):
+        """Re-resolve the expiring-credits window for every account.
+
+        Same shape as apply_reserve_credits(): settings.json holds the window
+        per realm (global by default) and each account reads its own, so the
+        request path needs no extra settings lookup. The window is a dispatch
+        preference, not a guard: it never makes an account unavailable, it
+        only decides who is handed out first.
+        """
+        import wb_settings
+
+        if values is None:
+            values = wb_settings.limit_values(self.dir, "expiring_window_days")
+        with self._lock:
+            for account in self.accounts:
+                account.expiring_window_days = _realm_limit(values, account.realm)
         return values
 
     def apply_daily_token_limit(self, values=None, usage=None):
@@ -2099,15 +2368,104 @@ class AccountPool(object):
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if not snapshot:
+            return None
+        # Expiring-credits preference: accounts whose soonest-expiring credit
+        # package is inside the window are served first, so credits about to
+        # lapse get spent. It only reorders who is offered; an account the
+        # window covers is still skipped when it is cooling down, over a daily
+        # limit, or excluded. When the window covers nobody - or everyone it
+        # covers is unavailable right now - the pool falls back to the plain
+        # round-robin it always had, so a single lapsed account can never wedge
+        # the realm.
+        account = self._pick_expiring_first(snapshot, exclude, model)
+        if account is not None:
+            return account
+        return self._rotate_pick(snapshot, exclude, model)
+
+    def _pick_expiring_first(self, snapshot, exclude, model):
+        """Serve the in-window accounts first, or None when none can.
+
+        Within the window the pick is a weighted round-robin: an account's
+        share grows the closer its credits are to lapsing, but no account is
+        ever handed the whole window. A strict soonest-first order would put
+        every request on the one account expiring tomorrow until the upstream
+        rate-limited it, which is exactly the burst this spreads out; weighting
+        keeps the preference while giving the accounts expiring later a real
+        share. Accounts that lapse on the same day carry the same weight, so
+        they keep taking turns.
+        """
+        urgent = [a for a in snapshot if a.in_expiring_window()]
+        if not urgent:
+            return None
+        ready = [a for a in urgent if a.uid not in exclude and a.ready(model=model)]
+        if not ready:
+            return None
+        return self._weighted_pick(ready)
+
+    def _expiry_weight(self, account):
+        """How much of the window's traffic this account should take.
+
+        Linear in how close the credits are to lapsing, floored at 1 so an
+        account at the far edge of the window still gets served rather than
+        starved until the others run dry.
+        """
+        try:
+            window = int(account.expiring_window_days or 0)
+        except (TypeError, ValueError):
+            window = 0
+        days = account.soonest_expiring_days()
+        if days is None:
+            return 1
+        return max(1, int(round(window - days)) + 1)
+
+    def _weighted_pick(self, ready):
+        """Smooth weighted round-robin over the ready accounts.
+
+        nginx's algorithm: every account accrues its weight each pick, the
+        largest running total wins, and the winner pays back the whole round's
+        weight. Equal weights degenerate to a plain rotation, so the
+        same-day-expiry accounts keep alternating.
+
+        The rotation state is shared by every request thread, so the
+        read-modify-write runs under the pool lock. The `ready()` checks that
+        feed this do NOT: those can reach the network (a token refresh), and
+        holding the lock across one expiring credential would serialise every
+        dispatch in the realm behind it.
+        """
+        ready_uids = set(a.uid for a in ready)
+        weights = [(account, self._expiry_weight(account)) for account in ready]
+        with self._lock:
+            state = dict((uid, value) for uid, value in self._expiry_weights.items()
+                         if uid in ready_uids)
+            total = 0
+            chosen = None
+            for account, weight in weights:
+                state[account.uid] = state.get(account.uid, 0) + weight
+                total += weight
+                if chosen is None or state[account.uid] > state[chosen.uid]:
+                    chosen = account
+            if chosen is None:
+                return None
+            state[chosen.uid] -= total
+            self._expiry_weights = state
+        return chosen
+
+    def _rotate_pick(self, group, exclude, model):
+        """Round-robin one group of accounts, advancing the shared cursor."""
+        total = len(group)
+        if total == 0:
+            return None
+        with self._lock:
             start = self._cursor
-        total = len(snapshot)
-        if total == 0: return None
         for offset in range(total):
             index = (start + offset) % total
-            account = snapshot[index]
-            if account.uid in exclude: continue
+            account = group[index]
+            if account.uid in exclude:
+                continue
             if account.ready(model=model):
-                with self._lock: self._cursor = (index + 1) % total
+                with self._lock:
+                    self._cursor = (index + 1) % total
                 return account
         return None
 

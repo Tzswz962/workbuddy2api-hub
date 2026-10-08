@@ -7,15 +7,25 @@
 动作（执行/旅行/签到）都会先清掉它——这条用测试钉住，别哪天又退化成"点完执行看到的
 还是旧状态"。
 """
+import atexit
 import os
 import sys
+import tempfile
 import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-os.environ.setdefault("ACCOUNTS_DIR", os.path.join(ROOT, "tests", "_acc_test"))
-os.environ.setdefault("USAGE_DIR", os.path.join(ROOT, "tests", "_use_test"))
+# Its own directories, removed when this process exits. This suite used to share
+# tests/_acc_test and tests/_use_test with _test_daily_chat.py and
+# _test_sanitize_fingerprint.py, which made them unsafe to run at the same time
+# and left directories in the repo after a run.
+_TMP = tempfile.TemporaryDirectory(prefix="wb-tasks-cache-")
+atexit.register(_TMP.cleanup)
+os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP.name, "accounts")
+os.environ["WB_PROXY_USAGE_DIR"] = os.path.join(_TMP.name, "usage")
+os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
+os.makedirs(os.environ["WB_PROXY_USAGE_DIR"], exist_ok=True)
 
 import wb_proxy as P        # noqa: E402
 import wb_tasks as T        # noqa: E402

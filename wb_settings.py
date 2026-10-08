@@ -30,6 +30,16 @@ LEGACY_PRICING_REFRESH_HOURS_KEY = "pricing_refresh_hours"
 PRICING_REFRESH_MINUTES_KEY = "pricing_refresh_minutes"
 # A month, the old cap converted: 720 hours = 43200 minutes.
 MAX_PRICING_REFRESH_MINUTES = 24 * 30 * 60
+# How stale an account's credit balance may get before the background
+# refresher updates it, in hours. Only the sign-in / daily-activity tasks used
+# to refresh balances, so a dispatch decision could rest on a balance days old.
+# 12 hours is deliberately slack: the preference is measured in days, so half a
+# day of drift moves an account by at most half a day inside a 7-day window,
+# and the wider TTL keeps the refresher from spending upstream billing calls it
+# does not need.
+DEFAULT_CREDITS_REFRESH_HOURS = 12.0
+MAX_CREDITS_REFRESH_HOURS = 24 * 30
+CREDITS_REFRESH_HOURS_KEY = "credits_refresh_hours"
 # Whether a model name may inherit its price from a suffix-stripped base
 # (deepseek-r1-0528-lkeap → deepseek-r1-0528). Missing key reads as on.
 PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
@@ -334,22 +344,57 @@ def api_keys(accounts_dir, include_deleted=False):
     return []
 
 
-def set_api_keys(accounts_dir, keys):
-    """Replace the whole key list. Returns the saved (live) list.
+def _retired_key_entry(old):
+    """The soft-deleted form of a stored key: name and dates kept, secret gone."""
+    return {
+        "id": old["id"],
+        "name": old["name"],
+        "key": "",
+        "realm": old.get("realm") or "",
+        "models": old.get("models") or [],
+        "enabled": False,
+        "created_at": old.get("created_at") or "",
+        "deleted_at": old.get("deleted_at") or time.strftime("%Y/%m/%d %H:%M"),
+    }
 
-    Removal is a soft delete. The caller is the panel, which can only submit
-    the rows it can see and cannot see deleted ones, so an id that vanishes
-    from the submission is marked deleted instead of dropped: the usage log
-    attributes spend by id, and losing the id would dump a key's whole history
-    into "(未知 key)". The secret is wiped at that same moment, so a deleted
-    key can never authenticate again.
+
+def set_api_keys(accounts_dir, keys, delete_ids=None):
+    """Save the key list. Returns the saved (live) list.
+
+    Removal is a soft delete: the usage log attributes spend by id, so losing
+    an id would dump a key's whole history into "(未知 key)", and the secret is
+    wiped at the same moment so a deleted key can never authenticate again.
+
+    Two modes decide which stored keys get soft-deleted:
+
+    - `delete_ids is None`: replace semantics. Any stored key absent from
+      `keys` is retired. This is what an older panel relies on - it deletes a
+      row by leaving it out of the submission - so it stays the default.
+    - `delete_ids` is a list: upsert semantics. Only those ids are retired; a
+      stored key the submission does not mention is left untouched. The panel
+      uses this because its submission is whatever its in-memory rows happen
+      to be, and a list that is stale or incomplete (a second browser tab, a
+      save that raced the post-save reload, a reload that failed) must not
+      retire a key the user never removed.
     """
     with _lock:
         previous = api_keys(accounts_dir, include_deleted=True)
+        upsert = delete_ids is not None
+        drop = {str(entry_id) for entry_id in (delete_ids or [])}
+        # Upsert mode: a stored live secret, so a submitted row that lost its id
+        # (a stale panel resubmitting a key it already saved) can adopt the
+        # stored id and update that key in place instead of minting a new one
+        # and splitting its usage history in two.
+        live_secret_id = {}
+        if upsert:
+            for old in previous:
+                if old["key"] and not old.get("deleted_at"):
+                    live_secret_id.setdefault(old["key"], old["id"])
         cleaned = []
         seen = set()
         seen_ids = set()
         for raw in keys or []:
+            raw_id = str((raw or {}).get("id") or "").strip() if isinstance(raw, dict) else ""
             entry = _clean_key_entry(raw)
             if entry is None:
                 continue
@@ -357,6 +402,8 @@ def set_api_keys(accounts_dir, keys):
                 if entry["key"] in seen:
                     continue
                 seen.add(entry["key"])
+            if upsert and entry["key"] and raw_id not in live_secret_id.values():
+                entry["id"] = live_secret_id.get(entry["key"], entry["id"])
             entry["id"] = _unique_key_id(entry["id"], seen_ids)
             seen_ids.add(entry["id"])
             cleaned.append(entry)
@@ -364,16 +411,21 @@ def set_api_keys(accounts_dir, keys):
             if old["id"] in seen_ids:
                 continue
             seen_ids.add(old["id"])
-            cleaned.append({
-                "id": old["id"],
-                "name": old["name"],
-                "key": "",
-                "realm": old.get("realm") or "",
-                "models": old.get("models") or [],
-                "enabled": False,
-                "created_at": old.get("created_at") or "",
-                "deleted_at": old.get("deleted_at") or time.strftime("%Y/%m/%d %H:%M"),
-            })
+            # Upsert mode keeps a stored key the submission never mentioned.
+            # An already-deleted row is kept too: it is read-only history.
+            if upsert and old["id"] not in drop:
+                # A submitted row may already carry this exact secret (the
+                # stale submission re-sent it under a fresh id). Two live rows
+                # with one secret is the duplicate this mode exists to avoid,
+                # so the stale stored copy is retired instead.
+                if old["key"] and old["key"] in seen:
+                    cleaned.append(_retired_key_entry(old))
+                    continue
+                if old["key"]:
+                    seen.add(old["key"])
+                cleaned.append(old)
+                continue
+            cleaned.append(_retired_key_entry(old))
         data = load(accounts_dir)
         data["api_keys"] = cleaned
         # The single-key fields are now derived; drop them so there is one
@@ -434,15 +486,29 @@ def set_auth_disabled(accounts_dir, disabled):
 # global value, so an install that never touches it behaves exactly as before,
 # and one that does only ever has to reason about a single number per guard.
 LIMIT_KEYS = ("reserve_credits", "daily_token_limit",
-              "daily_credit_limit", "model_daily_token_limit")
+              "daily_credit_limit", "model_daily_token_limit",
+              "expiring_window_days")
 LIMIT_REALMS = ("intl", "cn")
 LIMIT_SCOPES = ("global",) + LIMIT_REALMS
 LIMITS_KEY = "limits"
 
+# Guards whose global default is not "off". Every key still reads 0 as off;
+# only the expiring-credits window ships enabled, because 0 would make the
+# preference a silent no-op until someone turned it on by hand.
+LIMIT_DEFAULTS = {"expiring_window_days": 7}
 
-def _empty_limit_entry():
+
+def _default_global(key):
+    """The global value an install reads before it ever saves one."""
+    try:
+        return max(0, int(LIMIT_DEFAULTS.get(key, 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _empty_limit_entry(key=None):
     """One guard: a global default plus a slot per realm (None = inherit)."""
-    return {"global": 0, "intl": None, "cn": None}
+    return {"global": _default_global(key), "intl": None, "cn": None}
 
 
 def _coerce_global(value):
@@ -477,7 +543,7 @@ def _fold_legacy_limits(data):
     limits = {}
     changed = False
     for key in LIMIT_KEYS:
-        entry = _empty_limit_entry()
+        entry = _empty_limit_entry(key)
         if key in data:
             entry["global"] = _coerce_global(data.pop(key))
             changed = True
@@ -493,8 +559,14 @@ def _normalize_limits(raw):
         entry = raw.get(key)
         if not isinstance(entry, dict):
             entry = {}
+        global_raw = entry.get("global")
+        # A missing global falls back to that guard's own default (0 for every
+        # guard but the expiring window); an explicit 0 is a real "off" and is
+        # kept as one, so a saved "off" never silently comes back on.
+        global_value = (_default_global(key) if global_raw is None
+                        else _coerce_global(global_raw))
         limits[key] = {
-            "global": _coerce_global(entry.get("global")),
+            "global": global_value,
             "intl": _coerce_override(entry.get("intl")),
             "cn": _coerce_override(entry.get("cn")),
         }
@@ -648,6 +720,58 @@ def model_daily_token_limit(accounts_dir, realm=None):
 def set_model_daily_token_limit(accounts_dir, value):
     """Persist the per-model daily token threshold. Returns the stored value."""
     return set_limit(accounts_dir, "model_daily_token_limit", "global", value)["global"]
+
+
+def expiring_window_days(accounts_dir, realm=None):
+    """Window, in days, inside which an account's soonest-expiring credit
+    package makes the pool hand that account out first, so credits about to
+    lapse are spent before they are lost.
+
+    Zero disables the preference and dispatch falls back to a plain
+    round-robin; the shipped default is 7 days.
+    """
+    return limit_value(accounts_dir, "expiring_window_days", realm)
+
+
+def set_expiring_window_days(accounts_dir, value):
+    """Persist the window. Returns the stored value."""
+    return set_limit(accounts_dir, "expiring_window_days", "global", value)["global"]
+
+
+def credits_refresh_hours(accounts_dir):
+    """How stale a credit balance may get before the background refresher
+    updates it, in hours.
+
+    The dispatch preference reads the balance, and only the sign-in and
+    daily-activity tasks used to refresh it, so an account could be judged on a
+    balance days old - or on whatever was on disk when the process started.
+    Zero disables the refresher. Anything not a number falls back to the
+    default, so a hand-edited settings.json cannot wedge the loop.
+    """
+    with _lock:
+        data = load(accounts_dir)
+        raw = data.get(CREDITS_REFRESH_HOURS_KEY)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CREDITS_REFRESH_HOURS
+    if value < 0:
+        return DEFAULT_CREDITS_REFRESH_HOURS
+    return min(value, MAX_CREDITS_REFRESH_HOURS)
+
+
+def set_credits_refresh_hours(accounts_dir, value):
+    """Persist the refresh TTL. Returns the stored value."""
+    try:
+        hours = float(value)
+    except (TypeError, ValueError):
+        hours = 0.0
+    hours = max(0.0, min(MAX_CREDITS_REFRESH_HOURS, hours))
+    with _lock:
+        data = load(accounts_dir)
+        data[CREDITS_REFRESH_HOURS_KEY] = hours
+        save(accounts_dir, data)
+    return hours
 
 
 def _clamp_refresh_minutes(value):

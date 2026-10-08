@@ -1210,7 +1210,12 @@ def _cached_switch(cache, lock, reader, accounts_dir, default):
             return default
         try:
             settings = wb_settings.settings_path(path)
-            key = (settings, os.path.getmtime(settings), os.path.getsize(settings))
+            # 一次 stat 同时取 mtime 和 size：请求路径上每一行都要问一次这个
+            # 开关，getmtime + getsize 是两次系统调用。缓存键与原来完全一致
+            # （getmtime/getsize 就是 st_mtime/st_size），所以外部改设置仍然
+            # 当场可见——这个开关不能有 TTL。
+            info = os.stat(settings)
+            key = (settings, info.st_mtime, info.st_size)
         except OSError:
             key = (path, None, None)
         with lock:
@@ -1498,11 +1503,47 @@ def save_runtime_override(model, or_id):
     return data
 
 
+# 仪表盘聚合整份 usage 日志时，每一行都要问一次「策略表 / 时间线文件变了
+# 吗」，一次询问就是一次 stat——路由器上这是这趟扫描最大的一项开销。答案按
+# 路径缓存一个很短的 TTL：本进程之外写下的变更最迟 _FILE_KEY_TTL 秒内一定
+# 被看见（一次聚合里 stat 从每行数次降到每秒一次），而本进程自己的写入立刻
+# 作废缓存（见 _forget_file_key），所以「刚记完价的那一行」一行都不等。
+_FILE_KEY_TTL = 1.0
+_file_key_cache = {}
+_file_key_lock = threading.Lock()
+
+
+def _forget_file_key(path):
+    """作废一个本进程刚写过的文件的 stat 缓存。
+
+    写入方在写完之后立刻调用，把「自己写的变更」从 TTL 里摘出来：策略表在
+    取价后的下一行就要能被读到，不能等满一个 TTL。
+    """
+    with _file_key_lock:
+        _file_key_cache.pop(path, None)
+
+
 def _file_key(path):
+    """(path, mtime, size)，按路径缓存 TTL；取不到时 None。"""
+    now = time.monotonic()
+    with _file_key_lock:
+        hit = _file_key_cache.get(path)
+        if hit is not None and hit[0] > now:
+            return hit[1]
     try:
-        return (path, os.path.getmtime(path), os.path.getsize(path))
+        # 一次 stat 同时取 mtime 和 size，比 getmtime + getsize 少一次系统调用。
+        info = os.stat(path)
+        key = (path, info.st_mtime, info.st_size)
     except OSError:
-        return None
+        key = None
+    with _file_key_lock:
+        if len(_file_key_cache) > 32:
+            # 正常进程里只有数据目录下那两三个文件；这里只为「路径会换」的场合
+            # 兜底（换过数据目录、测试里每个用例一个临时目录）。清掉只会让下
+            # 一次多 stat 一次，正确性不受任何驱逐策略影响。
+            _file_key_cache.clear()
+        _file_key_cache[path] = (now + _FILE_KEY_TTL, key)
+    return key
 
 
 def _read_jsonl(path):
@@ -1893,6 +1934,7 @@ def record_policies(doc, at=None, merge=False):
                 for row in fresh:
                     fh.write(json.dumps(row, ensure_ascii=False) + "\n")
             _policies_cache.update({"key": None, "data": None})
+            _forget_file_key(path)
         changed = False
         if assignment and assignment != previous:
             path = timeline_path()
@@ -1901,6 +1943,7 @@ def record_policies(doc, at=None, merge=False):
                 fh.write(json.dumps({"at": stamp, "policies": assignment},
                                     ensure_ascii=False) + "\n")
             _timeline_cache.update({"key": None, "data": None})
+            _forget_file_key(path)
             changed = True
     return len(fresh), changed, assignment
 
@@ -1958,7 +2001,27 @@ def prune_policies(protect=()):
                     fh.write(json.dumps(policy, ensure_ascii=False) + "\n")
         os.replace(tmp, path)
         _policies_cache.update({"key": None, "data": None})
+        _forget_file_key(path)
     return removed
+
+
+# load_timeline() 对同一份文件内容交回的是同一个列表对象，所以「是不是同一份
+# 时间线」直接用对象身份判断即可。policy_ref_at 每行都要二分一次，而每行把整条
+# 时间线的 at 重新取一遍再转 float 是白花的（现场 46 行 × 每行一次，实测是聚合
+# 里可观的一块）；时刻列随列表一起缓存，改文件后 load_timeline 交回新对象，
+# 这里自然重算。
+_timeline_ats_cache = {"rows": None, "ats": None}
+
+
+def _timeline_ats(timeline):
+    """这条时间线的时刻列，随它自己的对象缓存一次。"""
+    cached = _timeline_ats_cache
+    if cached["rows"] is timeline:
+        return cached["ats"]
+    ats = [_as_float(r.get("at")) for r in timeline]
+    with _policy_lock:
+        _timeline_ats_cache.update({"rows": timeline, "ats": ats})
+    return ats
 
 
 def policy_ref_at(epoch_sec, model):
@@ -1975,7 +2038,7 @@ def policy_ref_at(epoch_sec, model):
     if not timeline:
         return None, False
     stamp = _as_float(epoch_sec)
-    index = bisect.bisect_right([_as_float(r.get("at")) for r in timeline], stamp) - 1
+    index = bisect.bisect_right(_timeline_ats(timeline), stamp) - 1
     if index < 0:
         index = 0
     rows = timeline[index].get("policies") or {}

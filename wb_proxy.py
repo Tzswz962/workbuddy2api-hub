@@ -1293,8 +1293,12 @@ _count_lock = threading.Lock()
 _COUNT_TTL = float(os.environ.get("WB_COUNT_TTL", 30))
 
 
+_series_cache = {}
+_series_lock = threading.Lock()
+
+
 def usage_timeseries(realm=None, range=None, since=None, until=None,
-                     bucket_seconds=None):
+                     bucket_seconds=None, ttl=None):
     """Bucketed token/credit series for the analytics chart.
 
     Bucket size auto-scales with the window: minute (<=6h), hour (<=14d),
@@ -1302,9 +1306,23 @@ def usage_timeseries(realm=None, range=None, since=None, until=None,
     requests contribute tokens; every non-client-aborted row contributes
     credit (money already spent). The most recent credited requests ride
     along so the panel can show a credit history without another endpoint.
+
+    Cached wrapper: the Token chart polls this endpoint whenever the metrics
+    tab is open, and one uncached call re-reads and re-parses the whole log.
+    Same shared TTL as its siblings, and the rebuild runs under the lock so a
+    burst of pollers cannot each start their own scan.
     """
+    ttl = _STATS_TTL if ttl is None else ttl
     r = realm_scope(realm, CURRENT_REALM)
     lo, hi = range_window(range, since, until)
+    # Which bounds the caller pinned, captured before the fallbacks below fill
+    # the rest in. Only a pinned bound may enter the cache key as a value:
+    # "now" (and the 24h-before-now default lo) is recomputed on every call,
+    # so a key holding it could never be reused while the panel polls the same
+    # chart, and the cache would buy nothing. The "auto" sentinel keeps the two
+    # kinds of bound apart, so a rolling window is never served a pinned
+    # window's series.
+    pinned_lo, pinned_hi = lo, hi
     if hi is None:
         hi = time.time()
     if lo is None:
@@ -1318,6 +1336,70 @@ def usage_timeseries(realm=None, range=None, since=None, until=None,
         step = 3600
     else:
         step = 86400
+    now = time.time()
+    with _series_lock:
+        # Bounds, not a range flag: this week and this month overlap, so a flag
+        # would let one window serve the other's series from the cache. The
+        # bucket step joins the key for the same reason: an explicit bucket
+        # changes every bucket's width, and the auto-scaled one flips with the
+        # span, so two different steps are two different payloads.
+        key = (r or "all",
+               pinned_lo if pinned_lo is not None else "auto",
+               pinned_hi if pinned_hi is not None else "auto",
+               step)
+        hit = _series_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
+        data = _usage_timeseries_uncached(r, lo, hi, step)
+        _series_cache[key] = (time.time(), data)
+    return data
+
+
+# Every row this process writes starts with `{"at": <float>,` - record_usage
+# and record_error put the timestamp first and json.dumps keeps that order -
+# which is what makes the window pre-filter below possible.
+_AT_PREFIX = '{"at": '
+
+
+def _line_outside_window(line, lo, hi):
+    """True when this log line's `at` is provably outside [lo, hi].
+
+    The scan uses it to drop out-of-window lines without paying for
+    json.loads, which is what made a cold pass over the log expensive. False
+    means "parse it as before" - both for lines that match the shape and fall
+    inside the window, and for anything the check cannot read exactly:
+
+    * another key order or a hand-edited line: no leading `{"at": `, or no
+      comma to end the value;
+    * an integer token: json.loads would hand back an int, and int/float
+      comparison stays exact where float(token) rounds once the value passes
+      2**53 (a float token round-trips through float() exactly, which is why
+      those are the only ones accepted);
+    * a later `"at"` key: json.loads keeps the last duplicate, so the first
+      value read here would be the wrong one. Escaped quotes inside string
+      values (\\") cannot produce a false `"at"`, so this check only ever
+      costs a parse - and it runs only for lines that would be skipped, so a
+      line the scan is going to parse anyway never pays for it.
+    """
+    if not line.startswith(_AT_PREFIX):
+        return False
+    end = line.find(",", len(_AT_PREFIX))
+    if end < 0:
+        return False
+    token = line[len(_AT_PREFIX):end]
+    if "." not in token and "e" not in token and "E" not in token:
+        return False
+    try:
+        at = float(token)
+    except ValueError:
+        return False
+    if not (at < lo or at > hi):
+        return False
+    return line.find('"at"', end) < 0
+
+
+def _usage_timeseries_uncached(realm, lo, hi, step):
+    """One uncached pass over the log, folding rows into fixed-width buckets."""
     buckets = {}
     credits = []
     try:
@@ -1326,11 +1408,19 @@ def usage_timeseries(realm=None, range=None, since=None, until=None,
                 line = line.strip()
                 if not line:
                     continue
+                # Cheap window test first: a day or week window covers a small
+                # slice of a multi-day log, and the json.loads this skips is
+                # what made a cold scan expensive. A line the check cannot read
+                # exactly falls through to the full parse and the full test
+                # below, so a skipped row is always one the parse would have
+                # skipped as well - same output, fewer parses.
+                if _line_outside_window(line, lo, hi):
+                    continue
                 try:
                     row = json.loads(line)
                 except Exception:
                     continue
-                if r and not row_matches_realm(row, r):
+                if realm and not row_matches_realm(row, realm):
                     continue
                 at = row.get("at") or 0
                 if at < lo or at > hi:
@@ -1368,7 +1458,7 @@ def usage_timeseries(realm=None, range=None, since=None, until=None,
         log("usage timeseries read failed: %s" % exc)
     credits.sort(key=lambda item: item.get("at") or 0, reverse=True)
     return {
-        "ok": True, "realm": r or "all", "bucket_seconds": step,
+        "ok": True, "realm": realm or "all", "bucket_seconds": step,
         "since": lo, "until": hi,
         "series": [buckets[key] for key in sorted(buckets)],
         "credits": credits[:50],
@@ -1537,6 +1627,7 @@ def recent_usage(limit=100, realm=None, page=1):
 POOL = None
 SCHEDULER = None
 PRICING = None
+CREDITS_REFRESHER = None
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
 def realm_state_file():
     """Path of the persisted realm switch.
@@ -2252,6 +2343,7 @@ def runtime_settings_view():
         "daily_credit_limit": wb_settings.daily_credit_limit(ACCOUNTS_DIR),
         "model_daily_token_limit": wb_settings.model_daily_token_limit(ACCOUNTS_DIR),
         "pricing_refresh_minutes": wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR),
+        "credits_refresh_hours": wb_settings.credits_refresh_hours(ACCOUNTS_DIR),
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
@@ -2262,7 +2354,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.6.16",
+        "version": "1.6.17",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -2490,6 +2582,25 @@ INTL_UI_ORDER = [
     "kimi-k2.6",
     "kimi-k2.8-preview",
 ]
+def merge_reasoning(base, live):
+    """Field-level merge of one model's reasoning block.
+
+    The live catalogue is the source of truth, but it does not always restate
+    every field: the desktop endpoint sometimes gives a bare `effort` where the
+    bundled table knows the level is selectable. A top-level update would drop
+    `supportedEfforts`, and an `effort` without it reads as a pin - the model
+    then looks unselectable in /v1/models and every request to it is reported at
+    the wrong level. So the two blocks are merged field by field, and a block
+    that ends up with `supportedEfforts` is selectable: its `effort` is the
+    default restated, not a pin.
+    """
+    out = dict(base) if isinstance(base, dict) else {}
+    if isinstance(live, dict):
+        out.update(live)
+    if out.get("supportedEfforts") and out.get("effort"):
+        out.setdefault("defaultEffort", out["effort"])
+        out.pop("effort", None)
+    return out
 def merge_catalog(primary, realm=None, extras=False):
     r = realm or CURRENT_REALM
     merged = {}
@@ -2511,7 +2622,10 @@ def merge_catalog(primary, realm=None, extras=False):
             continue
         if meta:
             base = merged.get(mid) or {}
+            base_reasoning = base.get("reasoning")
             base.update(meta)
+            if isinstance(meta.get("reasoning"), dict):
+                base["reasoning"] = merge_reasoning(base_reasoning, meta["reasoning"])
             merged[mid] = base
         elif mid not in merged:
             merged[mid] = {}
@@ -2542,12 +2656,23 @@ def note_bundled_reasoning(realm, live, entries):
 
     The live catalogue is the source of truth and the snapshot is only the
     fallback, so values the snapshot alone carries can be no fresher than the
-    snapshot. One line per change is enough to notice that.
+    snapshot. Two shapes put them there: a model the live catalogue gives no
+    reasoning block at all, and one it gives a bare `effort` for where the
+    snapshot knows the level is selectable. One line per change is enough.
     """
     live_meta = dict(live or [])
-    missing = sorted(mid for mid, meta in entries
-                     if (meta.get("reasoning") or {})
-                     and not ((live_meta.get(mid) or {}).get("reasoning")))
+
+    def from_snapshot(mid, meta):
+        reasoning = meta.get("reasoning") or {}
+        if not reasoning:
+            return False
+        live_reasoning = (live_meta.get(mid) or {}).get("reasoning") or {}
+        if not live_reasoning:
+            return True
+        return bool(reasoning.get("supportedEfforts")) \
+            and not live_reasoning.get("supportedEfforts")
+
+    missing = sorted(mid for mid, meta in entries if from_snapshot(mid, meta))
     if not missing:
         _catalog_fallback_log.pop(realm, None)
         return
@@ -2555,8 +2680,8 @@ def note_bundled_reasoning(realm, live, entries):
         return
     _catalog_fallback_log[realm] = frozenset(missing)
     shown = ", ".join(missing[:6]) + (" ..." if len(missing) > 6 else "")
-    log("catalog    : no reasoning block in the live catalogue for %d model(s); "
-        "using the bundled table: %s" % (len(missing), shown))
+    log("catalog    : bundled table fills in reasoning controls the live "
+        "catalogue omits for %d model(s): %s" % (len(missing), shown))
 def fetch_models(realm=None):
     r = realm or CURRENT_REALM
     with _lock:
@@ -4078,9 +4203,14 @@ def model_fixed_effort(model):
     reasoning.effort without supportedEfforts means the model always runs at
     that level: /v1/models advertises it as reasoning_fixed_effort and the
     picker offers no choice for it, so an effort the request carries anyway does
-    not change what ran.
+    not change what ran. A model that declares supportedEfforts is selectable
+    whatever else its block carries - an `effort` beside it is the default, not
+    a pin.
     """
-    effort = model_reasoning_meta(model).get("effort")
+    reasoning = model_reasoning_meta(model)
+    if reasoning.get("supportedEfforts"):
+        return None
+    effort = reasoning.get("effort")
     return effort.strip() if isinstance(effort, str) and effort.strip() else None
 
 
@@ -5955,15 +6085,24 @@ def messages_to_chat(payload):
         system = (system + "\n" + note) if system else note
     if system:
         messages.append({"role": "system", "content": system})
-    for item in messages_in:
+    for index, item in enumerate(messages_in):
         if not isinstance(item, dict):
             continue
         role = _anthropic_text(item.get("role")).strip() or "user"
+        content = item.get("content")
+        if role in ("system", "developer"):
+            # Claude Code >= 2.1.286 turns on Anthropic's mid-conversation
+            # system beta and carries system messages inside `messages`. The
+            # upstream knows the system role, so keep the message where the
+            # client put it rather than failing the whole request.
+            text = _anthropic_system_text(content) or _anthropic_content_to_text(content)
+            if text:
+                messages.append({"role": "system", "content": text})
+            continue
         if role not in ("user", "assistant"):
             raise ValueError(
-                "messages[].role must be user or assistant; "
-                "pass a system prompt in the top-level system field")
-        content = item.get("content")
+                "messages[%d].role %r must be user or assistant; "
+                "pass a system prompt in the top-level system field" % (index, role))
         if isinstance(content, str):
             messages.append({"role": role, "content": content})
         elif isinstance(content, list):
@@ -6921,7 +7060,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.6.16"
+    server_version = "wb-proxy/1.6.17"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -7853,12 +7992,20 @@ class Handler(BaseHTTPRequestHandler):
             # The panel only ever shows a masked key, so a blank value means
             # "keep what is stored" for that row rather than "clear it".
             existing = {entry.get("id"): entry for entry in configured_keys()}
+            # A submission that carries an explicit delete list is an upsert:
+            # only the ids it names are retired. That is what stops a stale or
+            # incomplete list (a second tab, a save racing the post-save
+            # reload) from wiping a key the user never removed. An older panel
+            # sends no such field and keeps the replace-by-omission contract.
+            delete_ids = payload.get("deleted_api_key_ids")
+            upsert = isinstance(delete_ids, list)
             cleaned = []
             for item in raw:
                 if not isinstance(item, dict):
                     return self._error(400, "each api key must be an object",
                                        "invalid_request_error")
                 entry_id = str(item.get("id") or "").strip()
+                stored = existing.get(entry_id) or {}
                 value = str(item.get("key") or "").strip()
                 if not value and entry_id and entry_id in existing:
                     value = existing[entry_id].get("key") or ""
@@ -7872,7 +8019,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not value:
                     return self._error(400, "a key entry is empty - fill it in or remove the row",
                                        "invalid_request_error")
-                realm = str(item.get("realm") or "").strip().lower()
+                # A field the submission omits keeps whatever is stored, the
+                # same rule `models` already follows: an older or partial
+                # client must not silently clear a key's exit binding, its
+                # name, or its disabled state.
+                if "realm" in item:
+                    realm = str(item.get("realm") or "").strip().lower()
+                else:
+                    realm = str(stored.get("realm") or "").strip().lower()
                 if realm not in ("", "intl", "cn"):
                     return self._error(400, "realm must be intl, cn or empty",
                                        "invalid_request_error")
@@ -7882,18 +8036,29 @@ class Handler(BaseHTTPRequestHandler):
                 if "models" in item:
                     models = item.get("models")
                 else:
-                    models = existing.get(entry_id, {}).get("models")
-                created_at = item.get("created_at") or (existing.get(entry_id, {}).get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
+                    models = stored.get("models")
+                if "name" in item:
+                    name = str(item.get("name") or "").strip()
+                else:
+                    name = str(stored.get("name") or "").strip()
+                if "enabled" in item:
+                    enabled = item.get("enabled", True) is not False
+                else:
+                    enabled = stored.get("enabled", True) is not False
+                created_at = item.get("created_at") or (stored.get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
-                    "name": str(item.get("name") or "").strip(),
+                    "name": name,
                     "key": value,
                     "realm": realm,
                     "models": models,
-                    "enabled": item.get("enabled", True) is not False,
+                    "enabled": enabled,
                     "created_at": created_at,
                 })
-            wb_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
+            wb_settings.set_api_keys(
+                ACCOUNTS_DIR, cleaned,
+                delete_ids=(delete_ids if upsert else None),
+            )
             reply["api_keys_saved"] = len(cleaned)
         if "auth_disabled" in payload:
             wb_settings.set_auth_disabled(ACCOUNTS_DIR, payload.get("auth_disabled"))
@@ -7964,6 +8129,8 @@ class Handler(BaseHTTPRequestHandler):
                 apply_daily_credit_limit(refresh=True)
             if "model_daily_token_limit" in touched:
                 apply_model_daily_token_limit(refresh=True)
+            if "expiring_window_days" in touched and POOL:
+                POOL.apply_expiring_window()
 
         if "pricing_enabled" in payload:
             raw = payload.get("pricing_enabled")
@@ -7999,6 +8166,25 @@ class Handler(BaseHTTPRequestHandler):
                 # A running wait picks the new interval up on the spot.
                 PRICING.set_interval(stored)
             reply["pricing_refresh_minutes"] = stored
+        if "credits_refresh_hours" in payload:
+            # How stale a credit balance may get before the background refresher
+            # updates it. Zero turns the refresher off.
+            raw = payload.get("credits_refresh_hours")
+            if isinstance(raw, bool) or raw is None:
+                return self._error(400, "credits_refresh_hours must be a number",
+                                   "invalid_request_error")
+            try:
+                hours = float(raw)
+            except (TypeError, ValueError):
+                return self._error(400, "credits_refresh_hours must be a number",
+                                   "invalid_request_error")
+            if hours < 0:
+                return self._error(400, "credits_refresh_hours cannot be negative",
+                                   "invalid_request_error")
+            reply["credits_refresh_hours"] = \
+                wb_settings.set_credits_refresh_hours(ACCOUNTS_DIR, hours)
+            if CREDITS_REFRESHER:
+                CREDITS_REFRESHER.wake()
         if "pricing_variant_inherit" in payload:
             # Strictly a JSON boolean, like the other switches: "false" as a
             # string would be truthy and silently keep the feature on.
@@ -9639,6 +9825,12 @@ def _bootstrap_runtime(args):
     PRICING = wb_pricing.PriceRefresher(
         wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR))
     PRICING.start()
+    # Credit balances back the expiring-credits dispatch preference, and only
+    # the sign-in / daily-activity tasks used to refresh them. The refresher
+    # keeps them current in the background so no request pays for a lookup.
+    global CREDITS_REFRESHER
+    CREDITS_REFRESHER = wb_accounts.CreditsRefresher(POOL)
+    CREDITS_REFRESHER.start()
     return api_key_generated
 
 def _report_first_run(args):

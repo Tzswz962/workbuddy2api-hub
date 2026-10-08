@@ -14,11 +14,18 @@ client parsed no call, asked again, and the model repeated itself forever.
 
 These tests pin the outbound shape so the deletion cannot come back.
 """
-import json, os, sys
+import atexit, json, os, sys, tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("ACCOUNTS_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_acc"))
-os.environ.setdefault("USAGE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "_use"))
+# Its own directories, removed when this process exits. This suite used to share
+# tests/_acc and tests/_use with _test_custom_tools.py, which made the two unsafe
+# to run at the same time and left directories in the repo after a run.
+_TMP = tempfile.TemporaryDirectory(prefix="wb-tool-choice-")
+atexit.register(_TMP.cleanup)
+os.environ["ACCOUNTS_DIR"] = os.path.join(_TMP.name, "accounts")
+os.environ["WB_PROXY_USAGE_DIR"] = os.path.join(_TMP.name, "usage")
+os.makedirs(os.environ["ACCOUNTS_DIR"], exist_ok=True)
+os.makedirs(os.environ["WB_PROXY_USAGE_DIR"], exist_ok=True)
 
 import wb_proxy as P
 

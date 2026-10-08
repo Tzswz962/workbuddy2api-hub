@@ -59,7 +59,7 @@ main{padding:24px 24px 60px;max-width:1280px;margin:0 auto}
 .card.accent .v{color:var(--accent)}
 .card.accent2 .v{color:var(--accent2)}
 .card.err .v{color:var(--bad)}
-#cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:20px}
+#cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:20px}
 #cards .card{padding:14px 18px;min-width:0;border-radius:12px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow);display:flex;flex-direction:column;justify-content:space-between;min-height:92px}
 #cards .card .k{font-size:12px;color:var(--dim);margin-bottom:8px;font-weight:600;letter-spacing:.2px}
 #cards .card .v{font-size:22px;font-weight:700;letter-spacing:-.3px;color:var(--fg);display:flex;align-items:baseline}
@@ -77,6 +77,10 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:right;padding:9px 12px;border-bottom:1px solid var(--line);
   font-variant-numeric:tabular-nums;vertical-align:middle}
 th{color:var(--dim);font-weight:600;font-size:12px;white-space:nowrap;background:var(--panel2)}
+/* 积分扣减历史：外层容器自己纵向滚动，表头不钉住的话滑到下面就看不出哪列是哪列。
+   表头本来就有 --panel2 底色（不透明），加 sticky 即可盖住滚上来的行。 */
+#creditHistoryTable thead th{position:sticky;top:0;z-index:2;
+  box-shadow:inset 0 -1px 0 var(--line)}
 th:first-child{border-top-left-radius:8px;border-bottom-left-radius:8px}
 th:last-child{border-top-right-radius:8px;border-bottom-right-radius:8px}
 th:first-child,td:first-child{text-align:left}
@@ -337,12 +341,7 @@ a:hover{text-decoration:underline}
 /* 页面级两栏：左侧区块导航由 initPageNav() 依据页面内的 section 现场生成，
    这里的样式只描述外观，既不预设任何页面，也不预设任何区块。给页面加
    .page-nav-on 即可启用，区块不足两项的页面不加这个类，保持单栏。 */
-.main-page.page-nav-on.active{display:grid;grid-template-columns:196px minmax(0,1fr);gap:20px;align-items:start}
-.main-page.page-nav-on > *{grid-column:2;min-width:0}
-.main-page.page-nav-on > .page-sidebar{grid-column:1;grid-row:1 / -1;position:sticky;
-  top:var(--page-nav-top,84px);z-index:6;background:var(--panel);border:1px solid var(--line);
-  border-radius:14px;padding:10px;box-shadow:var(--shadow);
-  max-height:calc(100vh - var(--page-nav-top,84px) - 20px);overflow:auto}
+.page-sidebar{display:none!important}
 .page-sidebar-title{font-size:11px;font-weight:700;color:var(--dim);text-transform:uppercase;
   letter-spacing:.6px;padding:6px 10px 8px}
 .page-nav{display:flex;flex-direction:column;gap:2px}
@@ -815,6 +814,7 @@ a:hover{text-decoration:underline}
     '刷新': 'Refresh',
     '刷新中...': 'Refreshing...',
     '刷新凭证': 'Refresh token',
+    '一键刷新凭证': 'Refresh all tokens',
     '刷新失败:': 'Refresh failed:',
     '刷新完成:': 'Refresh finished:',
     '刷新明细': 'Refresh details',
@@ -1154,6 +1154,14 @@ a:hover{text-decoration:underline}
     '每日活跃:': 'Daily activity:',
     '每日活跃打卡 (国际版)': 'Daily activity check-in (Global)',
     '每日积分限额': 'Daily credit limit',
+    '临期积分优先': 'Expiring credits first',
+    '账号最早到期的积分包进入该天数窗口时，分派优先使用这些账号，避免快到期的积分被浪费；窗口内按到期先后使用，同一天到期的账号之间仍轮询。填 0 表示关闭。': 'When an account\'s soonest-expiring credit package falls inside this many days, dispatch prefers those accounts so credits about to lapse are not wasted. Inside the window the earliest expiry is used first; accounts expiring on the same day still take turns. 0 turns it off.',
+    '启用临期优先': 'Enable expiring-credits first',
+    '已开启临期积分优先': 'Expiring-credits priority on',
+    '已关闭临期积分优先': 'Expiring-credits priority off',
+    '积分数据刷新间隔（小时）': 'Credit refresh interval (hours)',
+    '已保存积分数据刷新间隔': 'Credit refresh interval saved',
+    '积分数据刷新间隔请填 0 或正整数（0 = 关闭后台刷新）': 'Credit refresh interval must be 0 or a positive integer (0 turns the background refresh off)',
     '每日签到 (国内版)': 'Daily check-in (China)',
     '每日签到:': 'Daily check-in:',
     '每账号每日上限（token）': 'Daily cap per account (tokens)',
@@ -1740,7 +1748,7 @@ a:hover{text-decoration:underline}
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:8px">
         <div style="display:flex;align-items:baseline;gap:6px">
           <span id="tabIntlCredits" style="font-size:22px;font-weight:700;color:var(--accent2);letter-spacing:-.5px">0</span>
-          <span style="font-size:12px;color:var(--dim)">剩余积分 · <b id="tabIntlAccts" style="color:var(--fg)">0</b> 账号</span>
+          <span style="font-size:12px;color:var(--dim)">剩余积分 · <span id="tabIntlAccts" style="color:var(--fg);font-weight:600">0/0 可用</span></span>
         </div>
         <span id="tabIntlKeyBadge" class="badge s mini" style="font-weight:600">0 个 Key</span>
       </div>
@@ -1759,7 +1767,7 @@ a:hover{text-decoration:underline}
       <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:8px">
         <div style="display:flex;align-items:baseline;gap:6px">
           <span id="tabCnCredits" style="font-size:22px;font-weight:700;color:var(--accent2);letter-spacing:-.5px">0</span>
-          <span style="font-size:12px;color:var(--dim)">剩余积分 · <b id="tabCnAccts" style="color:var(--fg)">0</b> 账号</span>
+          <span style="font-size:12px;color:var(--dim)">剩余积分 · <span id="tabCnAccts" style="color:var(--fg);font-weight:600">0/0 可用</span></span>
         </div>
         <span id="tabCnKeyBadge" class="badge warn mini" style="font-weight:600">0 个 Key</span>
       </div>
@@ -1812,6 +1820,7 @@ a:hover{text-decoration:underline}
     <button class="sec" onclick="exportAccounts(this)">导出账号</button>
     <button class="sec" onclick="openImport()">导入账号</button>
     <button class="sec" onclick="fetchCredits(this)">刷新积分</button>
+    <button class="sec" onclick="refreshAccounts(this)" title="逐个刷新所有账号的上游访问凭证（相当于对每个账号点一次「刷新凭证」）">一键刷新凭证</button>
     <button class="sec" onclick="autoAssignSlots()" title="把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响">分配代理出口给未绑定账号</button>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
@@ -2159,7 +2168,7 @@ a:hover{text-decoration:underline}
         <div>
           <h2 style="margin:0">限额 <em id="setLimitsState"></em></h2>
           <div style="font-size:12px;color:var(--dim);margin-top:4px">
-            四条护栏默认按<b>全局默认</b>生效，同时作用于<b>国际版</b>与<b>国内版</b>；需要时可单独给某一版本设值，留空即<b>继承全局</b>。每条护栏填 0 表示关闭该项。
+            五条护栏默认按<b>全局默认</b>生效，同时作用于<b>国际版</b>与<b>国内版</b>；需要时可单独给某一版本设值，留空即<b>继承全局</b>。每条护栏填 0 表示关闭该项。
           </div>
         </div>
         <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -2226,6 +2235,28 @@ a:hover{text-decoration:underline}
               <td data-label="全局默认"><input id="limitGlobalModelDailyToken" class="limit-input" type="number" min="0" step="1000000" value="0"></td>
               <td class="limit-realm-col" style="display:none" data-label="国际版"><input id="limitIntlModelDailyToken" class="limit-input" type="number" min="0" step="1000000" placeholder="继承全局"></td>
               <td class="limit-realm-col" style="display:none" data-label="国内版"><input id="limitCnModelDailyToken" class="limit-input" type="number" min="0" step="1000000" placeholder="继承全局"></td>
+            </tr>
+            <tr>
+              <td class="limit-name">
+                <div style="font-weight:600;color:var(--fg)">临期积分优先 <em id="setExpiringWindowState"></em></div>
+                <div style="font-size:12px;color:var(--dim);margin-top:2px">
+                  账号最早到期的积分包进入该天数窗口时，分派优先使用这些账号，避免快到期的积分被浪费；窗口内按到期先后使用，同一天到期的账号之间仍轮询。填 0 表示关闭。
+                </div>
+                <label class="switch" style="margin-top:8px">
+                  <input id="setExpiringWindowToggle" type="checkbox" onchange="toggleExpiringWindow(this)">
+                  <span class="switch-track"></span>
+                  <span style="font-size:12px">启用临期优先</span>
+                </label>
+                <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+                  <span style="font-size:12px;color:var(--dim)">积分数据刷新间隔（小时）</span>
+                  <input id="setCreditsRefreshHours" type="number" min="0" step="1" value="12"
+                         style="width:90px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;color:var(--fg);font:inherit">
+                  <button class="sec" onclick="saveCreditsRefreshHours(this)">保存</button>
+                </div>
+              </td>
+              <td data-label="全局默认"><input id="limitGlobalExpiringWindow" class="limit-input" type="number" min="0" step="1" value="7"></td>
+              <td class="limit-realm-col" style="display:none" data-label="国际版"><input id="limitIntlExpiringWindow" class="limit-input" type="number" min="0" step="1" placeholder="继承全局"></td>
+              <td class="limit-realm-col" style="display:none" data-label="国内版"><input id="limitCnExpiringWindow" class="limit-input" type="number" min="0" step="1" placeholder="继承全局"></td>
             </tr>
           </tbody>
         </table>
@@ -2772,15 +2803,19 @@ function updateUI(){
   let cnCred = 0, hasCnCred = false;
   cnAccts.forEach(a => { if(a.credits && a.credits.remain != null){ cnCred += a.credits.remain; hasCnCred = true; } });
 
+  const isAcctActive = a => a.enabled && !a.reserveBlocked && !a.dailyLimitBlocked && !a.creditLimitReached;
+  const intlActive = intlAccts.filter(isAcctActive).length;
+  const cnActive = cnAccts.filter(isAcctActive).length;
+
   const elIntlCred = document.getElementById("tabIntlCredits");
   if(elIntlCred) elIntlCred.textContent = hasIntlCred ? fmt(intlCred) : "—";
   const elIntlAcct = document.getElementById("tabIntlAccts");
-  if(elIntlAcct) elIntlAcct.textContent = intlAccts.length;
+  if(elIntlAcct) elIntlAcct.innerHTML = '<b style="color:var(--accent)">' + intlActive + '</b>/' + intlAccts.length + ' 可用';
 
   const elCnCred = document.getElementById("tabCnCredits");
   if(elCnCred) elCnCred.textContent = hasCnCred ? fmt(cnCred) : "—";
   const elCnAcct = document.getElementById("tabCnAccts");
-  if(elCnAcct) elCnAcct.textContent = cnAccts.length;
+  if(elCnAcct) elCnAcct.innerHTML = '<b style="color:var(--accent)">' + cnActive + '</b>/' + cnAccts.length + ' 可用';
 };
 
 async function switchViewRealm(r){
@@ -3839,6 +3874,8 @@ async function loadAccounts(){
     await loadProxySlots();
     renderAccounts();
     updateUI();
+    // 昵称刚到位，补画一次积分扣减历史：它和本请求是并行的，先渲染的那次只有 uid。
+    if(LAST_CREDIT_DATA) renderCreditHistory();
     // Auto-fetch credits once if not present
     if(window.ACCOUNTS.length && window.ACCOUNTS.some(a => !a.credits)){
       postJSON('/accounts/credits', {}).then(r => {
@@ -3945,12 +3982,23 @@ async function testAccount(uid, btn){
     if(btn){ btn.disabled = false; btn.textContent = '测试'; }
   }
 }
-async function refreshAccounts(){
-  try{ const r = await postJSON('/accounts/refresh', {});
-       const okc = (r.results||[]).filter(x=>x.ok).length;
-       toast('刷新完成: ' + okc + '/' + (r.results||[]).length);
-       await loadAccounts(); }
-  catch(e){ toast(e.message); }
+async function refreshAccounts(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }
+  try{
+    const r = await postJSON('/accounts/refresh', {});
+    const results = r.results || [];
+    const okc = results.filter(x=>x.ok).length;
+    const bad = results.filter(x=>!x.ok);
+    toast('刷新完成: ' + okc + '/' + results.length, bad.length ? 'warn' : 'ok');
+    if(bad.length){
+      toast('刷新失败: ' + (bad[0].error || '未知错误') + ' (' + bad.length + ')', 'bad');
+    }
+    await loadAccounts();
+  }catch(e){
+    toast('刷新失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '一键刷新凭证'; }
+  }
 }
 async function setAll(enable, btn){
   if(btn) btn.disabled = true;
@@ -4858,7 +4906,6 @@ async function refreshInner(gen){
   if(t.usd_cny) costUsdRate = Number(t.usd_cny) || costUsdRate;
 
   document.getElementById('cards').innerHTML =
-    card('可用账号池', poolHtml, '', 'accent') +
     card('网关调用量', fmt(t.requests) + ' <span style="font-size:13px;font-weight:500;color:var(--dim);margin-left:4px">次</span>', '', '') +
     card('估算价格', fmtCostBoth(t.cost_cny), '', 'warn') +
     card('请求成功率', '<span style="color:' + (perf.errors ? 'var(--warn)' : 'var(--accent2)') + '">' + succStr + '</span>', '', '');
@@ -5272,7 +5319,7 @@ function onPageNavScroll(){
   pageNavSpy();
 }
 
-function initPageNav(page){
+function initPageNav(page){ return;
   if(!page) return;
   syncPageNavOffset();
   const sections = pageNavSections(page);
@@ -5403,6 +5450,11 @@ async function loadSettings(showToast){
 
     applyLimits(data);
 
+      const creditsHoursInput = document.getElementById('setCreditsRefreshHours');
+      if(creditsHoursInput && data.credits_refresh_hours !== undefined){
+        creditsHoursInput.value = String(Number(data.credits_refresh_hours || 0));
+      }
+
       const pricingOn = data.pricing_enabled !== false;
       const pricingEnabledInput = document.getElementById('setPricingEnabled');
       if(pricingEnabledInput) pricingEnabledInput.checked = pricingOn;
@@ -5514,13 +5566,14 @@ async function savePanelPassword(btn){
 }
 
 // ---- 限额（全局默认 + 可选分版本） -------------------------------------
-// 四个护栏共用一张表：一列一个作用域。国际版/国内版留空即继承全局默认，
+// 五个护栏共用一张表：一列一个作用域。国际版/国内版留空即继承全局默认，
 // 所以“不分版本”只是“两列都留空”的一个特例，不必再另存一套开关。
 const LIMIT_FIELDS = [
   {key:'reserve_credits',         id:'Reserve',         label:'保留积分'},
   {key:'daily_token_limit',       id:'DailyToken',      label:'每日 Token 限额'},
   {key:'daily_credit_limit',      id:'DailyCredit',     label:'每日积分限额'},
   {key:'model_daily_token_limit', id:'ModelDailyToken', label:'按模型每日 Token 限额'},
+  {key:'expiring_window_days',    id:'ExpiringWindow',  label:'临期积分优先'},
 ];
 const LIMIT_SCOPES = [
   {scope:'global', prefix:'Global', label:'全局默认'},
@@ -5580,6 +5633,11 @@ function applyLimits(data){
       state.style.color = (globalValue > 0 || anyOverride) ? 'var(--accent2)' : 'var(--dim)';
     }
   }
+  const expiringToggle = document.getElementById('setExpiringWindowToggle');
+  if(expiringToggle){
+    expiringToggle.checked =
+      Number((limits.expiring_window_days || {}).global || 0) > 0;
+  }
   const toggle = document.getElementById('setLimitsPerRealm');
   if(toggle) toggle.checked = anyOverride;
   toggleLimitRealms(anyOverride);
@@ -5621,6 +5679,48 @@ async function saveLimits(btn){
   try {
     await postJSON('/settings/save', {limits: payload});
     toast('限额已保存', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+/* 临期积分优先的开关：开着等价于「窗口天数 > 0」，关掉就写 0。窗口天数本身
+   仍可在表格里单独填（例如 3 天、14 天），开关只负责一键开/关。 */
+async function toggleExpiringWindow(el){
+  const enabled = !!(el && el.checked);
+  const input = document.getElementById('limitGlobalExpiringWindow');
+  const current = Math.floor(Number(input && input.value) || 0);
+  const value = enabled ? (current > 0 ? current : 7) : 0;
+  if(input) input.value = String(value);
+  el.disabled = true;
+  try {
+    await postJSON('/settings/save', {limits:{expiring_window_days:{global:value}}});
+    toast(enabled ? '已开启临期积分优先' : '已关闭临期积分优先', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+    el.checked = !enabled;
+  } finally {
+    el.disabled = false;
+  }
+}
+
+/* 积分数据的后台刷新间隔。分派读的是账号上缓存的积分余额，只有签到/每日活跃
+   会刷新它；这里给一个 TTL，超时的账号由后台每十分钟挑最旧的一个刷一次，填 0
+   关闭后台刷新。 */
+async function saveCreditsRefreshHours(btn){
+  const input = document.getElementById('setCreditsRefreshHours');
+  const value = Number(input && input.value);
+  if(!Number.isFinite(value) || value < 0){
+    toast('积分数据刷新间隔请填 0 或正整数（0 = 关闭后台刷新）', 'warn'); return;
+  }
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {credits_refresh_hours: value});
+    toast('已保存积分数据刷新间隔', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
@@ -5880,6 +5980,12 @@ async function saveLocalWebTools(btn){
 /* ---- API key list: several keys, each bound to an upstream exit ---- */
 let API_KEY_ROWS = [];
 let DELETED_KEY_ROWS = [];
+/* Ids the user removed but that are still stored server-side, pending the
+   next save. Deletion is sent explicitly (rather than by leaving the row out
+   of the list) so a submission that is stale or incomplete - a second tab, a
+   save that raced the post-save reload - can never retire a key nobody
+   removed. */
+let DELETED_KEY_IDS = [];
 
 function randomKeyValue(){
   const bytes = new Uint8Array(18);
@@ -6077,7 +6183,7 @@ async function saveSingleKey(index, btn){
 
   if(btn) btn.disabled = true;
   try {
-    await saveApiKeys();
+    if(!await saveApiKeys()) return;
     toast('API Key [' + row.name + '] 已保存', 'ok');
   } catch(e){
     toast('保存失败: ' + e.message, 'bad');
@@ -6089,9 +6195,16 @@ async function toggleKeyRow(index){
   if(!row) return;
   row.enabled = !row.enabled;
   try {
-    await saveApiKeys();
+    if(!await saveApiKeys()){
+      // The save was rejected; put the switch back so the row does not lie.
+      row.enabled = !row.enabled;
+      renderKeyRows();
+      return;
+    }
     toast(row.enabled ? 'Key [' + row.name + '] 已启用' : 'Key [' + row.name + '] 已禁用', 'ok');
   } catch(e){
+    row.enabled = !row.enabled;
+    renderKeyRows();
     toast('操作失败: ' + e.message, 'bad');
   }
 }
@@ -6100,9 +6213,16 @@ async function removeKeyRow(index){
   const row = API_KEY_ROWS[index];
   if(!row) return;
   if(!confirm('确定删除 API Key [' + (row.name || '未命名') + '] 吗？密钥会被抹掉且无法恢复；看板里它已经产生的历史用量仍会保留这个名字。')) return;
+  if(row.id && DELETED_KEY_IDS.indexOf(row.id) === -1) DELETED_KEY_IDS.push(row.id);
   API_KEY_ROWS.splice(index, 1);
   try {
-    await saveApiKeys();
+    if(!await saveApiKeys()){
+      // The server kept the key; drop the pending delete and resync the list
+      // so the row comes back instead of lingering as a phantom.
+      DELETED_KEY_IDS = DELETED_KEY_IDS.filter(id => id !== row.id);
+      await loadSettings();
+      return;
+    }
     toast('已删除 API Key', 'ok');
   } catch(e){
     toast('删除失败: ' + e.message, 'bad');
@@ -6173,30 +6293,47 @@ async function writeClipboard(text){
   if(!ok) throw new Error('浏览器拒绝了复制操作');
 }
 
+/* Save the whole visible list, plus the ids the user explicitly removed.
+   Returns true when the server accepted the save.
+
+   The submit is an upsert: the server retires only the ids named in
+   `deleted_api_key_ids` and leaves every other stored key alone. That is what
+   keeps a stale or incomplete list from wiping keys the user never removed,
+   which is how "adding a new key" used to lose the old ones. */
 async function saveApiKeys(btn){
-  const payload = API_KEY_ROWS.map(row => ({
-    id: row.id || '',
-    name: row.name || '',
-    realm: row.realm || '',
-    models: row.models || [],
-    enabled: row.enabled !== false,
-    // Blank means "keep the stored key", which the server honours per row.
-    key: (row.key || '').trim(),
-  }));
-  const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
-  if(newRow){
+  const payload = API_KEY_ROWS
+    .filter(row => !row.id || DELETED_KEY_IDS.indexOf(row.id) === -1)
+    .map(row => ({
+      id: row.id || '',
+      name: row.name || '',
+      realm: row.realm || '',
+      models: row.models || [],
+      enabled: row.enabled !== false,
+      // Blank means "keep the stored key", which the server honours per row.
+      key: (row.key || '').trim(),
+    }));
+  if(API_KEY_ROWS.some(row => !row.masked && !row.id && !(row.key || '').trim())){
     toast('新增的行还没有填写 Key', 'warn');
-    return;
+    return false;
   }
   // Several callers save without going through a button (saveSingleKey,
   // toggleKeyRow, removeKeyRow), so a missing button must not abort the save.
   if(btn) btn.disabled = true;
   try {
-    await postJSON('/settings/save', {api_keys: payload});
+    await postJSON('/settings/save', {
+      api_keys: payload,
+      deleted_api_key_ids: DELETED_KEY_IDS.slice(),
+    });
+    DELETED_KEY_IDS = [];
     toast('已保存 ' + payload.length + ' 个 Key', 'ok');
-    loadSettings();
+    // Reload before returning: the next edit must start from the ids the
+    // server just minted, or a quick second save would resubmit the rows with
+    // empty ids and duplicate them.
+    await loadSettings();
+    return true;
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
+    return false;
   } finally {
     if(btn) btn.disabled = false;
   }
@@ -7305,14 +7442,27 @@ async function loadCreditHistory(btn){
   }
 }
 
+// 最近一次的积分扣减数据。账号昵称来自 /accounts（另一条并行请求），
+// 它比 /usage/timeseries 晚到时就先用 uid 兜底，等账号到位后再补画一次。
+let LAST_CREDIT_DATA = null;
+
+// uid -> 昵称。取不到（账号已删除/尚未加载完）就回退 uid 前 8 位，不留空。
+function creditAccountLabel(uid){
+  const id = String(uid || '');
+  if(!id) return '—';
+  const acct = (window.ACCOUNTS || []).find(a => a.uid === id);
+  return (acct && acct.nickname) || id.slice(0, 8);
+}
+
 function renderCreditHistory(data){
-  const rows = ((data && data.credits) || []).slice(0, 50);
+  if(data) LAST_CREDIT_DATA = data;
+  const rows = ((LAST_CREDIT_DATA && LAST_CREDIT_DATA.credits) || []).slice(0, 50);
   const tbody = document.querySelector('#creditHistoryTable tbody');
   if(!tbody) return;
   tbody.innerHTML = rows.map(x => '<tr>'
     + '<td>' + esc(x.iso || '') + '</td>'
     + '<td>' + esc(x.model || '') + '</td>'
-    + '<td class="mono">' + esc(String(x.account || '').slice(0,8)) + '</td>'
+    + '<td title="' + esc(x.account || '') + '">' + esc(creditAccountLabel(x.account)) + '</td>'
     + '<td>' + fmt(x.credit) + '</td>'
     + '<td>' + fmt(x.total_tokens || 0) + '</td>'
     + '</tr>').join('') || '<tr><td colspan="5" style="color:var(--dim)">没有积分扣减记录</td></tr>';
