@@ -5168,6 +5168,7 @@ async function bootPanel(){
 
 let PANEL_READY = false;
 let PANEL_TIMERS = [];
+let visHookInstalled = false;
 
 async function startDashboard(){
   if(PANEL_READY) return;
@@ -5185,15 +5186,31 @@ async function startDashboard(){
   // Polling only starts after the panel is unlocked, so a locked browser
   // never hammers the server with 401s.
   PANEL_TIMERS.forEach(t => clearInterval(t));
+  // 后台标签页不再轮询：浏览器停止绘制后台页，但定时器照跑——实测网关页在后台
+  // 仍有 50 次/分钟、统计页 110 次/分钟的请求，全是白跑的。可见性变化时下面会
+  // 补一次刷新，所以切回前台看到的数据仍是新的。
   PANEL_TIMERS = [
     setInterval(() => {
-      if(!PANEL_READY) return;
+      if(!PANEL_READY || document.hidden) return;
       if(currentMainTab === 'analytics'){ loadAnalytics(); loadAnalyticsMatrix(); }
     }, 5000),
-    setInterval(refresh, 5000),
-    setInterval(loadSchedulerStatus, 30000),
-    setInterval(loadAccounts, 15000),
+    setInterval(() => { if(!document.hidden) refresh(); }, 5000),
+    setInterval(() => { if(!document.hidden) loadSchedulerStatus(); }, 30000),
+    setInterval(() => { if(!document.hidden) loadAccounts(); }, 15000),
   ];
+  if(!visHookInstalled){
+    visHookInstalled = true;
+    // 回到前台补一次：按当前所在页刷新，复用 refresh 自身的并发合并（撞上在飞
+    // 的那一轮会排队补跑），所以不会与刚跑完的一轮重复。
+    document.addEventListener('visibilitychange', () => {
+      if(document.hidden || !PANEL_READY) return;
+      refresh();
+      loadAccounts();
+      loadSchedulerStatus();
+      if(currentMainTab === 'analytics'){ loadAnalytics(); loadAnalyticsMatrix(); }
+      if(currentMainTab === 'logs' && logAutoRefresh) fetchNewLogs(false);
+    });
+  }
 }
 
 /* ---- 页面区块导航 ----
@@ -6692,7 +6709,7 @@ let logUserScrolledUp = false;
 function startLogPolling(){
   if(logPollTimer) clearInterval(logPollTimer);
   logPollTimer = setInterval(() => {
-    if(logAutoRefresh && currentMainTab === 'logs'){
+    if(logAutoRefresh && currentMainTab === 'logs' && !document.hidden){
       fetchNewLogs(false);
     }
   }, 2000);
