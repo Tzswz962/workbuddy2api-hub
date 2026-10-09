@@ -2227,7 +2227,7 @@ def _details_for(cost, entry, meta, model):
     return out
 
 
-def cost_for_row(row):
+def cost_for_row(row, details=True, enabled=None):
     """A usage row -> {"cny", "known", "band", "source", "source_at", "backfilled"}
     外加悬停要用的价格明细（rates / unit / currency / usd_cny / or_id / via /
     inherited_from / override_from / band_note / via_derived）。
@@ -2243,13 +2243,24 @@ def cost_for_row(row):
     总开关关闭时整块功能停摆：不查策略、不查快照、不折算，直接按「未定价」
     返回并打上 disabled 标记，面板据此显示「—」；与真正没有价的模型走同一条
     路径，但汇总侧能区分「没价」和「功能关着」，不会误报未定价清单。
+
+    `details=False` 是聚合扫描（/usage 快照、指标页整表）用的：那两处每行
+    只读 `known` / `cny`（外加 disabled 标记），悬停明细构造出来就被丢掉，
+    而每行都要为此付 policy_entry + _details_for 的钱。逐行展示路径（最近
+    请求的悬停气泡）不传这个参数，明细照旧。
+
+    `enabled` 是同一件事对总开关的延伸：聚合扫描在循环外把开关问一次传进来
+    （None 表示逐行自己查，逐行路径「每行都查、改设置当场生效」的原语义不
+    变）。聚合因此看到的是扫描开始那一刻的开关值：设置改动从下一次扫描起
+    生效——整表本来就是一次快照，这与其它字段的口径一致。
     """
-    if not row or not pricing_enabled():
+    if not row or not (pricing_enabled() if enabled is None else enabled):
         cost = {"cny": 0.0, "known": False, "band": None, "source": "builtin",
                 "source_at": None, "backfilled": False}
         if row:
             cost["disabled"] = True
-        cost.update(_no_details())
+        if details:
+            cost.update(_no_details())
         return cost
     model = row.get("model")
     pid = row.get("cost_policy")
@@ -2262,7 +2273,8 @@ def cost_for_row(row):
         cost["source"] = pid
         cost["source_at"] = _as_float(policy.get("first_seen"))
         cost["backfilled"] = backfilled
-        cost.update(_details_for(cost, policy_entry(policy), policy, model))
+        if details:
+            cost.update(_details_for(cost, policy_entry(policy), policy, model))
         return cost
     doc = load_pricing()
     entry = (doc.get("models") or {}).get(model)
@@ -2270,7 +2282,8 @@ def cost_for_row(row):
     cost["source"] = "builtin"
     cost["source_at"] = None
     cost["backfilled"] = False
-    cost.update(_details_for(cost, entry, doc.get("meta"), model))
+    if details:
+        cost.update(_details_for(cost, entry, doc.get("meta"), model))
     return cost
 
 

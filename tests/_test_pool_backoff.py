@@ -73,6 +73,19 @@ class BackoffMathTests(unittest.TestCase):
         self.assertTrue(wb_proxy.rate_limit_is_account_level("", None))
         self.assertFalse(wb_proxy.rate_limit_is_account_level("...", time.time() + 60))
 
+    def test_reset_clock_is_parsed_for_both_realm_wordings(self):
+        cn = ('{"code":6004,"msg":"您的使用量已超出频率限制，'
+              '将在 2026-10-09 14:44:59 UTC+8 重置。"}')
+        intl = ('{"code":6004,"message":"your usage will reset at '
+                '2026-10-09 14:44:59 UTC+8"}')
+        cn_reset = wb_proxy.parse_rate_limit_reset(cn)
+        self.assertEqual(cn_reset, wb_proxy.parse_rate_limit_reset(intl))
+        self.assertIsNotNone(cn_reset)
+        # 14:44:59 UTC+8 is the same wall clock as 06:44:59 UTC.
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(cn_reset)),
+                         "2026-10-09 06:44:59")
+        self.assertIsNone(wb_proxy.parse_rate_limit_reset('{"code":429}'))
+
 
 class AccountGovernanceTests(unittest.TestCase):
     def test_soft_rate_backs_off_and_counts_the_streak(self):

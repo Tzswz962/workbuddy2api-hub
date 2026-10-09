@@ -1,11 +1,14 @@
 /* Drive the dashboard's per-API-key table in Node.
  *
  * The key table is the only place where the new axis meets the browser, and
- * the two things that break silently there are (a) a <td> that loses its
+ * the things that break silently there are (a) a <td> that loses its
  * data-label, which makes the row unreadable on a phone because the header
- * row is hidden at that breakpoint, and (b) a key name that reaches innerHTML
- * unescaped - names are free text typed into the panel. Neither shows up in
- * a Python test, so this drives the real functions out of dashboard.html.
+ * row is hidden at that breakpoint, (b) a key name that reaches innerHTML
+ * unescaped - names are free text typed into the panel - and (c) a per-key
+ * label that drifts onto another key's row, which a table-wide substring check
+ * cannot see because the string is still somewhere in the table. None of those
+ * shows up in a Python test, so this drives the real functions out of
+ * dashboard.html.
  *
  * Requires node (no other dependency); the rest of the suite is Python only.
  *
@@ -70,12 +73,61 @@ check('every cell carries a data-label (the phone layout depends on it)',
       (out.match(/<td/g) || []).length === (out.match(/data-label=/g) || []).length,
       (out.match(/<td/g) || []).length + ' vs ' + (out.match(/data-label=/g) || []).length);
 check('a named key shows its name', out.includes('甲 · 生产'));
-check('a cn-bound key is labelled', out.includes('国内版'));
-check('an intl-bound key is labelled', out.includes('国际版'));
-check('a key that used both exits is flagged as mixed', out.includes('跟随 · 混合'));
-check('a key that merely follows the model is labelled plainly',
-      out.includes('>跟随<'));
-check('a disabled key says so', out.includes('已禁用'));
+
+// --- row-bound helpers -------------------------------------------------
+// The rendered table is the contract: "the CN key is labelled 国内版" only
+// means something if that badge sits on the CN key's row. These helpers are
+// deliberately tiny - split the rows, read one labelled cell out of one row -
+// and they match on data-label and text only, never on classes, styles or
+// attribute order, so a markup-only change stays tolerated.
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const rowsOf = (html) => html.split(/<tr[^>]*>/).slice(1).map(r => r.split(/<\/tr>/)[0]);
+const cellOf = (row, label) => {
+  const m = row.match(new RegExp('<td[^>]*data-label="' + escapeRe(label) + '"[^>]*>([\\s\\S]*?)</td>'));
+  return m ? m[1] : null;
+};
+const rowFor = (html, name) => {
+  const hits = rowsOf(html).filter(r => (cellOf(r, 'API Key') || '').includes(name));
+  return hits.length === 1 ? hits[0] : null;
+};
+const show = (row, label) => row === null ? '(no single row)' : JSON.stringify(cellOf(row, label));
+
+console.log();
+console.log('[1b] every per-key label is bound to the row it describes');
+// k2 is both cross-exit and disabled, which is why one row answers two of
+// these; the point is that each answer is read from that row and no other.
+const cnRow = rowFor(out, '甲 · 生产');
+const crossRow = rowFor(out, '乙');
+const intlRow = rowFor(out, '启动参数');
+const followRow = rowFor(out, '&lt;img');
+const beforeRow = rowFor(out, '(切换前)');
+const noKeyRow = rowFor(out, '(无 key)');
+
+check('the cn-bound key is labelled 国内版 on its own row',
+      cnRow !== null && cellOf(cnRow, '出口').includes('国内版'),
+      show(cnRow, '出口'));
+check('the intl-bound key is labelled 国际版 on its own row',
+      intlRow !== null && cellOf(intlRow, '出口').includes('国际版'),
+      show(intlRow, '出口'));
+check('the key that used both exits is flagged 跟随 · 混合 on its own row',
+      crossRow !== null && cellOf(crossRow, '出口').includes('跟随 · 混合'),
+      show(crossRow, '出口'));
+check('a key that only follows the model says 跟随 and not 混合, on its own row',
+      followRow !== null && cellOf(followRow, '出口').includes('跟随')
+      && !cellOf(followRow, '出口').includes('混合'),
+      show(followRow, '出口'));
+check('the disabled marker sits on the disabled key row',
+      crossRow !== null && cellOf(crossRow, 'API Key').includes('已禁用'),
+      show(crossRow, 'API Key'));
+check('no other key row carries the disabled marker',
+      rowsOf(out).filter(r => (cellOf(r, 'API Key') || '').includes('已禁用')).length === 1,
+      rowsOf(out).filter(r => (cellOf(r, 'API Key') || '').includes('已禁用')).length + ' row(s)');
+check('the pre-upgrade bucket row shows no exit instead of guessing one',
+      beforeRow !== null && cellOf(beforeRow, '出口').includes('—'),
+      show(beforeRow, '出口'));
+check('the no-key bucket row shows no exit either',
+      noKeyRow !== null && cellOf(noKeyRow, '出口').includes('—'),
+      show(noKeyRow, '出口'));
 check('the launcher key is attributed to the start-up argument', out.includes('启动参数'));
 check('panel keys are marked as panel keys', out.includes('面板 Key'));
 check('failures are surfaced next to the request count', out.includes('失败 1'));
@@ -89,7 +141,9 @@ check('(无 key) is rendered separately', out.includes('(无 key)'));
 check('bucket rows show no exit instead of guessing one',
       (out.match(/—<\/span><\/td>/g) || []).length === 2,
       (out.match(/—<\/span><\/td>/g) || []).length);
-check('a bucket row is never badged as disabled', !/\(切换前\)[\s\S]{0,400}?已禁用/.test(out));
+// "a bucket row is never badged as disabled" used to live here as a
+// (切换前)-then-within-400-chars regex. [1b] now states it as a property of the
+// rows themselves, which is both stronger and not dependent on a magic width.
 
 console.log();
 console.log('[3] model pills');

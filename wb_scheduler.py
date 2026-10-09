@@ -147,7 +147,7 @@ class Scheduler:
             if acc.realm == "cn":
                 if acc.can_checkin():
                     self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
-                    res = acc.checkin()
+                    res = acc.checkin(trigger="scheduler")
                     if res.get("ok"):
                         checkin_count += 1
                         self.log(f"✓ 账号 [{uid8}] 自动签到成功: {res.get('msg')}")
@@ -174,7 +174,7 @@ class Scheduler:
             if acc.realm == "intl":
                 if acc.can_daily_chat():
                     self.log(f"检测到国际版账号 [{uid8}] 今日尚未活跃，执行每日活跃打卡对话...")
-                    res = acc.daily_chat()
+                    res = acc.daily_chat(trigger="scheduler")
                     if res.get("ok"):
                         daily_chat_count += 1
                         self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功")

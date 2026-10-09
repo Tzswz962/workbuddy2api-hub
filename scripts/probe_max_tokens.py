@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""真實輸出上限探測（M5 E2，panel scripts/probe_max_tokens.py 的 hub 版）。
+"""真实输出上限探测（M5 E2，panel scripts/probe_max_tokens.py 的 hub 版）。
 
-對本機網關送一次「要求超長輸出」的請求：若 finish_reason == "length"，
-本次 completion_tokens 就是上游靜默鉗制的真實上限；結果寫入
-accounts/output_probes.json，/v1/models 會標注 output_clamp。
+对本机网关送一次「要求超长输出」的请求：若 finish_reason == "length"，
+本次 completion_tokens 就是上游静默钳制的真实上限；结果写入
+accounts/output_probes.json，/v1/models 会标注 output_clamp。
 
 用法：
   python scripts/probe_max_tokens.py --model deepseek-v4.1-flash
-  python scripts/probe_max_tokens.py --model m1 m2 --base-url http://127.0.0.1:8789
+  python scripts/probe_max_tokens.py --model m1 m2 --base-url http://127.0.0.1:8788
   python scripts/probe_max_tokens.py --model m1 --dry-run
 
-金鑰預設讀 accounts/settings.json 的 launcher key；也可用 --api-key 指定。
-純標準庫。
+金钥预设读 accounts/settings.json 的 launcher key；也可用 --api-key 指定。
+纯标准库。
 """
 
 import argparse
@@ -33,7 +33,7 @@ def main(argv=None):
                         help="one or more model ids to probe")
     parser.add_argument("--base-url",
                         default=os.environ.get("WB_PROBE_BASE")
-                        or "http://127.0.0.1:8789")
+                        or "http://127.0.0.1:8788")
     parser.add_argument("--api-key", default="")
     parser.add_argument("--accounts-dir",
                         default=os.environ.get("ACCOUNTS_DIR")

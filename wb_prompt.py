@@ -1,26 +1,26 @@
 # -*- coding: utf-8 -*-
-"""wb_prompt.py — 網關自有系統提示詞模式（panel prompt.go / degrade.go 語義）。
+"""wb_prompt.py — 网关自有系统提示词模式（panel prompt.go / degrade.go 语义）。
 
-客戶端（Codex / Claude Code 等）在 system prompt 裡注入固定模板句時，上游內容
-審核可能按逐字匹配誤殺合法流量。本模組讓網關在出站前改寫 system/developer
-訊息，從源頭消滅 system 來源的指紋誤報；user/assistant/tool 訊息不動（既有
-sanitize 指紋清洗照舊，兩層互不替代）。
+客户端（Codex / Claude Code 等）在 system prompt 里注入固定模板句时，上游内容
+审核可能按逐字匹配误杀合法流量。本模组让网关在出站前改写 system/developer
+讯息，从源头消灭 system 来源的指纹误报；user/assistant/tool 讯息不动（既有
+sanitize 指纹清洗照旧，两层互不替代）。
 
-模式（settings.json 的 prompt.mode，預設 passthrough）：
-  - passthrough：透傳客戶端 system/developer（hub 原本的行為）；
-  - custom：刪除所有 system/developer，換成一條網關提示詞；
-  - append：在開頭連續 system/developer 區塊之後插入一條網關提示詞，
-    客戶端既有訊息逐字保留。
+模式（settings.json 的 prompt.mode，预设 passthrough）：
+  - passthrough：透传客户端 system/developer（hub 原本的行为）；
+  - custom：删除所有 system/developer，换成一条网关提示词；
+  - append：在开头连续 system/developer 区块之后插入一条网关提示词，
+    客户端既有讯息逐字保留。
 
-降級（passthrough / append）：內容審核攔截（403）多半是 system 來源的指紋
-誤殺。此時切到最小中性提示詞，直到次日 00:00 CST 重置，並把同一個請求用
-中性提示詞重試一次（panel degrade.go）。custom 模式不進降級路徑。
+降级（passthrough / append）：内容审核拦截（403）多半是 system 来源的指纹
+误杀。此时切到最小中性提示词，直到次日 00:00 CST 重置，并把同一个请求用
+中性提示词重试一次（panel degrade.go）。custom 模式不进降级路径。
 """
 
 import threading
 import time
 
-# 內置默認提示詞：用於 custom / append 模式（可用 prompt.file 覆蓋）。
+# 内置默认提示词：用于 custom / append 模式（可用 prompt.file 覆盖）。
 DEFAULT_PROMPT = """你是一名工程助手，幫助用戶完成軟件工程任務。
 
 - 先理解代碼與上下文再動手，遵循既有模式與約定。
@@ -31,7 +31,7 @@ DEFAULT_PROMPT = """你是一名工程助手，幫助用戶完成軟件工程任
 - 如實報告失敗與邊界，不掩蓋、不粉飾。
 """
 
-# 降級提示詞：刻意極簡中性，只用於繞開 system 來源的審核誤報。
+# 降级提示词：刻意极简中性，只用于绕开 system 来源的审核误报。
 DEGRADED_PROMPT = ("You are a helpful assistant. Respond in the user's language, "
                    "follow the user's instructions, and be direct and concise.")
 
@@ -39,13 +39,13 @@ VALID_MODES = ("passthrough", "custom", "append")
 
 
 def normalize_mode(value):
-    """未知模式回退 passthrough（保守默認，不意外改寫客戶端提示詞）。"""
+    """未知模式回退 passthrough（保守默认，不意外改写客户端提示词）。"""
     mode = str(value or "").strip().lower()
     return mode if mode in VALID_MODES else "passthrough"
 
 
 def load_prompt(mode, file_path=""):
-    """讀取網關提示詞：file 非空則讀檔（失敗拋出，調用方 fail open），否則內置默認。"""
+    """读取网关提示词：file 非空则读档（失败抛出，调用方 fail open），否则内置默认。"""
     path = str(file_path or "").strip()
     if not path:
         return DEFAULT_PROMPT
@@ -54,7 +54,7 @@ def load_prompt(mode, file_path=""):
 
 
 def rewrite(messages, system_prompt):
-    """刪除所有 system/developer，頭部插入一條網關 system 訊息。"""
+    """删除所有 system/developer，头部插入一条网关 system 讯息。"""
     if not system_prompt:
         return messages
     kept = [m for m in (messages or [])
@@ -64,7 +64,7 @@ def rewrite(messages, system_prompt):
 
 
 def append(messages, system_prompt):
-    """在開頭連續 system/developer 區塊之後插入網關提示詞，其餘訊息不動。"""
+    """在开头连续 system/developer 区块之后插入网关提示词，其余讯息不动。"""
     if not system_prompt:
         return messages
     msgs = list(messages or [])
@@ -79,7 +79,7 @@ def append(messages, system_prompt):
 
 
 def apply_mode(messages, mode, text, degraded=False):
-    """按模式路由一次請求的 messages；degraded 只影響 passthrough/append。"""
+    """按模式路由一次请求的 messages；degraded 只影响 passthrough/append。"""
     mode = normalize_mode(mode)
     if mode == "custom":
         return rewrite(messages, text)
@@ -93,10 +93,10 @@ def apply_mode(messages, mode, text, degraded=False):
 
 
 def next_midnight_cst(now=None):
-    """now 之後最近的 Asia/Shanghai 00:00（epoch 秒）。
+    """now 之后最近的 Asia/Shanghai 00:00（epoch 秒）。
 
-    用固定 +08:00 計算，不依賴宿主機時區（容器/宿主時區不確定）。
-    00:00 整點 → 次日 00:00；23:59 → 幾秒後的次日 00:00。
+    用固定 +08:00 计算，不依赖宿主机时区（容器/宿主时区不确定）。
+    00:00 整点 → 次日 00:00；23:59 → 几秒后的次日 00:00。
     """
     now = time.time() if now is None else float(now)
     offset = 8 * 3600
@@ -105,7 +105,7 @@ def next_midnight_cst(now=None):
 
 
 class DegradeGate(object):
-    """進程內存降級窗口：觸發後到次日 00:00 CST 為止（不續期）。"""
+    """进程内存降级窗口：触发后到次日 00:00 CST 为止（不续期）。"""
 
     def __init__(self):
         self._lock = threading.Lock()

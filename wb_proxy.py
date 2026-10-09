@@ -47,6 +47,7 @@ import urllib.error
 import urllib.request
 import uuid
 import wb_accounts
+import wb_activity
 import wb_atrest
 import wb_catalog
 import wb_ipintel
@@ -57,6 +58,8 @@ import wb_identity
 import wb_prompt
 import wb_modelsdev
 import wb_probes
+import wb_updates
+import wb_agents
 IS_WINDOWS = os.name == "nt"
 def launcher_hint(port):
     """Platform-appropriate launcher command for starting on another port."""
@@ -1157,80 +1160,437 @@ def _fold_cost(bucket, cost, model):
         missing[mid] = missing.get(mid, 0) + 1
 
 
+# ---------------------------------------------------------------------------
+# Incremental all-time aggregates
+#
+# The dashboard's all-time panels used to re-read the whole usage.jsonl on
+# every cache miss, and the log grows by thousands of rows a day. Those totals
+# only change when a row is appended, so each aggregate keeps the byte offset
+# it has already folded and a refresh reads just the rows past it - the shape
+# daily_usage_stats() already uses for today's counters, truncation guard
+# included. A windowed query still walks the file, but the pre-filter above
+# drops out-of-window lines before the parse, so it pays only for the rows it
+# keeps.
+#
+# A carried-over total is only valid while everything the fold read is
+# unchanged, so a state also carries a fingerprint of its other inputs: the
+# price tables (a new policy can re-price a row that has no reference of its
+# own) and the realm a row without a realm field is attributed to. When one of
+# those moves, the fold starts over - an offset alone would happily keep
+# yesterday's prices forever.
+#
+# One state per realm and per aggregate: each holds a few models and a few
+# accounts, so keeping one around costs nothing next to the scan it replaces.
+# ---------------------------------------------------------------------------
+
+# What wb_pricing hands back while its file is missing. Without these, every
+# call would get a fresh empty dict, the identity test below would never
+# match, and a deployment with no price files would rescan on every refresh.
+_EMPTY_POLICIES = {}
+_EMPTY_TIMELINE = []
+
+
+def _usage_log_key():
+    """(size, device, inode) of the usage log, or a zero key when it is gone.
+
+    One stat answers both questions an incremental fold has to ask. The size
+    says whether the bytes the cached offset counted are still there: a
+    shorter file was truncated, or replaced by a shorter one. The device and
+    inode say whether it is still the same file at all - a log copied over in
+    place keeps its inode and is caught by the size test, while one moved into
+    position is a different file and a stale offset would point into the
+    middle of unrelated rows.
+    """
+    try:
+        info = os.stat(USAGE_LOG)
+        return (info.st_size, info.st_dev, info.st_ino)
+    except OSError:
+        return (0, 0, 0)
+
+
+def _log_offset_holds(previous, current, offset):
+    """True when `offset` still sits inside the file `previous` described.
+
+    False means the cached fold counted bytes that are gone or belong to a
+    different file now, so it has to start over.
+    """
+    return (previous is not None
+            and previous[1] == current[1] and previous[2] == current[2]
+            and current[0] >= offset)
+
+
+# How many bytes of the already-counted prefix are read back on every
+# refresh to prove that prefix still holds the same bytes. Long enough
+# that a rewrite cannot match it by accident, short enough to cost
+# nothing on the poll path.
+_TAIL_SIGNATURE = 64
+
+
+def _log_tail_signature(offset):
+    """The last bytes before `offset`, or None when they cannot be read.
+
+    An incremental fold assumes the bytes it has already counted are still
+    there. Size and inode catch a log that was replaced or cut short, but
+    not one that was emptied in place and has since grown past the old
+    offset: same file, only longer, which is what truncating the log - or
+    a log rotation with copytruncate - leaves behind. Reading the seam back
+    is what tells those apart, because an append leaves it alone and a
+    rewrite does not.
+    """
+    if offset <= 0:
+        return b""
+    try:
+        with open(USAGE_LOG, "rb") as fh:
+            start = max(0, offset - _TAIL_SIGNATURE)
+            fh.seek(start)
+            return fh.read(offset - start)
+    except OSError:
+        return None
+
+
+def _log_resume_ok(state, log_key):
+    """True when the cached offset still sits on the log's current prefix.
+
+    False means the fold cannot be carried over: the file shrank, it is a
+    different file, or the bytes it counted were rewritten under it.
+    """
+    if not _log_offset_holds(state["key"], log_key, state["offset"]):
+        return False
+    return _log_tail_signature(state["offset"]) == state["tail"]
+
+
+def _pricing_inputs(pricing_on=None):
+    """Everything cost_for_row() reads besides the row itself.
+
+    Identity, not equality: wb_pricing caches each of these behind its own
+    file key, so an edited file hands back a different object, and comparing
+    identities keeps the check off the refresh path - walking the whole price
+    table to notice a change would cost more than the change does. Holding the
+    objects here is also what makes the test sound: a live object cannot have
+    its id handed to a replacement.
+
+    With the master switch off cost_for_row() never opens a table at all, so
+    the flag is the whole input. It is read through the same no-argument
+    call cost_for_row() makes - passing a directory here would answer from
+    a different settings file whenever the two disagree, and the fingerprint
+    would then watch an input the fold never read.
+    """
+    # pricing_on 由调用方传入时不再自己问一次总开关：一次扫描里它只该被问一次
+    # （见 _usage_snapshot_uncached / _compute_usage_analytics_uncached），指纹
+    # 与折叠读到的因此是同一个值。
+    try:
+        if not (wb_pricing.pricing_enabled() if pricing_on is None else pricing_on):
+            return (False, None, None, None)
+        return (True,
+                wb_pricing.load_policies() or _EMPTY_POLICIES,
+                wb_pricing.load_timeline() or _EMPTY_TIMELINE,
+                wb_pricing.load_pricing())
+    except Exception as exc:
+        log("pricing inputs unreadable: %s" % exc)
+        return None
+
+
+def _pricing_unchanged(previous, current):
+    """True when two _pricing_inputs() tuples describe the same prices."""
+    if previous is None or current is None:
+        return False
+    return (previous[0] == current[0] and previous[1] is current[1]
+            and previous[2] is current[2] and previous[3] is current[3])
+
+
+def _realm_inputs():
+    """What row_realm() consults for a row that carries no realm field.
+
+    Rows written before the field existed - an error row with no account - are
+    attributed to the account that served them, or to the model's home realm.
+    Importing or dropping an account can therefore move such a row from one
+    exit to the other, and a cached aggregate must not outlive that.
+    """
+    if POOL is None:
+        return (CURRENT_REALM, ())
+    try:
+        return (CURRENT_REALM, tuple(sorted((a.uid, a.realm) for a in POOL.accounts)))
+    except Exception as exc:
+        log("realm inputs unreadable: %s" % exc)
+        return None
+
+
+def _scan_usage_from(offset, fold, stop_at=None, skip=None):
+    """Fold every row past `offset` into `fold(row)`; returns (offset, error).
+
+    The offset handed back is the end of the last row the pass got through.
+    Rows are appended whole, so a line without its trailing newline is left
+    for the next pass rather than half-parsed - the rule _scan_daily_usage()
+    follows.
+
+    `skip(line)` drops a line before the parse; the windowed readers pass
+    _line_outside_window() here, so a line the range excludes costs a substring
+    search instead of a json.loads.
+
+    `stop_at` caps the read at the offset an all-time fold has already covered,
+    so a windowed payload built on top of that fold describes exactly the same
+    bytes as its all-time half.
+
+    The log is read in binary and the offset advances by the length of each
+    line: a tell() per line costs more than the parse it would be tracking,
+    and an offset only has to be a byte count. Each line is decoded to text
+    before it is looked at, which is the order the text-mode readers read in
+    and the one the pre-filter expects.
+
+    `error` is the exception that stopped the read, or None. A row the fold
+    cannot swallow ends the pass exactly where it used to - the readers have
+    always kept what they had folded so far - and the caller reports it with
+    its own label. The offset handed back with an error is the end of that
+    row: the fold may have half applied it before it raised, so the caller
+    starts its own fold over instead of resuming after it, while a windowed
+    pass built on the state still sees the row - and stops there - so the
+    two halves keep describing the same bytes.
+    """
+    if stop_at is not None and offset >= stop_at:
+        return offset, None
+    try:
+        with open(USAGE_LOG, "rb") as fh:
+            fh.seek(offset)
+            while True:
+                if stop_at is not None and offset >= stop_at:
+                    break
+                raw = fh.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    break
+                end = offset + len(raw)
+                if stop_at is not None and end > stop_at:
+                    # The line straddles the covered bytes, so the all-time
+                    # fold never saw it either: leave it out of this pass too.
+                    break
+                try:
+                    # Decoded before anything else, exactly as the text-mode
+                    # readers do: a line no reader can decode stops them where
+                    # it stands, so it stops this pass too rather than letting
+                    # it count rows the full scan never reached. Stripping the
+                    # text (not the bytes) keeps the two agreeing on what
+                    # counts as an empty line.
+                    line = raw.decode("utf-8").strip()
+                except UnicodeDecodeError as exc:
+                    return end, exc
+                if not line:
+                    offset = end
+                    continue
+                if skip is not None and skip(line):
+                    offset = end
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    offset = end
+                    continue
+                try:
+                    fold(row)
+                except Exception as exc:
+                    return end, exc
+                offset = end
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        return offset, exc
+    return offset, None
+
+
+def _copy_usage_bucket(bucket):
+    """Copy one by_model* bucket, its accounts dict included."""
+    out = dict(bucket)
+    out["accounts"] = dict(bucket["accounts"])
+    return out
+
+
+def _copy_usage_snapshot(snap):
+    """A snapshot copy the caller may decorate and hand out.
+
+    The fold is cached and shared, so what leaves this module is a copy - the
+    same reason _daily_state_copy() exists for the daily counters. Only the
+    three per-model views nest; every other value is a scalar.
+    """
+    out = dict(snap)
+    out["cost_missing"] = dict(snap["cost_missing"])
+    out["by_model"] = {m: _copy_usage_bucket(b) for m, b in snap["by_model"].items()}
+    out["by_model_realm"] = {m: {rr: _copy_usage_bucket(b) for rr, b in realms.items()}
+                             for m, realms in snap["by_model_realm"].items()}
+    out["by_model_acct"] = {
+        m: {rr: {acct: _copy_usage_bucket(b) for acct, b in accts.items()}
+            for rr, accts in realms.items()}
+        for m, realms in snap["by_model_acct"].items()}
+    return out
+
+
+def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None):
+    """Fold one parsed row into a usage snapshot.
+
+    One definition for both callers: the all-time fold (fed only the rows past
+    its offset) and the windowed one (fed the whole file, out-of-window lines
+    dropped before the parse). The realm and window tests come first, so every
+    total below - requests, tokens, per-model and per-account breakdowns -
+    describes the same slice of the log.
+
+    pricing_on 是本次扫描开头问过一次的总开关：聚合只读 known/cny（_fold_cost
+    再读 disabled），悬停明细构造出来就被丢掉，所以整扫不建明细、开关也不逐行
+    重问。代价是设置改动从下一次扫描起生效；逐行展示路径不受影响，仍然每行
+    查、改设置当场可见。
+    """
+    if r and not row_matches_realm(row, r):
+        return
+    at = row.get("at") or 0
+    if since and at < since:
+        return
+    if until and at > until:
+        return
+    outcome = row_outcome(row)
+    # Each row is priced against the version that was in force when it
+    # happened, so a later price change cannot rewrite yesterday's totals.
+    cost = wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
+    model = row.get("model")
+    if outcome != "completed":
+        snap["errors"] += 1
+        # Credit is money already spent: a request that failed after the
+        # upstream had billed for it still consumed credit, so it is summed
+        # here exactly like the analytics page sums it. Token totals keep the
+        # completed-only rule this page has always used, and a client abort is
+        # skipped because its usage block is incomplete.
+        if outcome != "client_aborted":
+            snap["credit"] += (row.get("credit") or 0)
+            _fold_cost(snap, cost, model)
+        return
+    snap["requests"] += 1
+    # Read each tracked field once: the row lands in four buckets below and
+    # every one of them walks the same fields.
+    present = [(k, row[k] or 0) for k in USAGE_FIELDS if k in row]
+    for k, value in present:
+        snap[k] += value
+    _fold_cost(snap, cost, model)
+    m = model or "unknown"
+    rr = row_realm(row)
+    acct_id = row.get("account")
+    acct_key = acct_id or "(unattributed)"
+    per = snap["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+    per_realm = snap["by_model_realm"].setdefault(m, {}).setdefault(
+        rr, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+    per_acct = (snap["by_model_acct"].setdefault(m, {})
+                .setdefault(rr, {})
+                .setdefault(acct_key, {"requests": 0, "accounts": {},
+                                       "cost_cny": 0.0,
+                                       **{k: 0 for k in USAGE_FIELDS}}))
+    known = cost["known"]
+    cny = cost["cny"] if known else 0.0
+    for bucket in (per, per_realm, per_acct):
+        bucket["requests"] += 1
+        for k, value in present:
+            bucket[k] += value
+        if known:
+            bucket["cost_cny"] += cny
+        if acct_id:
+            accounts = bucket["accounts"]
+            accounts[acct_id] = accounts.get(acct_id, 0) + 1
+
+
+_usage_snap_state = {}
+_usage_snap_state_lock = threading.Lock()
+
+
+def _usage_alltime_snapshot(r, pricing_on=None):
+    """A private copy of the cached all-time fold for realm filter `r`
+    (None = every realm).
+
+    One state per realm: the filter decides which rows the fold ever sees, so
+    `intl` and `cn` are two folds and neither may inherit the other's rows.
+    The state holds the raw fold only - `started`, `since`, `accounts_map` and
+    the rest are re-derived on every call, exactly as the full scan re-derived
+    them.
+    """
+    with _usage_snap_state_lock:
+        state = _usage_snap_state.get(r)
+        if state is None:
+            state = _usage_snap_state[r] = {"snap": None, "offset": 0, "key": None,
+                                            "pricing": None, "realm": None,
+                                            "tail": b""}
+        pricing = _pricing_inputs(pricing_on)
+        realm = _realm_inputs()
+        log_key = _usage_log_key()
+        if state["snap"] is None:
+            # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+            if not _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
+                state.update({"snap": _empty_stats(), "offset": 0, "tail": b""})
+        elif (not _pricing_unchanged(state["pricing"], pricing)
+                or state["realm"] != realm
+                or not _log_resume_ok(state, log_key)):
+            state.update({"snap": _empty_stats(), "offset": 0, "tail": b""})
+        state.update({"pricing": pricing, "realm": realm, "key": log_key})
+        offset, error = _scan_usage_from(
+            state["offset"],
+            lambda row: _fold_usage_snapshot(row, state["snap"], r, None, None,
+                                             pricing_on))
+        if error is None:
+            state["offset"] = offset
+            state["tail"] = _log_tail_signature(offset)
+            # Copied while the lock is held: the caller decorates what it
+            # gets, and a concurrent refresh must never be seen half-applied.
+            snap = _copy_usage_snapshot(state["snap"])
+        else:
+            # A row the fold could not swallow may have half applied itself,
+            # so the carried-over totals cannot be resumed from there: this
+            # call answers what was folded - the full scan reports the same
+            # partial totals - and the next refresh starts over, which is
+            # what the full scan does on every call.
+            log(f"usage snapshot read failed: {error}")
+            snap = state["snap"]
+            state.update({"snap": None, "offset": 0, "tail": b""})
+    # 落盘决定在锁外做（见 checkpoint 一节）：写盘要逐把读三份状态，在状态
+    # 锁里再取别的状态锁会构成锁序环。折叠失败的那次不写——它的 offset 已经
+    # 归零，落盘函数也会跳过。
+    if error is None:
+        _usage_cache_maybe_save("snapshot", offset)
+    return snap
+
+
+def _scan_usage_snapshot_window(r, since, until, pricing_on=None):
+    """One pass over the log, keeping only the rows inside the window.
+
+    Nothing is carried over here - a window moves with the clock - but the
+    pre-filter drops the parse for every line it can prove is outside it,
+    which is what keeps a cold day or week view cheap on a multi-day log.
+
+    The bounds reach the pre-filter through `or None` because that is the
+    test the fold itself applies (`if since and at < since`): a bound of 0
+    is a bound the fold ignores, and the pre-filter must not read it as
+    "keep nothing after the epoch" and drop rows the fold would have
+    counted.
+    """
+    snap = _empty_stats()
+    _, error = _scan_usage_from(
+        0,
+        lambda row: _fold_usage_snapshot(row, snap, r, since, until, pricing_on),
+        skip=lambda line: _line_outside_window(line, since or None,
+                                                 until or None))
+    if error is not None:
+        log(f"usage snapshot read failed: {error}")
+    return snap
+
+
 def _usage_snapshot_uncached(realm=None, since=None, until=None):
     # None means every realm; usage_snapshot() has already mapped "all"
     # onto it, so the filter below is simply skipped.
     r = realm
     rep = POOL.representative(realm=r) if POOL else current_account()
-    snap = _empty_stats()
+    # 总开关整扫只问一次，值一路传进折叠与价格指纹：每行重问一次就是每行一次
+    # os.stat，2.7 万行上很可观（见 tests/_test_usage_aggregate_fold.py）。
+    pricing_on = wb_pricing.pricing_enabled()
+    if since is None and until is None:
+        # An open window covers every row, and the rows only ever arrive at
+        # the end of the log, so the all-time totals are carried over from the
+        # last fold and only the rows appended since then are read.
+        snap = _usage_alltime_snapshot(r, pricing_on)
+    else:
+        snap = _scan_usage_snapshot_window(r, since, until, pricing_on)
     snap["started"] = _usage.get("started", time.time())
-    try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if r and not row_matches_realm(row, r):
-                    continue
-                # The window is applied before the request is counted, so every
-                # total below - requests, tokens, per-model and per-account
-                # breakdowns - describes the same slice of the log.
-                at = row.get("at") or 0
-                if since and at < since:
-                    continue
-                if until and at > until:
-                    continue
-                outcome = row_outcome(row)
-                # Each row is priced against the version that was in force
-                # when it happened, so a later price change cannot rewrite
-                # yesterday's totals.
-                cost = wb_pricing.cost_for_row(row)
-                if outcome != "completed":
-                    snap["errors"] += 1
-                    # Credit is money already spent: a request that failed
-                    # after the upstream had billed for it still consumed
-                    # credit, so it is summed here exactly like the analytics
-                    # page sums it. Token totals keep the completed-only rule
-                    # this page has always used, and a client abort is skipped
-                    # because its usage block is incomplete.
-                    if outcome != "client_aborted":
-                        snap["credit"] += (row.get("credit") or 0)
-                        _fold_cost(snap, cost, row.get("model"))
-                else:
-                    snap["requests"] += 1
-                    for k in USAGE_FIELDS:
-                        if k in row:
-                            snap[k] += (row[k] or 0)
-                    _fold_cost(snap, cost, row.get("model"))
-                    m = row.get("model") or "unknown"
-                    rr = row_realm(row)
-                    per = snap["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
-                    per_realm = snap["by_model_realm"].setdefault(m, {}).setdefault(
-                        rr, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
-                    acct_id = row.get("account")
-                    acct_key = acct_id or "(unattributed)"
-                    per_acct = (snap["by_model_acct"].setdefault(m, {})
-                                .setdefault(rr, {})
-                                .setdefault(acct_key, {"requests": 0, "accounts": {},
-                                                       "cost_cny": 0.0,
-                                                       **{k: 0 for k in USAGE_FIELDS}}))
-                    for bucket in (per, per_realm, per_acct):
-                        bucket["requests"] += 1
-                        for k in USAGE_FIELDS:
-                            if k in row:
-                                bucket[k] += (row[k] or 0)
-                        if cost["known"]:
-                            bucket["cost_cny"] += cost["cny"]
-                        if acct_id:
-                            bucket["accounts"][acct_id] = bucket["accounts"].get(acct_id, 0) + 1
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        log(f"usage snapshot read failed: {exc}")
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.get("started", time.time())))
     snap["log_file"] = USAGE_LOG
     snap["realm"] = r or "all"
@@ -1364,6 +1724,10 @@ _AT_PREFIX = '{"at": '
 def _line_outside_window(line, lo, hi):
     """True when this log line's `at` is provably outside [lo, hi].
 
+    Either bound may be None, which means "unbounded on that side": the
+    ranges the dashboard asks for ("today", "this week") only pin a start,
+    and an open side must never drop a row.
+
     The scan uses it to drop out-of-window lines without paying for
     json.loads, which is what made a cold pass over the log expensive. False
     means "parse it as before" - both for lines that match the shape and fall
@@ -1393,7 +1757,7 @@ def _line_outside_window(line, lo, hi):
         at = float(token)
     except ValueError:
         return False
-    if not (at < lo or at > hi):
+    if not ((lo is not None and at < lo) or (hi is not None and at > hi)):
         return False
     return line.find('"at"', end) < 0
 
@@ -1628,6 +1992,8 @@ POOL = None
 SCHEDULER = None
 PRICING = None
 CREDITS_REFRESHER = None
+# Release discovery only - the checker never downloads or installs anything.
+UPDATES = None
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
 def realm_state_file():
     """Path of the persisted realm switch.
@@ -1850,37 +2216,85 @@ def usage_by_account(ttl=None):
     return data
 
 
+_byacct_state = {"buckets": None, "offset": 0, "key": None, "tail": b""}
+# The wrapper above holds _byacct_lock while it rebuilds and then calls in
+# here, and _usage_by_account_uncached() is also called straight from the
+# bench and the tests; a lock of its own keeps the refresh from re-entering
+# the wrapper's - that one is not reentrant, so sharing it hung the process
+# on the first cache miss.
+_byacct_state_lock = threading.Lock()
+
+
+def _fold_usage_by_account(row, buckets):
+    """Fold one row into the per-account buckets.
+
+    No window and no realm filter here - this view has always described the
+    whole log - so the fold only skips the rows the original skipped.
+    """
+    if row.get("error"):
+        return
+    key = row.get("account") or "(unattributed)"
+    bucket = buckets.get(key)
+    if bucket is None:
+        bucket = buckets[key] = {
+            "account": key, "requests": 0, "prompt_tokens": 0,
+            "completion_tokens": 0, "reasoning_tokens": 0,
+            "cached_tokens": 0, "total_tokens": 0, "models": {},
+        }
+    bucket["requests"] += 1
+    bucket["prompt_tokens"] += row.get("prompt_tokens") or 0
+    bucket["completion_tokens"] += row.get("completion_tokens") or 0
+    bucket["reasoning_tokens"] += row.get("reasoning_tokens") or 0
+    bucket["cached_tokens"] += row.get("cached_tokens") or 0
+    bucket["total_tokens"] += row.get("total_tokens") or 0
+    model = row.get("model") or "?"
+    models = bucket["models"]
+    models[model] = models.get(model, 0) + 1
+
+
+def _usage_by_account_buckets():
+    """The cached per-account fold, refreshed and copied for the caller.
+
+    The copy matters: _usage_by_account_uncached() replaces each bucket's
+    `models` dict with a sorted list, and the next refresh must still find the
+    counts dict where it left it.
+    """
+    with _byacct_state_lock:
+        log_key = _usage_log_key()
+        if _byacct_state["buckets"] is None:
+            # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+            if not _usage_cache_adopt_by_account(_byacct_state, log_key):
+                _byacct_state.update({"buckets": {}, "offset": 0, "tail": b""})
+        elif not _log_resume_ok(_byacct_state, log_key):
+            _byacct_state.update({"buckets": {}, "offset": 0, "tail": b""})
+        _byacct_state["key"] = log_key
+        offset, error = _scan_usage_from(
+            _byacct_state["offset"],
+            lambda row: _fold_usage_by_account(row, _byacct_state["buckets"]))
+        buckets = _byacct_state["buckets"]
+        if error is None:
+            _byacct_state["offset"] = offset
+            _byacct_state["tail"] = _log_tail_signature(offset)
+        else:
+            # The row that stopped the fold may have half applied
+            # itself, so this view starts over next call - the full
+            # scan it replaces does the same on every call.
+            log("usage_by_account failed: %s" % error)
+            _byacct_state.update({"buckets": {}, "offset": 0, "tail": b""})
+        out = {k: dict(v) for k, v in buckets.items()}
+    if error is None:
+        _usage_cache_maybe_save("by_account", offset)
+    return out
+
+
 def _usage_by_account_uncached():
-    """Aggregate the JSONL log per account id."""
-    buckets = {}
-    try:
-        with open(USAGE_LOG, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except Exception:
-                    continue
-                if row.get("error"):
-                    continue
-                key = row.get("account") or "(unattributed)"
-                bucket = buckets.setdefault(key, {
-                    "account": key, "requests": 0, "prompt_tokens": 0,
-                    "completion_tokens": 0, "reasoning_tokens": 0,
-                    "cached_tokens": 0, "total_tokens": 0, "models": {},
-                })
-                bucket["requests"] += 1
-                for field in ("prompt_tokens", "completion_tokens",
-                              "reasoning_tokens", "cached_tokens", "total_tokens"):
-                    bucket[field] += row.get(field) or 0
-                model = row.get("model") or "?"
-                bucket["models"][model] = bucket["models"].get(model, 0) + 1
-    except FileNotFoundError:
-        pass
-    except Exception as exc:
-        log("usage_by_account failed: %s" % exc)
+    """Aggregate the JSONL log per account id.
+
+    Incremental: the fold is carried over and refreshed with the rows appended
+    since the last call, so this costs what the new traffic costs instead of
+    what the whole log costs.
+    """
+    buckets = _usage_by_account_buckets()
     out = sorted(buckets.values(), key=lambda b: -b["total_tokens"])
     for item in out:
         item["models"] = sorted(item["models"].items(), key=lambda kv: -kv[1])[:5]
@@ -1943,152 +2357,352 @@ KEY_BUCKET_UNKNOWN = "__unknown_key__"
 KEY_MODEL_TOP_N = 5
 
 
-def _scan_usage_log(all_summary, window_summary, acct_map, model_map, since=None, until=None,
-                    realm=None, key_map=None):
-    """Walk the usage JSONL once, folding every row into the maps.
+# One half of the analytics payload folds into four maps: the window summary,
+# the per-account entries, the per-model entries and the per-key entries. The
+# all-time half and the windowed half hold the same maps and differ only in
+# which stat on each entry they own, so the row fold below is written once and
+# told which half it is feeding.
+_ANALYTICS_ALL = ("all_time", "all_models")
+_ANALYTICS_WINDOW = ("window", "window_models")
 
-    `all_summary` always covers the whole log (it is the stable reference the
-    page shows next to the selection); `window_summary` and the per-account /
-    per-model "window" buckets cover only the selected range, which is what
-    every figure on the first column of the page describes.
 
-    `key_map` (optional) folds the same rows by the API key that called the
-    gateway. It is a separate axis from `acct_map` on purpose: one key can be
+def _new_analytics_maps():
+    """The four maps one half of the payload folds into."""
+    return {"summary": _new_analytics_stat(), "accts": {}, "models": {}, "keys": {}}
+
+
+def _analytics_row_values(row):
+    """The per-row numbers the folds below need, read once per row.
+
+    feed()/bump_models() used to call row.get() for each of them on every
+    invocation - eight stat objects per row, all walking the same handful of
+    fields - which was the single biggest cost of a cold analytics pass.
+    """
+    return (row.get("prompt_tokens") or 0,
+            row.get("completion_tokens") or 0,
+            row.get("reasoning_tokens") or 0,
+            row.get("cached_tokens") or 0,
+            row.get("total_tokens") or 0,
+            row.get("credit") or 0,
+            row.get("ttft_ms"),
+            row.get("tokens_per_sec"),
+            row.get("elapsed_ms"))
+
+
+def _feed_analytics(stat_obj, vals, is_err, cost_cny):
+    """Fold one row's numbers into one analytics stat object.
+
+    Token totals follow actual consumption, so a request that failed after the
+    upstream had already billed for tokens still shows them; only the
+    request/error counters depend on the outcome. An unpriced model passes
+    cost_cny = 0.0, which adds nothing: the accumulator starts as a float in
+    _new_analytics_stat(), so the sum is exactly what the guarded
+    `if cost["known"]` used to leave behind.
+    """
+    if is_err:
+        stat_obj["errors"] += 1
+    else:
+        stat_obj["requests"] += 1
+    stat_obj["prompt_tokens"] += vals[0]
+    stat_obj["completion_tokens"] += vals[1]
+    stat_obj["reasoning_tokens"] += vals[2]
+    stat_obj["cached_tokens"] += vals[3]
+    stat_obj["total_tokens"] += vals[4]
+    stat_obj["credit"] += vals[5]
+    stat_obj["cost_cny"] += cost_cny
+    if vals[6]:
+        stat_obj["ttft_sum"] += vals[6]
+        stat_obj["ttft_n"] += 1
+    if vals[7]:
+        stat_obj["speed_sum"] += vals[7]
+        stat_obj["speed_n"] += 1
+    if vals[8]:
+        stat_obj["elapsed_sum"] += vals[8]
+        stat_obj["elapsed_n"] += 1
+
+
+def _bump_analytics_models(tgt, m_id, vals, is_err, cost_cny):
+    """Fold one row into one {model: {...}} bucket.
+
+    Model distribution counts successful requests only: a failed call
+    attributed to a model would show up as demand for it when the caller got
+    nothing.
+    """
+    if is_err:
+        return
+    tm = tgt.get(m_id)
+    if tm is None:
+        tm = tgt[m_id] = {"requests": 0, "tokens": 0, "reasoning": 0, "cost_cny": 0.0}
+    tm["requests"] += 1
+    tm["tokens"] += vals[4]
+    tm["reasoning"] += vals[2]
+    tm["cost_cny"] += cost_cny
+
+
+def _fold_usage_analytics(row, realm, maps, half, pricing_on=None):
+    """Fold one parsed row into one half of the analytics payload.
+
+    `maps` holds the four maps that half folds into and `half` names the stat
+    each entry of that half owns, so the incremental all-time fold (every
+    entry's all_time stat) and the windowed pass (the same entries' window
+    stat) share one definition of what a row contributes.
+
+    The key axis is separate from the account axis on purpose: one key can be
     served by many upstream accounts, and one account can serve many keys, so
     the two tables are views of the same spend, not a decomposition of it.
     """
-    if os.path.exists(USAGE_LOG):
-        try:
-            with open(USAGE_LOG, encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        r = json.loads(line)
-                    except Exception:
-                        continue
-                    if realm and not row_matches_realm(r, realm):
-                        continue
-                    # Only a genuine gateway/upstream failure is an error.
-                    # A client cancellation is not: its token counts are
-                    # incomplete, and folding them into the ratios this page
-                    # reports would understate cache hit and speed. It is
-                    # counted in perf_stats instead.
-                    outcome = row_outcome(r)
-                    if outcome == "client_aborted":
-                        continue
-                    is_err = outcome != "completed"
-                    cost = wb_pricing.cost_for_row(r)
-                    at = r.get("at", 0)
-                    # Same bounds as /usage and /usage/perf, so the three
-                    # readers agree on what the selected range contains.
-                    in_window = ((since is None or at >= since)
-                                 and (until is None or at <= until))
-                    acct_uid = r.get("account") or "(unattributed)"
-                    m_id = r.get("model") or "(unknown)"
-                    def feed(stat_obj, is_error):
-                        if is_error:
-                            stat_obj["errors"] += 1
-                        else:
-                            stat_obj["requests"] += 1
-                        # Token totals follow actual consumption, so a request
-                        # that failed after the upstream had already billed for
-                        # tokens still shows them. Only the request/error
-                        # counters depend on the outcome.
-                        stat_obj["prompt_tokens"] += (r.get("prompt_tokens") or 0)
-                        stat_obj["completion_tokens"] += (r.get("completion_tokens") or 0)
-                        stat_obj["reasoning_tokens"] += (r.get("reasoning_tokens") or 0)
-                        stat_obj["cached_tokens"] += (r.get("cached_tokens") or 0)
-                        stat_obj["total_tokens"] += (r.get("total_tokens") or 0)
-                        stat_obj["credit"] += (r.get("credit") or 0)
-                        if cost["known"]:
-                            stat_obj["cost_cny"] += cost["cny"]
-                        if r.get("ttft_ms"):
-                            stat_obj["ttft_sum"] += r["ttft_ms"]
-                            stat_obj["ttft_n"] += 1
-                        if r.get("tokens_per_sec"):
-                            stat_obj["speed_sum"] += r["tokens_per_sec"]
-                            stat_obj["speed_n"] += 1
-                        if r.get("elapsed_ms"):
-                            stat_obj["elapsed_sum"] += r["elapsed_ms"]
-                            stat_obj["elapsed_n"] += 1
-                    def bump_models(tgt_all, tgt_window, is_error):
-                        # Model distribution counts successful requests only:
-                        # a failed call attributed to a model would show up as
-                        # demand for it when the caller got nothing.
-                        if is_error:
-                            return
-                        tm = tgt_all.setdefault(m_id, {"requests": 0, "tokens": 0, "reasoning": 0, "cost_cny": 0.0})
-                        tm["requests"] += 1
-                        tm["tokens"] += (r.get("total_tokens") or 0)
-                        tm["reasoning"] += (r.get("reasoning_tokens") or 0)
-                        if cost["known"]:
-                            tm["cost_cny"] += cost["cny"]
-                        if in_window:
-                            tdm = tgt_window.setdefault(m_id, {"requests": 0, "tokens": 0, "reasoning": 0, "cost_cny": 0.0})
-                            tdm["requests"] += 1
-                            tdm["tokens"] += (r.get("total_tokens") or 0)
-                            tdm["reasoning"] += (r.get("reasoning_tokens") or 0)
-                            if cost["known"]:
-                                tdm["cost_cny"] += cost["cny"]
-                    feed(all_summary, is_err)
-                    if in_window:
-                        feed(window_summary, is_err)
-                    if acct_uid not in acct_map:
-                        acct_map[acct_uid] = {
-                            "uid": acct_uid,
-                            "nickname": acct_uid,
-                            "realm": r.get("realm", ""),
-                            "domain": "",
-                            "window": _new_analytics_stat(),
-                            "all_time": _new_analytics_stat(),
-                            "window_models": {},
-                            "all_models": {},
-                        }
-                    feed(acct_map[acct_uid]["all_time"], is_err)
-                    if in_window:
-                        feed(acct_map[acct_uid]["window"], is_err)
-                    bump_models(acct_map[acct_uid]["all_models"], acct_map[acct_uid]["window_models"], is_err)
-                    if m_id not in model_map:
-                        model_map[m_id] = {"model": m_id, "window": _new_analytics_stat(), "all_time": _new_analytics_stat()}
-                    feed(model_map[m_id]["all_time"], is_err)
-                    if in_window:
-                        feed(model_map[m_id]["window"], is_err)
-                    if key_map is not None:
-                        # A row written before this feature existed has no
-                        # `key` field at all; a row from a deployment that
-                        # never configured a key has one, and it is empty.
-                        if "key" in r:
-                            k_id = r.get("key") or KEY_BUCKET_ANON
-                        else:
-                            k_id = KEY_BUCKET_BEFORE
-                        km = key_map.get(k_id)
-                        if km is None:
-                            km = key_map[k_id] = {
-                                "key": k_id,
-                                "window": _new_analytics_stat(),
-                                "all_time": _new_analytics_stat(),
-                                "window_models": {},
-                                "all_models": {},
-                                # realm -> row count. A key bound to one
-                                # exit only ever sees that exit; a key with no
-                                # binding follows the model, and its credit
-                                # column then adds up two different products.
-                                # Kept as a dict because this ends up in JSON.
-                                "realms": {},
-                                "last_at": 0,
-                            }
-                        k_realm = row_realm(r) or ""
-                        km["realms"][k_realm] = km["realms"].get(k_realm, 0) + 1
-                        if at and at > km["last_at"]:
-                            km["last_at"] = at
-                        feed(km["all_time"], is_err)
-                        if in_window:
-                            feed(km["window"], is_err)
-                        bump_models(km["all_models"], km["window_models"], is_err)
-        except Exception as exc:
-            log("compute_usage_analytics failed: %s" % exc)
+    if realm and not row_matches_realm(row, realm):
+        return
+    # Only a genuine gateway/upstream failure is an error. A client
+    # cancellation is not: its token counts are incomplete, and folding them
+    # into the ratios this page reports would understate cache hit and speed.
+    # It is counted in perf_stats instead.
+    outcome = row_outcome(row)
+    if outcome == "client_aborted":
+        return
+    is_err = outcome != "completed"
+    cost = wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
+    cost_cny = cost["cny"] if cost["known"] else 0.0
+    vals = _analytics_row_values(row)
+    stat_key, models_key = half
+    acct_uid = row.get("account") or "(unattributed)"
+    m_id = row.get("model") or "(unknown)"
+
+    _feed_analytics(maps["summary"], vals, is_err, cost_cny)
+
+    entry = maps["accts"].get(acct_uid)
+    if entry is None:
+        entry = maps["accts"][acct_uid] = {
+            "uid": acct_uid,
+            "nickname": acct_uid,
+            "realm": row.get("realm", ""),
+            "domain": "",
+            stat_key: _new_analytics_stat(),
+            models_key: {},
+        }
+    _feed_analytics(entry[stat_key], vals, is_err, cost_cny)
+    _bump_analytics_models(entry[models_key], m_id, vals, is_err, cost_cny)
+
+    model = maps["models"].get(m_id)
+    if model is None:
+        model = maps["models"][m_id] = {"model": m_id, stat_key: _new_analytics_stat()}
+    _feed_analytics(model[stat_key], vals, is_err, cost_cny)
+
+    # A row written before this feature existed has no `key` field at all; a
+    # row from a deployment that never configured a key has one, and it is
+    # empty.
+    if "key" in row:
+        k_id = row.get("key") or KEY_BUCKET_ANON
+    else:
+        k_id = KEY_BUCKET_BEFORE
+    km = maps["keys"].get(k_id)
+    if km is None:
+        km = maps["keys"][k_id] = {
+            "key": k_id,
+            stat_key: _new_analytics_stat(),
+            models_key: {},
+            # realm -> row count. A key bound to one exit only ever sees that
+            # exit; a key with no binding follows the model, and its credit
+            # column then adds up two different products. Kept as a dict
+            # because this ends up in JSON.
+            "realms": {},
+            "last_at": 0,
+        }
+    k_realm = row_realm(row) or ""
+    km["realms"][k_realm] = km["realms"].get(k_realm, 0) + 1
+    at = row.get("at") or 0
+    if at and at > km["last_at"]:
+        km["last_at"] = at
+    _feed_analytics(km[stat_key], vals, is_err, cost_cny)
+    _bump_analytics_models(km[models_key], m_id, vals, is_err, cost_cny)
+
+
+_analytics_state = {}
+_analytics_state_lock = threading.Lock()
+
+
+def _analytics_all_time(realm, pricing_on=None):
+    """The cached all-time fold for one realm filter; returns (maps, offset).
+
+    One state per realm: the filter decides which rows the fold ever sees, so
+    two realms are two folds and neither may inherit the other's rows. Only
+    the all-time half is cached - the windowed half moves with the clock - and
+    the offset comes back with it so a windowed pass can stop where the fold
+    stopped.
+    """
+    with _analytics_state_lock:
+        state = _analytics_state.get(realm)
+        if state is None:
+            state = _analytics_state[realm] = {"maps": _new_analytics_maps(),
+                                               "offset": 0, "key": None,
+                                               "pricing": None, "realm": None,
+                                               "tail": b""}
+        pricing = _pricing_inputs(pricing_on)
+        realm_inputs = _realm_inputs()
+        log_key = _usage_log_key()
+        if state["key"] is None:
+            # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+            if not _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
+                state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b""})
+        elif (not _pricing_unchanged(state["pricing"], pricing)
+                or state["realm"] != realm_inputs
+                or not _log_resume_ok(state, log_key)):
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b""})
+        state.update({"pricing": pricing, "realm": realm_inputs, "key": log_key})
+        offset, error = _scan_usage_from(
+            state["offset"],
+            lambda row: _fold_usage_analytics(row, realm, state["maps"],
+                                              _ANALYTICS_ALL, pricing_on))
+        if error is None:
+            state["offset"] = offset
+            state["tail"] = _log_tail_signature(offset)
+            # Copied under the lock, same rule as the snapshot state: what
+            # the caller decorates must not be the live fold.
+            maps = _copy_analytics_all_time(state["maps"])
+        else:
+            # Same rule as the snapshot state: the row that stopped the
+            # fold may have half applied itself, so the state starts
+            # over next call. The offset still goes back - it is the
+            # end of that row - because the windowed half has to see
+            # it, and stop there, to describe the same bytes the
+            # all-time half already folded.
+            log("compute_usage_analytics failed: %s" % error)
+            maps = state["maps"]
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b""})
+    if error is None:
+        _usage_cache_maybe_save("analytics", offset)
+    return maps, offset
+
+
+def _scan_usage_analytics_window(realm, since, until, stop_at=None, pricing_on=None):
+    """One pass over the log, folding only the rows inside the window.
+
+    The all-time half is not rebuilt here - it comes from the incremental fold
+    - and the read stops where that fold stopped, so both halves of the
+    payload describe the same bytes even when a row lands mid-rebuild.
+    """
+    maps = _new_analytics_maps()
+
+    def fold(row):
+        # Same bounds as /usage and /usage/perf, so the three readers agree on
+        # what the selected range contains.
+        at = row.get("at", 0)
+        if since is not None and at < since:
+            return
+        if until is not None and at > until:
+            return
+        _fold_usage_analytics(row, realm, maps, _ANALYTICS_WINDOW, pricing_on)
+
+    _, error = _scan_usage_from(
+        0, fold, stop_at=stop_at,
+        skip=lambda line: _line_outside_window(line, since, until))
+    if error is not None:
+        log("compute_usage_analytics failed: %s" % error)
+    return maps
+
+
+def _copy_analytics_models(models):
+    """Copy one {model: {...}} bucket; its inner dicts are only ever read."""
+    return {mid: dict(entry) for mid, entry in models.items()}
+
+
+def _copy_analytics_all_time(maps):
+    """A private copy of the cached all-time maps.
+
+    The payload build decorates what it is given (finalize writes the
+    derived ratios into the stat dicts) and the cached fold keeps growing
+    under a concurrent refresh, so the caller gets a copy taken while the
+    state lock is held rather than a live view of it.
+    """
+    out = {"summary": dict(maps["summary"]), "accts": {}, "models": {}, "keys": {}}
+    for uid, entry in maps["accts"].items():
+        copy = dict(entry)
+        copy["all_time"] = dict(entry["all_time"])
+        copy["all_models"] = _copy_analytics_models(entry["all_models"])
+        out["accts"][uid] = copy
+    for m_id, entry in maps["models"].items():
+        out["models"][m_id] = {"model": m_id, "all_time": dict(entry["all_time"])}
+    for k_id, km in maps["keys"].items():
+        copy = dict(km)
+        copy["all_time"] = dict(km["all_time"])
+        copy["all_models"] = _copy_analytics_models(km["all_models"])
+        out["keys"][k_id] = copy
+    return out
+
+
+def _merge_analytics_halves(all_maps, win_maps):
+    """Combine the cached all-time fold with the windowed one.
+
+    `win_maps` is `all_maps` itself when no range was selected - every row is
+    inside an open window, so the windowed half is the all-time fold over
+    again. The halves are copied apart in that case, which is what a second
+    pass would have produced without the second pass, and it keeps a caller
+    that mutates one half out of the other (and out of the cache).
+
+    An entry only the windowed half knows cannot exist: the windowed pass
+    stops where the all-time fold stopped, so every row it saw is already in
+    there.
+    """
+    shared = win_maps is all_maps
+    acct_map = {}
+    for uid, entry in all_maps["accts"].items():
+        win = win_maps["accts"].get(uid)
+        if shared:
+            window_stat = dict(entry["all_time"])
+            window_models = _copy_analytics_models(entry["all_models"])
+        elif win is None:
+            window_stat = _new_analytics_stat()
+            window_models = {}
+        else:
+            window_stat = win["window"]
+            window_models = win["window_models"]
+        acct_map[uid] = {
+            "uid": uid,
+            "nickname": uid,
+            "realm": entry["realm"],
+            "domain": "",
+            "window": window_stat,
+            "all_time": dict(entry["all_time"]),
+            "window_models": window_models,
+            "all_models": _copy_analytics_models(entry["all_models"]),
+        }
+    model_map = {}
+    for m_id, entry in all_maps["models"].items():
+        stat = entry["all_time"]
+        win = win_maps["models"].get(m_id)
+        if shared:
+            window_stat = dict(stat)
+        elif win is None:
+            window_stat = _new_analytics_stat()
+        else:
+            window_stat = win["window"]
+        model_map[m_id] = {"model": m_id, "window": window_stat,
+                           "all_time": dict(stat)}
+    key_map = {}
+    for k_id, km in all_maps["keys"].items():
+        win = win_maps["keys"].get(k_id)
+        if shared:
+            window_stat = dict(km["all_time"])
+            window_models = _copy_analytics_models(km["all_models"])
+        elif win is None:
+            window_stat = _new_analytics_stat()
+            window_models = {}
+        else:
+            window_stat = win["window"]
+            window_models = win["window_models"]
+        key_map[k_id] = {
+            "key": k_id,
+            "window": window_stat,
+            "all_time": dict(km["all_time"]),
+            "window_models": window_models,
+            "all_models": _copy_analytics_models(km["all_models"]),
+            "realms": dict(km["realms"]),
+            "last_at": km["last_at"],
+        }
+    return {"summary": dict(all_maps["summary"]),
+            "window_summary": (dict(all_maps["summary"]) if shared
+                               else win_maps["summary"]),
+            "accts": acct_map, "models": model_map, "keys": key_map}
 
 
 def _add_analytics_stat(dst, src):
@@ -2260,14 +2874,25 @@ def _finalize_analytics_stat(stat_obj):
 
 def _compute_usage_analytics_uncached(realm=None, since=None, until=None):
     """Detailed analytics for Token, Cache, and Reasoning metrics page."""
-    all_summary = _new_analytics_stat()
-    window_summary = _new_analytics_stat()
-    acct_map = {}
-    model_map = {}
-    key_map = {}
-    _scan_usage_log(all_summary, window_summary, acct_map, model_map,
-                    since=since, until=until, realm=realm, key_map=key_map)
+    # 与 /usage 快照同一条规矩：一次扫描里总开关只问一次，值传进折叠与指纹。
+    pricing_on = wb_pricing.pricing_enabled()
+    all_maps, offset = _analytics_all_time(realm, pricing_on)
+    if since is None and until is None:
+        # An open window covers every row, so the windowed half is the
+        # all-time fold over again; the merge copies the two apart.
+        win_maps = all_maps
+    else:
+        # The all-time half is not re-folded: the windowed pass stops where
+        # the incremental fold stopped, so one page never mixes two reads.
+        win_maps = _scan_usage_analytics_window(realm, since, until, stop_at=offset,
+                                                pricing_on=pricing_on)
+    parts = _merge_analytics_halves(all_maps, win_maps)
+    acct_map = parts["accts"]
+    model_map = parts["models"]
+    key_map = parts["keys"]
     _enrich_accounts_from_pool(acct_map, realm=realm)
+    all_summary = parts["summary"]
+    window_summary = parts["window_summary"]
     _finalize_analytics_stat(all_summary)
     _finalize_analytics_stat(window_summary)
     for a in acct_map.values():
@@ -2296,6 +2921,673 @@ def _compute_usage_analytics_uncached(realm=None, since=None, until=None):
         # is a second view of the same spend, not a breakdown of it.
         "keys": keys_list,
     }
+
+
+# ---------------------------------------------------------------------------
+# 聚合状态落盘（重启后免冷扫）
+#
+# 上面的三份增量聚合（_usage_alltime_snapshot / _usage_by_account_buckets /
+# _analytics_all_time）把状态放在模块级字典里，进程一重启就全丢：第一次刷新
+# 仍是全量扫一遍日志。日志每天涨一万多行，冷扫描成本跟着线性上升——路由器
+# 上 2.7 万行的一次冷启动要 6~8 秒，一个月后接近两分钟。这里把三份状态连同
+# 它们的位置信息写进数据目录下的一个 JSON 文件，重启后第一次刷新只读文件
+# 尾部的新增字节。
+#
+# 文件放在数据目录里是刻意的：它和日志同生命周期，跟着 sysupgrade 一起走，
+# 也和日志一起被搬走、清掉。读写失败（只读文件系统、磁盘满、权限不足）一律
+# 静默降级——checkpoint 只是加速，丢的是一次加速，绝不能影响服务本身。
+#
+# 加载校验复用 #189 已有的原语，不另造一套：offset 必须仍落在同一个文件的
+# 现有字节里（_log_offset_holds），offset 前的最后 64 字节必须与写下时一致
+# （_log_tail_signature），再加上价格/realm 指纹和 schema 版本。任何一项对不
+# 上就当没有缓存、走全量——宁可多扫一次，也不能给出错的数字。
+# ---------------------------------------------------------------------------
+
+# 数据目录下的文件名。usage/*.json 已被 .gitignore 覆盖。
+_USAGE_CACHE_NAME = "usage-aggregate-cache.json"
+# 状态结构或折叠口径一变就 +1，旧文件整体作废。这是唯一挡在「旧结构喂进新
+# 代码」前面的东西，改动状态形状时别忘了它。
+# v2：写盘不再排序（v1 用 sort_keys 写，加载回来所有 dict 变字母序，响应
+# 与冷启动逐字节不同）。键顺序算状态结构的一部分，所以旧文件必须整体作废
+# ——否则那份字母序会一直粘在内存里，直到日志尾部被重写才会被清掉。
+_USAGE_CACHE_SCHEMA = 2
+
+
+def _usage_cache_enabled():
+    """落盘总开关，默认开；WB_USAGE_CACHE=0 关。
+
+    每次调用都读环境变量而不是在导入时定死：现场用它紧急关掉，测试用它在一
+    个进程里来回切，而一次 os.environ.get 的开销在刷新路径上可以忽略。
+    """
+    return os.environ.get("WB_USAGE_CACHE", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _usage_cache_path():
+    """checkpoint 的路径。
+
+    每次调用重算，而不是在导入时算成常量：--usage-dir、测试和探针脚本都会
+    在导入之后改 USAGE_DIR，常量会写到旧目录去。
+    """
+    return os.path.join(USAGE_DIR, _USAGE_CACHE_NAME)
+
+
+def _usage_cache_min_bytes():
+    """写盘节流：折叠推进不足这么多字节就不写。默认 1MB。
+
+    1MB 是「重启后最多回放多少」的上限——路由器上扫描约 0.5s/MB，回放 1MB
+    等于冷启动成本多半秒；而日志每天涨 6MB 上下，正常流量下一天也未必触发
+    一次。写小了是写放大（路由器 flash 写入慢且费寿命），写大了重启变慢。
+    """
+    try:
+        return max(0, int(os.environ.get("WB_USAGE_CACHE_MIN_BYTES", 1024 * 1024)))
+    except (TypeError, ValueError):
+        return 1024 * 1024
+
+
+def _usage_cache_min_seconds():
+    """写盘节流：距上次尝试不足这么多秒就不写。默认 900s（15 分钟）。
+
+    这条兜住「字节阈值还没到、但偏移已经推进了一点」的情况：不设它，一段
+    短流量之后停下的日志要等到下次凑满 1MB 才会落盘。15 分钟让面板开着时
+    一天最多约百次写盘（每次几十 KB），对 flash 友好；重启回放的上限则是
+    min(1MB, 15 分钟流量)。
+    """
+    try:
+        return max(0.0, float(os.environ.get("WB_USAGE_CACHE_MIN_SECONDS", 900)))
+    except (TypeError, ValueError):
+        return 900.0
+
+
+_usage_cache_lock = threading.Lock()
+# 写盘串行锁：只被 _usage_cache_maybe_save() 拿一次、且永远是最外层（拿它
+# 之后才拿状态锁/节流锁），所以它不参与任何锁序环。
+_usage_cache_write_lock = threading.Lock()
+# 进程启动后只读一次 checkpoint：读到就记下来（按 realm 逐份取用），读不到
+# 也记 None——坏文件、只读文件系统都不该让每次刷新都去解析一遍。
+_usage_cache_loaded = False
+_usage_cache_read_result = None
+# 写盘节流状态，全部由 _usage_cache_lock 保护：
+#   progress[kind]     —— 本进程见过该类状态折叠到的最远 offset；
+#   checkpointed[kind] —— 该类状态上次「尝试」落盘时的 offset（失败也记，
+#                         只读文件系统上不能每次刷新都去试写一遍）；
+#   last_attempt       —— 上次尝试写盘的时刻，时间阈值与失败退避都靠它。
+# 按「类」记账而不是记一个总数：某类状态第一次折叠（或中途重扫）时 offset
+# 从 0 跳到文件尾，这一类要尽快落盘，而刚采用过 checkpoint 的类不能被别的
+# 类的推进带着白写一遍。
+_usage_cache_progress = {}
+_usage_cache_checkpointed = {}
+_usage_cache_last_attempt = time.time()
+
+
+def _usage_cache_data():
+    """checkpoint 的解析结果，或 None。
+
+    调用点可能在状态锁内（采用阶段），所以本函数会取 _usage_cache_lock；
+    反向的锁序不存在——写盘路径取状态锁之前一定先放开本锁，见
+    _usage_cache_maybe_save。
+    """
+    global _usage_cache_loaded, _usage_cache_read_result
+    if not _usage_cache_enabled():
+        return None
+    if _usage_cache_loaded:
+        return _usage_cache_read_result
+    with _usage_cache_lock:
+        if not _usage_cache_loaded:
+            _usage_cache_read_result = _usage_cache_read()
+            _usage_cache_loaded = True
+        return _usage_cache_read_result
+
+
+def _usage_cache_read():
+    """读 checkpoint 文件并做顶层校验；任何一步不成立都返回 None。
+
+    None 和「文件不存在」同义：调用方按没有缓存处理，绝不因此报错。
+    """
+    try:
+        with open(_usage_cache_path(), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # 先看类型再看值：JSON 的 true 在 Python 里等于 1，schema: true 不能算
+    # 「版本 1」。
+    if not _usage_cache_int(data.get("schema")):
+        return None
+    if data["schema"] != _USAGE_CACHE_SCHEMA:
+        return None
+    return data
+
+
+_usage_cache_digest_memo = {}
+
+
+def _object_digest(obj):
+    """一段 JSON 内容摘要，按对象身份记忆；算不出来返回 None。
+
+    记忆表的值强引用对象本身，所以 id() 不会被回收复用；超过几条就整体清空
+    ——正常进程里价表对象只在价格变化时换代，这里只是给长期运行兜底。
+    """
+    hit = _usage_cache_digest_memo.get(id(obj))
+    if hit is not None and hit[0] is obj:
+        return hit[1]
+    try:
+        payload = json.dumps(obj, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+        digest = hashlib.sha1(payload).hexdigest()
+    except Exception:
+        return None
+    if len(_usage_cache_digest_memo) > 8:
+        _usage_cache_digest_memo.clear()
+    _usage_cache_digest_memo[id(obj)] = (obj, digest)
+    return digest
+
+
+def _pricing_inputs_key(inputs):
+    """把 _pricing_inputs() 的元组压成一段跨进程可比的价格指纹。
+
+    进程内那套靠对象身份（_pricing_unchanged），身份活不过重启，所以这里存
+    内容摘要。摘要取的是取价函数真正返回的对象而不是价表文件：文件损坏时会
+    回退到内联表，折叠读到的也是内联表，指纹必须描述折叠真正读的东西；文件
+    不在时内联表有没有变过，也只有摘要看得出来。
+    """
+    if inputs is None:
+        return None
+    if not inputs[0]:
+        # 总开关关着：取价路径一个价表都不读，开关本身就是全部输入。
+        return ["off"]
+    digests = []
+    for obj in inputs[1:]:
+        digest = _object_digest(obj)
+        if digest is None:
+            return None
+        digests.append(digest)
+    return ["on"] + digests
+
+
+def _realm_inputs_key(inputs):
+    """realm 指纹本来就是值比较（不是身份），JSON 化后原样可比。"""
+    if inputs is None:
+        return None
+    realm, accounts = inputs
+    return [realm, [[uid, r] for uid, r in accounts]]
+
+
+# 折叠会就地累加/读取的字段集合直接从构造函数推导：上游往 _empty_stats() 或
+# _new_analytics_stat() 里加字段时这里自动跟着收——漏一个，放行的缓存就会在
+# 折叠半路抛 KeyError，那次刷新报出半份数字（折叠的错误路径只保留已折的
+# 部分）。
+_USAGE_CACHE_SNAPSHOT_NUMBERS = tuple(
+    k for k, v in _empty_stats().items()
+    if isinstance(v, (int, float)) and not isinstance(v, bool))
+_USAGE_CACHE_SNAPSHOT_MAPS = ("cost_missing", "by_model", "by_model_realm", "by_model_acct")
+_USAGE_CACHE_ANALYTICS_NUMBERS = tuple(_new_analytics_stat().keys())
+_USAGE_CACHE_BUCKET_NUMBERS = ("requests", "cost_cny") + USAGE_FIELDS
+
+
+def _usage_cache_number(value):
+    """折叠累加的数字。bool 是 int 的子类，必须挡掉。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _usage_cache_int(value):
+    """严格整数：JSON 里写成 12345.0 的不算。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _usage_cache_counts_ok(counts):
+    """{str: 数字} 形状的计数表（cost_missing / models / realms）。"""
+    if not isinstance(counts, dict):
+        return False
+    for key, value in counts.items():
+        if not isinstance(key, str) or not _usage_cache_number(value):
+            return False
+    return True
+
+
+def _usage_cache_bucket_ok(bucket):
+    """一个 by_model* 桶：折叠会就地累加这些键。"""
+    if not isinstance(bucket, dict):
+        return False
+    for field in _USAGE_CACHE_BUCKET_NUMBERS:
+        if not _usage_cache_number(bucket.get(field)):
+            return False
+    return _usage_cache_counts_ok(bucket.get("accounts"))
+
+
+def _usage_cache_snapshot_ok(snap):
+    """snapshot 折叠的形状。
+
+    少一个键，折叠或 _copy_usage_snapshot() 就会半路抛错，那次刷新报出半份
+    数字——校验必须挡在采用之前。
+    """
+    if not isinstance(snap, dict):
+        return False
+    for field in _USAGE_CACHE_SNAPSHOT_NUMBERS:
+        if not _usage_cache_number(snap.get(field)):
+            return False
+    for field in _USAGE_CACHE_SNAPSHOT_MAPS:
+        if not isinstance(snap.get(field), dict):
+            return False
+    if not _usage_cache_counts_ok(snap["cost_missing"]):
+        return False
+    for _, bucket in snap["by_model"].items():
+        if not _usage_cache_bucket_ok(bucket):
+            return False
+    for _, realms in snap["by_model_realm"].items():
+        if not isinstance(realms, dict):
+            return False
+        for _, bucket in realms.items():
+            if not _usage_cache_bucket_ok(bucket):
+                return False
+    for _, realms in snap["by_model_acct"].items():
+        if not isinstance(realms, dict):
+            return False
+        for _, accts in realms.items():
+            if not isinstance(accts, dict):
+                return False
+            for _, bucket in accts.items():
+                if not _usage_cache_bucket_ok(bucket):
+                    return False
+    return True
+
+
+def _usage_cache_stat_ok(stat):
+    """一个 analytics 统计桶：折叠会就地累加它的每一个字段。"""
+    if not isinstance(stat, dict):
+        return False
+    for field in _USAGE_CACHE_ANALYTICS_NUMBERS:
+        if not _usage_cache_number(stat.get(field)):
+            return False
+    return True
+
+
+def _usage_cache_models_ok(models):
+    """analytics 的 {model: {requests, tokens, reasoning, cost_cny}} 表。"""
+    if not isinstance(models, dict):
+        return False
+    for mid, stat in models.items():
+        if not isinstance(mid, str) or not isinstance(stat, dict):
+            return False
+        for field in ("requests", "tokens", "reasoning", "cost_cny"):
+            if not _usage_cache_number(stat.get(field)):
+                return False
+    return True
+
+
+def _usage_cache_analytics_ok(maps):
+    """analytics all-time maps：summary/accts/models/keys 四张表。"""
+    if not isinstance(maps, dict):
+        return False
+    if not _usage_cache_stat_ok(maps.get("summary")):
+        return False
+    accts, models, keys = maps.get("accts"), maps.get("models"), maps.get("keys")
+    if not isinstance(accts, dict) or not isinstance(models, dict) or not isinstance(keys, dict):
+        return False
+    for uid, entry in accts.items():
+        if not isinstance(uid, str) or not isinstance(entry, dict):
+            return False
+        for field in ("nickname", "realm", "domain"):
+            if not isinstance(entry.get(field), str):
+                return False
+        if not _usage_cache_stat_ok(entry.get("all_time")):
+            return False
+        if not _usage_cache_models_ok(entry.get("all_models")):
+            return False
+    for mid, entry in models.items():
+        if not isinstance(mid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("model"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("all_time")):
+            return False
+    for kid, entry in keys.items():
+        if not isinstance(kid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("key"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("all_time")):
+            return False
+        if not _usage_cache_models_ok(entry.get("all_models")):
+            return False
+        if not _usage_cache_counts_ok(entry.get("realms")):
+            return False
+        if not _usage_cache_number(entry.get("last_at")):
+            return False
+    return True
+
+
+def _usage_cache_buckets_ok(buckets):
+    """by_account 的 {account: 桶}：折叠会就地累加每个桶。"""
+    if not isinstance(buckets, dict):
+        return False
+    for key, bucket in buckets.items():
+        if not isinstance(key, str) or not isinstance(bucket, dict):
+            return False
+        if not isinstance(bucket.get("account"), str):
+            return False
+        for field in ("requests", "prompt_tokens", "completion_tokens",
+                      "reasoning_tokens", "cached_tokens", "total_tokens"):
+            if not _usage_cache_number(bucket.get(field)):
+                return False
+        if not _usage_cache_counts_ok(bucket.get("models")):
+            return False
+    return True
+
+
+def _usage_cache_take(kind, realm=None):
+    """从 checkpoint 数据里取出一份状态（取过即删），没有合适的返回 None。
+
+    snapshot/analytics 按 realm 匹配（JSON 的 null 表示不限 realm），
+    by_account 只有一份。逐份取用：同一份不会被第二次采用，也就不存在
+    「先取走、校验失败、下个 realm 又拿到一份脏状态」的路径。
+    """
+    data = _usage_cache_data()
+    if not data:
+        return None
+    entries = data.get(kind)
+    if not isinstance(entries, list):
+        return None
+    # 取走这一步也要在锁里：两个 realm 的首次刷新可能同时到这里，一个
+    # 边遍历边 pop、另一个也在 pop，遍历就会跳过条目。跳过的后果只是这次
+    # 不采用（安全方向），但少一次竞争就少一个要解释的路径。
+    with _usage_cache_lock:
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict):
+                continue
+            if kind != "by_account":
+                # realm 字段必须显式存在且类型正确：realm=None 的折叠（全部
+                # realm）和某个具体 realm 的折叠是两份不同的状态，缺字段的
+                # 条目一旦被 None 匹配走，就会把「只折了一个 realm」的数字
+                # 当成「全部 realm」报出去。
+                entry_realm = entry.get("realm")
+                if "realm" not in entry or not (entry_realm is None
+                                                or isinstance(entry_realm, str)):
+                    continue
+                if entry_realm != realm:
+                    continue
+            entries.pop(index)
+            return entry
+    return None
+
+
+def _usage_cache_position_ok(entry, log_key):
+    """校验一份状态的 (offset, key, tail)；不合格返回 None。
+
+    复用 #189 的两个原语而不是另造一套：offset 必须仍落在同一个文件的现有
+    字节里（dev/ino 相同、当前 size >= offset），并且 offset 前的最后 64 字节
+    与写下时一致——文件被替换、截短、copytruncate 后重写都会被这两条挡住。
+    """
+    offset = entry.get("offset")
+    key = entry.get("key")
+    tail_hex = entry.get("tail")
+    if not _usage_cache_int(offset) or offset <= 0:
+        return None
+    if not isinstance(key, list) or len(key) != 3 or not all(
+            _usage_cache_int(v) for v in key):
+        return None
+    if not isinstance(tail_hex, str):
+        return None
+    try:
+        tail = bytes.fromhex(tail_hex)
+    except ValueError:
+        return None
+    if not _log_offset_holds(tuple(key), log_key, offset):
+        return None
+    if _log_tail_signature(offset) != tail:
+        return None
+    return offset, tail
+
+
+def _usage_cache_fingerprints_ok(entry, pricing_key, realm_key):
+    """价格与 realm 指纹必须和当前进程读到的一致。
+
+    任一侧取不到（None）都算不一致：取不到就意味着「折叠当时读了什么」已经
+    无法确认，缓存不能当有效用。
+    """
+    if pricing_key is None or realm_key is None:
+        return False
+    return entry.get("pricing") == pricing_key and entry.get("realm_inputs") == realm_key
+
+
+def _usage_cache_note_adopted(kind, offset):
+    """采用成功后的节流初始化：刚加载的 offset 不算「有新字节要写」。
+
+    不初始化的话，重启后第一次刷新会把「offset 从 0 涨到文件尾」当成一次大
+    推进，白白重写一份内容相同的文件。
+    """
+    global _usage_cache_last_attempt
+    with _usage_cache_lock:
+        if offset > _usage_cache_progress.get(kind, 0):
+            _usage_cache_progress[kind] = offset
+        if offset > _usage_cache_checkpointed.get(kind, 0):
+            _usage_cache_checkpointed[kind] = offset
+        _usage_cache_last_attempt = time.time()
+
+
+def _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
+    """把 checkpoint 里对应 realm 的 snapshot 折叠装进 state；成功返回 True。
+
+    调用方持有 _usage_snap_state_lock，并且只在 state 全新时调用：采用只把
+    offset/tail 往前挪，折叠逻辑一行不动。
+    """
+    entry = _usage_cache_take("snapshot", r)
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    if not _usage_cache_fingerprints_ok(entry, _pricing_inputs_key(pricing),
+                                        _realm_inputs_key(realm)):
+        return False
+    snap = entry.get("snap")
+    if not _usage_cache_snapshot_ok(snap):
+        return False
+    offset, tail = position
+    state.update({"snap": snap, "offset": offset, "tail": tail})
+    _usage_cache_note_adopted("snapshot", offset)
+    return True
+
+
+def _usage_cache_adopt_by_account(state, log_key):
+    """by_account 折叠的采用；这一份没有价格/realm 指纹（折叠不读它们）。"""
+    entry = _usage_cache_take("by_account")
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    buckets = entry.get("buckets")
+    if not _usage_cache_buckets_ok(buckets):
+        return False
+    offset, tail = position
+    state.update({"buckets": buckets, "offset": offset, "tail": tail})
+    _usage_cache_note_adopted("by_account", offset)
+    return True
+
+
+def _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
+    """analytics all-time 折叠的采用。"""
+    entry = _usage_cache_take("analytics", realm)
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    if not _usage_cache_fingerprints_ok(entry, _pricing_inputs_key(pricing),
+                                        _realm_inputs_key(realm_inputs)):
+        return False
+    maps = entry.get("maps")
+    if not _usage_cache_analytics_ok(maps):
+        return False
+    offset, tail = position
+    state.update({"maps": maps, "offset": offset, "tail": tail})
+    _usage_cache_note_adopted("analytics", offset)
+    return True
+
+
+def _usage_cache_snapshot_entry(realm, state):
+    """一份 snapshot 状态的 JSON 形态；不适合落盘时返回 None。
+
+    只写「折叠成功过」的状态：错误路径会把 offset 归零，这里直接跳过——
+    offset 为 0 的缓存没有任何加速作用，写进去只会让加载端白校验一遍。
+    """
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    if offset <= 0 or not isinstance(tail, bytes) or state.get("snap") is None:
+        return None
+    pricing_key = _pricing_inputs_key(state.get("pricing"))
+    realm_key = _realm_inputs_key(state.get("realm"))
+    if pricing_key is None or realm_key is None:
+        return None
+    return {"realm": realm, "offset": offset,
+            "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
+            "pricing": pricing_key, "realm_inputs": realm_key,
+            # 深拷贝在锁内做，序列化在锁外做（见 _usage_cache_collect）。
+            "snap": _copy_usage_snapshot(state["snap"])}
+
+
+def _usage_cache_by_account_entry(state):
+    """by_account 折叠的 JSON 形态；同上，只写折叠成功过的。"""
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    buckets = state.get("buckets")
+    if offset <= 0 or not isinstance(tail, bytes) or not isinstance(buckets, dict):
+        return None
+    return {"offset": offset, "key": list(state["key"] or (0, 0, 0)),
+            "tail": tail.hex(),
+            # 深拷贝：序列化在锁外做，桶里的 models 必须和活状态脱钩。
+            "buckets": {k: dict(v, models=dict(v.get("models") or {}))
+                        for k, v in buckets.items()}}
+
+
+def _usage_cache_analytics_entry(realm, state):
+    """analytics all-time 折叠的 JSON 形态；同上。"""
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    if offset <= 0 or not isinstance(tail, bytes):
+        return None
+    pricing_key = _pricing_inputs_key(state.get("pricing"))
+    realm_key = _realm_inputs_key(state.get("realm"))
+    if pricing_key is None or realm_key is None:
+        return None
+    return {"realm": realm, "offset": offset,
+            "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
+            "pricing": pricing_key, "realm_inputs": realm_key,
+            "maps": _copy_analytics_all_time(state["maps"])}
+
+
+def _usage_cache_collect():
+    """逐把取三份状态，做锁外可序列化的深拷贝；返回 (payload, offsets) 或 None。
+
+    每份状态单独加锁、单独拷贝，三份之间不强求同一个瞬间：加载端对每份分别
+    校验 offset/tail/指纹，一份新一份旧也各自成立。锁是逐把拿、随即放开的，
+    不存在嵌套——写盘路径不能制造「snapshot -> analytics」这样的锁序边。
+    """
+    snapshot_entries = []
+    by_account_entries = []
+    analytics_entries = []
+    offsets = {}
+    with _usage_snap_state_lock:
+        for realm, state in _usage_snap_state.items():
+            entry = _usage_cache_snapshot_entry(realm, state)
+            if entry is not None:
+                snapshot_entries.append(entry)
+                offsets["snapshot"] = max(offsets.get("snapshot", 0), state["offset"])
+    with _byacct_state_lock:
+        entry = _usage_cache_by_account_entry(_byacct_state)
+        if entry is not None:
+            by_account_entries.append(entry)
+            offsets["by_account"] = _byacct_state["offset"]
+    with _analytics_state_lock:
+        for realm, state in _analytics_state.items():
+            entry = _usage_cache_analytics_entry(realm, state)
+            if entry is not None:
+                analytics_entries.append(entry)
+                offsets["analytics"] = max(offsets.get("analytics", 0), state["offset"])
+    if not (snapshot_entries or by_account_entries or analytics_entries):
+        return None
+    payload = {"schema": _USAGE_CACHE_SCHEMA, "written_at": time.time(),
+               "snapshot": snapshot_entries, "by_account": by_account_entries,
+               "analytics": analytics_entries}
+    return payload, offsets
+
+
+def _usage_cache_write(payload):
+    """原子写：同目录临时文件 + os.replace。
+
+    直接在目标文件上写，崩在中间会留下半份 JSON；加载端虽然能识别（解析失败
+    按没有缓存处理），但一份完整的旧文件更省事。不 fsync：这是一份加速件，
+    掉电后写坏或丢掉的，加载端一律当没有缓存，不值得为它多刷一次盘。
+
+    不排序键：checkpoint 里 dict 的键顺序就是折叠时的插入顺序（先出现的先
+    排），加载回来必须与冷启动逐字节一致——响应的 JSON 字节里键序是可见的，
+    而冷启动折叠出的顺序正是这份插入顺序。排序只留给 _object_digest() 那种
+    「只要内容一样就算一样」的指纹。
+    """
+    path = _usage_cache_path()
+    tmp = path + ".tmp"
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _usage_cache_maybe_save(kind, offset):
+    """一次折叠成功后，按节流阈值决定要不要把三份状态落盘。
+
+    调用点必须在状态锁之外：这里要逐把取三份状态，在状态锁里再取别的状态锁
+    会构成锁序环（snapshot -> analytics 与反向同时存在）。任何异常都吞掉——
+    落盘失败只损失一次加速，不能影响这次刷新。
+    """
+    global _usage_cache_last_attempt
+    if not _usage_cache_enabled():
+        return
+    try:
+        # 串行化整段写盘：两个请求线程可能同时判定「该写」，而临时文件名是
+        # 固定的（path + ".tmp"，和 save_runtime_override 一致），两个写者
+        # 同时打开同一个临时文件会互相截断。等锁的一方在锁里会重新判定一遍，
+        # 第一个写者已经把 checkpointed 推上去，于是它多半直接返回。
+        with _usage_cache_write_lock:
+            now = time.time()
+            with _usage_cache_lock:
+                if offset > _usage_cache_progress.get(kind, 0):
+                    _usage_cache_progress[kind] = offset
+                min_bytes = _usage_cache_min_bytes()
+                min_seconds = _usage_cache_min_seconds()
+                due = any(_usage_cache_progress.get(k, 0)
+                          - _usage_cache_checkpointed.get(k, 0) >= min_bytes
+                          for k in _usage_cache_progress)
+                if not due and (now - _usage_cache_last_attempt) < min_seconds:
+                    return
+                # 记「尝试」而不是「成功」：只读文件系统上失败会一直成立，
+                # 不退避的话每次刷新都去试写一遍。
+                _usage_cache_last_attempt = now
+            collected = _usage_cache_collect()
+            if collected is None:
+                return
+            payload, offsets = collected
+            _usage_cache_write(payload)
+            with _usage_cache_lock:
+                for k, value in offsets.items():
+                    if value > _usage_cache_checkpointed.get(k, 0):
+                        _usage_cache_checkpointed[k] = value
+    except Exception as exc:
+        log("usage aggregate cache write failed: %s" % exc)
+
+
 def runtime_settings_view():
     """Current panel-visible settings (never returns the password or the key)."""
     key = API_KEY or ""
@@ -2344,11 +3636,14 @@ def runtime_settings_view():
         "model_daily_token_limit": wb_settings.model_daily_token_limit(ACCOUNTS_DIR),
         "pricing_refresh_minutes": wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR),
         "credits_refresh_hours": wb_settings.credits_refresh_hours(ACCOUNTS_DIR),
+        "ui_language": wb_settings.ui_language(ACCOUNTS_DIR),
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
+        "accounts_collapsed": wb_settings.accounts_collapsed(ACCOUNTS_DIR),
+        "update_check_enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
         "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
         "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
@@ -3785,77 +5080,77 @@ def translate_max_completion_tokens(obj):
     except (TypeError, ValueError):
         pass
 # ---------------------------------------------------------------------------
-# 模型封鎖表
+# 模型封锁表
 #
-# 背景：客戶端除了使用者的對話，還會自己發背景請求（記憶整理、自動複核等）。
-# 這些請求不經過模型選單，而是直接使用目錄上的模型 ID，因此可能在使用者
-# 沒有實際操作時，用付費模型消耗額度。
+# 背景：客户端除了使用者的对话，还会自己发背景请求（记忆整理、自动复核等）。
+# 这些请求不经过模型选单，而是直接使用目录上的模型 ID，因此可能在使用者
+# 没有实际操作时，用付费模型消耗额度。
 #
-# 對策（選用）：把要拒絕的模型填進 ALLOWED_MODELS / BANNED_SUBSTRING /
-#               EXTRA_BANNED；命中的請求在本機直接回 400，完全不碰上游。
-#               預設全部為空 = 不封鎖任何模型，行為與原版相同。
+# 对策（选用）：把要拒绝的模型填进 ALLOWED_MODELS / BANNED_SUBSTRING /
+#               EXTRA_BANNED；命中的请求在本机直接回 400，完全不碰上游。
+#               预设全部为空 = 不封锁任何模型，行为与原版相同。
 #
-# 調整方式：
-#   要放行某個模型 -> 加進 ALLOWED_MODELS 或 ALLOWED_PREFIXES
-#   要連非 gpt 的模型一起擋 -> 加進 EXTRA_BANNED
+# 调整方式：
+#   要放行某个模型 -> 加进 ALLOWED_MODELS 或 ALLOWED_PREFIXES
+#   要连非 gpt 的模型一起挡 -> 加进 EXTRA_BANNED
 # ---------------------------------------------------------------------------
 
-# 允許放行的模型（你要用的）
+# 允许放行的模型（你要用的）
 ALLOWED_MODELS = {
-    # 預設不封鎖任何模型；填入模型 id 即可只放行這些
+    # 预设不封锁任何模型；填入模型 id 即可只放行这些
 }
 
-# 允許前綴：涵蓋 -high / -preview / [1M] 等變體
+# 允许前缀：涵盖 -high / -preview / [1M] 等变体
 ALLOWED_PREFIXES = ()
 
-# 封鎖字串：模型名裡含這個就拒絕
+# 封锁字串：模型名里含这个就拒绝
 BANNED_SUBSTRING = ""
 
-# 額外封鎖的內部模型（不在 gpt- 前綴內，但也會燒點）
+# 额外封锁的内部模型（不在 gpt- 前缀内，但也会烧点）
 EXTRA_BANNED = set()
 
 
 def is_model_banned(model):
-    """True 表示這個模型名不該被送去上游。
+    """True 表示这个模型名不该被送去上游。
 
-    規則：ALLOWED_MODELS / ALLOWED_PREFIXES 命中就放行；其餘只要命中
-    BANNED_SUBSTRING 或 EXTRA_BANNED 就拒絕，沒命中則照常送往上游。
-    三個設定預設都是空的，所以預設不封鎖任何模型。
+    规则：ALLOWED_MODELS / ALLOWED_PREFIXES 命中就放行；其余只要命中
+    BANNED_SUBSTRING 或 EXTRA_BANNED 就拒绝，没命中则照常送往上游。
+    三个设定预设都是空的，所以预设不封锁任何模型。
     """
     if not model:
         return False
     m = str(model).strip().lower()
-    # 白名單優先（含 -high / -preview / [1M] 這類變體）
+    # 白名单优先（含 -high / -preview / [1M] 这类变体）
     if m in ALLOWED_MODELS:
         return False
     if any(m.startswith(a) for a in ALLOWED_PREFIXES):
         return False
-    # 命中封鎖字串就拒絕
+    # 命中封锁字串就拒绝
     if BANNED_SUBSTRING and BANNED_SUBSTRING in m:
         return True
-    # 其他已知會燒點的內部模型
+    # 其他已知会烧点的内部模型
     if m in EXTRA_BANNED:
         return True
     return False
 
 
 # ---------------------------------------------------------------------------
-# 背景請求攔截
+# 背景请求拦截
 #
-# Codex App 除了使用者的對話，還會自己發背景請求（記憶整理、環境建議、自動複核…）。
-# 這些請求不經過模型選單，所以單靠模型白名單擋不住 —— 它們可能直接用目錄上
-# 的付費模型（例如 gpt-6-astra 這類），在使用者沒有實際操作時照樣消耗額度。
+# Codex App 除了使用者的对话，还会自己发背景请求（记忆整理、环境建议、自动复核…）。
+# 这些请求不经过模型选单，所以单靠模型白名单挡不住 —— 它们可能直接用目录上
+# 的付费模型（例如 gpt-6-astra 这类），在使用者没有实际操作时照样消耗额度。
 #
-# Codex 會在 client_metadata 裡帶 x-codex-turn-metadata，內容像：
+# Codex 会在 client_metadata 里带 x-codex-turn-metadata，内容像：
 #   {"request_kind":"memory","thread_source":"memory_consolidation",
 #    "turn_trigger":"memory_consolidation"}
-# 這裡就靠這個標記判斷：命中背景關鍵字 -> 本地直接拒絕，不碰上游、不扣點。
+# 这里就靠这个标记判断：命中背景关键字 -> 本地直接拒绝，不碰上游、不扣点。
 # ---------------------------------------------------------------------------
 
-# 要不要攔截背景請求（False = 全部放行，維持原行為）
+# 要不要拦截背景请求（False = 全部放行，维持原行为）
 BLOCK_BACKGROUND_REQUESTS = False
 
-# 命中任一關鍵字就視為背景請求（不分大小寫、子字串比對）
+# 命中任一关键字就视为背景请求（不分大小写、子字串比对）
 BACKGROUND_TRIGGER_KEYWORDS = (
     "memory_consolidation",
     "memory-write",
@@ -3902,7 +5197,7 @@ def turn_metadata_fields(payload):
     if not isinstance(meta, dict):
         return {}
 
-    # 收集所有可能的來源/觸發欄位
+    # 收集所有可能的来源/触发栏位
     fields = {}
     for key, value in meta.items():
         if isinstance(value, str) and value.strip().startswith("{"):
@@ -3936,9 +5231,9 @@ def is_compaction_request(payload):
 
 
 def background_request_reason(payload):
-    """若這是 Codex 自己發的背景請求，回傳說明字串；否則回傳 ""。
+    """若这是 Codex 自己发的背景请求，回传说明字串；否则回传 ""。
 
-    只看 client_metadata，不碰訊息內容。
+    只看 client_metadata，不碰讯息内容。
     """
     fields = turn_metadata_fields(payload)
     if not fields:
@@ -4102,7 +5397,7 @@ def build_upstream_body(payload):
     # upstream to ignore unknown keys.
     for _marker in [k for k in body if str(k).startswith("_")]:
         body.pop(_marker, None)
-    # dict(payload) 會把原始模型名一起帶過去，所以別名要在這裡覆蓋回去
+    # dict(payload) 会把原始模型名一起带过去，所以别名要在这里覆盖回去
     body["model"] = model
     body["messages"] = messages
     # Repair tool-call pairing before the body leaves: a call whose result never
@@ -4345,19 +5640,19 @@ def gateway_hint(status, message):
 
 
 # ---------------------------------------------------------------------------
-# 出站身分自動切換
+# 出站身分自动切换
 #
-# 官方有三套身分（workbuddy / vscode / cli），端點與配額通道各不相同，
-# 對照表見 wb_identity._ENDPOINTS。
+# 官方有三套身分（workbuddy / vscode / cli），端点与配额通道各不相同，
+# 对照表见 wb_identity._ENDPOINTS。
 #
-# 某模型在某條通道被限流（429 / code 6004）時，換成另一套身分通常還能繼續
-# 用 —— 那是另一條配額線。每輪最多切 MAX_PRODUCT_SWITCHES 次，避免來回彈跳。
+# 某模型在某条通道被限流（429 / code 6004）时，换成另一套身分通常还能继续
+# 用 —— 那是另一条配额线。每轮最多切 MAX_PRODUCT_SWITCHES 次，避免来回弹跳。
 #
-# 身分會寫進憑證檔並在重啟後讀回（issue #76）：面板手動切換當下就落盤，
-# 這裡的自動切換則在下一次任何 save() 時一併寫入。
+# 身分会写进凭证档并在重启后读回（issue #76）：面板手动切换当下就落盘，
+# 这里的自动切换则在下一次任何 save() 时一并写入。
 #
-# 這個開關交給面板設定決定（issue #67），預設關閉：自動切換會吃掉重試預算，
-# 也會把帳號留在操作者沒主動選過的身分上，要用的話自己開。
+# 这个开关交给面板设定决定（issue #67），预设关闭：自动切换会吃掉重试预算，
+# 也会把帐号留在操作者没主动选过的身分上，要用的话自己开。
 # ---------------------------------------------------------------------------
 
 MAX_PRODUCT_SWITCHES = 4
@@ -4370,7 +5665,7 @@ def auto_switch_product_enabled():
 
 
 def _switch_count(account, model):
-    """這一輪已經切過幾次（60 秒內的切換算同一輪）。"""
+    """这一轮已经切过几次（60 秒内的切换算同一轮）。"""
     entry = _SWITCH_LOG.get((account.uid, model))
     if not entry:
         return 0
@@ -4381,11 +5676,11 @@ def _switch_count(account, model):
 
 
 def _try_switch_product(account, model):
-    """429 時換身分重試。回傳 True 表示已切換、可以重試。
+    """429 时换身分重试。回传 True 表示已切换、可以重试。
 
-    同一請求內最多切 MAX_PRODUCT_SWITCHES 次：
+    同一请求内最多切 MAX_PRODUCT_SWITCHES 次：
       cli -> workbuddy -> cli -> workbuddy
-    四次都不行就放棄，讓呼叫端回報真正的 429。
+    四次都不行就放弃，让呼叫端回报真正的 429。
     """
     count = _switch_count(account, model)
     if count >= MAX_PRODUCT_SWITCHES:
@@ -4414,7 +5709,7 @@ def _try_switch_product(account, model):
 
 
 def reset_switch_counter(account, model):
-    """成功之後歸零，下一次請求重新享有 4 次切換額度。"""
+    """成功之后归零，下一次请求重新享有 4 次切换额度。"""
     _SWITCH_LOG.pop((account.uid, model), None)
 
 
@@ -4482,13 +5777,19 @@ def rate_limit_is_account_level(detail, reset_at):
 def parse_rate_limit_reset(detail):
     """Pull the reset time out of an upstream 429 body, if it names one.
 
-    Upstream answers code 6004 with "... your usage will reset at
-    2026-09-19 18:29:03 UTC+8 ...". Returns an epoch or None. Kept tolerant on
-    purpose: an unparseable body must not break the request path.
+    Upstream answers code 6004 with a reset wall clock, but the wording is
+    per-realm: the intl form is "... your usage will reset at
+    2026-09-19 18:29:03 UTC+8 ...", the cn form is "... 将在
+    2026-10-09 14:44:59 UTC+8 重置 ...". Matching only the English form left
+    every cn 429 without a reset time, so it read as an account-level soft
+    limit and cooled the whole credential instead of parking just the
+    throttled model. Returns an epoch or None. Kept tolerant on purpose: an
+    unparseable body must not break the request path.
     """
     if not detail:
         return None
-    m = re.search(r"reset at\s+(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", detail)
+    m = re.search(r"(?:reset at|将在)\s*"
+                  r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})", detail)
     if not m:
         return None
     stamp = m.group(1).replace("T", " ")
@@ -4653,8 +5954,8 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 account.note_error("HTTP 429 (model throttled)", model=model, until=reset_at,
                                    cooldown=wait, detail=detail)
                 if auto_switch and _try_switch_product(account, model):
-                    # 換了身分就等於換了一條配額線：要把它從「已試過」拿掉，
-                    # 並清掉剛剛記下的模型冷卻，否則下一輪迴圈會找不到帳號。
+                    # 换了身分就等于换了一条配额线：要把它从「已试过」拿掉，
+                    # 并清掉刚刚记下的模型冷却，否则下一轮回圈会找不到帐号。
                     tried.discard(account.uid)
                     try:
                         account.clear_error(model=model)
@@ -5033,21 +6334,21 @@ CUSTOM_TOOL_HINT = (
 
 
 # ---------------------------------------------------------------------------
-# namespace 工具拒絕
+# namespace 工具拒绝
 #
-# Codex 會把 MCP server / 外掛工具用 type="namespace" 的形式送出來。實測行為：
-#   反代「接受」namespace 工具 -> app 把 MCP／外掛工具當成不可執行
+# Codex 会把 MCP server / 外挂工具用 type="namespace" 的形式送出来。实测行为：
+#   反代「接受」namespace 工具 -> app 把 MCP／外挂工具当成不可执行
 #                                -> 每一次呼叫都回 "unsupported call"
-#   反代「拒絕」namespace 工具 -> app 自動 fallback 成 flat function 清單
-#                                -> 全部工具恢復正常
-# （此行為在 Command Code proxy.mjs 的 CC_REJECT_NAMESPACE_TOOLS 實驗裡有記載，
-#   Agent Router 也是靠直接拒絕這類請求才正常的。）
+#   反代「拒绝」namespace 工具 -> app 自动 fallback 成 flat function 清单
+#                                -> 全部工具恢复正常
+# （此行为在 Command Code proxy.mjs 的 CC_REJECT_NAMESPACE_TOOLS 实验里有记载，
+#   Agent Router 也是靠直接拒绝这类请求才正常的。）
 #
-# 所以在這裡主動回一個格式明確的 400，逼 app 走 fallback。
-# 想還原成「照單全收」就把 REJECT_NAMESPACE_TOOLS 改成 False。
+# 所以在这里主动回一个格式明确的 400，逼 app 走 fallback。
+# 想还原成「照单全收」就把 REJECT_NAMESPACE_TOOLS 改成 False。
 # ---------------------------------------------------------------------------
 
-REJECT_NAMESPACE_TOOLS = False  # 保持關閉：正解是展開+還原 namespace
+REJECT_NAMESPACE_TOOLS = False  # 保持关闭：正解是展开+还原 namespace
 
 NAMESPACE_TOOL_MESSAGE = (
     'Unsupported tool type "namespace": this endpoint only supports flat '
@@ -5056,7 +6357,7 @@ NAMESPACE_TOOL_MESSAGE = (
 
 
 def find_namespace_tool(tools):
-    """回傳第一個 type=="namespace" 的工具名稱，沒有就回 None。"""
+    """回传第一个 type=="namespace" 的工具名称，没有就回 None。"""
     for t in tools or []:
         if isinstance(t, dict) and str(t.get("type") or "").lower() == "namespace":
             return str(t.get("name") or t.get("server_label") or "(unnamed)")
@@ -5101,19 +6402,19 @@ def _downgrade_custom_tool(tool):
 
 
 # ---------------------------------------------------------------------------
-# namespace 工具：展開 + 還原
+# namespace 工具：展开 + 还原
 #
-# 新版 Codex App 把 MCP／外掛工具用 namespace 形式送出：
+# 新版 Codex App 把 MCP／外挂工具用 namespace 形式送出：
 #   {"type":"namespace","name":"codex_app","tools":[{name:"list_threads",...}]}
 #
-# 上游 Chat Completions 只認 flat function，看不懂 namespace。
-# 但 App 回程是用 (name, namespace) 兩個欄位找執行器 ——
-# 只給 flat name，App 一律回 "unsupported call"（實測 js / list_threads 全滅）。
+# 上游 Chat Completions 只认 flat function，看不懂 namespace。
+# 但 App 回程是用 (name, namespace) 两个栏位找执行器 ——
+# 只给 flat name，App 一律回 "unsupported call"（实测 js / list_threads 全灭）。
 #
 # 三件事：
-#   1. Expand   送上游前把 namespace 展開成 flat function，記住 name -> namespace
-#   2. Normalise 模型回傳的 name 可能是 js / ns__js / ns::js，都要能解析
-#   3. Restore   回程的 function_call / custom_tool_call 補上 namespace 欄位
+#   1. Expand   送上游前把 namespace 展开成 flat function，记住 name -> namespace
+#   2. Normalise 模型回传的 name 可能是 js / ns__js / ns::js，都要能解析
+#   3. Restore   回程的 function_call / custom_tool_call 补上 namespace 栏位
 #
 # 参考：某开源 CodeBuddy/WorkBuddy 反向代理项目的 tool-namespaces 说明
 # ---------------------------------------------------------------------------
@@ -5123,13 +6424,13 @@ _NS_SEP = "__"
 
 
 def expand_namespace_tools(tools, _depth=0):
-    """把 namespace 展開成 flat function 清單，其餘工具原樣保留。
+    """把 namespace 展开成 flat function 清单，其余工具原样保留。
 
-      * 子工具可能在 tools / children / functions 任一欄位
-      * namespace 子工具常常沒有 type 欄位，展開時補成上游認得的 flat function
-      * custom / web_search 等非 function 項目原樣留下，交給既有管線處理
-      * 同名只留第一個
-      * 回傳 (flat_tools, name_to_namespace)
+      * 子工具可能在 tools / children / functions 任一栏位
+      * namespace 子工具常常没有 type 栏位，展开时补成上游认得的 flat function
+      * custom / web_search 等非 function 项目原样留下，交给既有管线处理
+      * 同名只留第一个
+      * 回传 (flat_tools, name_to_namespace)
     """
     flat = []
     mapping = {}
@@ -5192,7 +6493,7 @@ def expand_namespace_tools(tools, _depth=0):
 
 
 def resolve_namespaced_name(name, mapping):
-    """把模型回傳的名字解析回 (bare_name, namespace)。接受 js / ns__js / ns::js。"""
+    """把模型回传的名字解析回 (bare_name, namespace)。接受 js / ns__js / ns::js。"""
     if not name:
         return name, ""
     name = str(name)
@@ -5207,7 +6508,7 @@ def resolve_namespaced_name(name, mapping):
                 return tail, mapping[tail]
             return tail, head
 
-    # ns__tool 用精確比對，避免 namespace 內含 '__'（如 codex_apps__github）時切錯
+    # ns__tool 用精确比对，避免 namespace 内含 '__'（如 codex_apps__github）时切错
     for tool, ns in mapping.items():
         if name == ns + _NS_SEP + tool:
             return tool, ns
@@ -5216,10 +6517,10 @@ def resolve_namespaced_name(name, mapping):
 
 
 def stamp_namespace(item, mapping):
-    """把模型回傳的扁平工具名還原成 (name, namespace)。
+    """把模型回传的扁平工具名还原成 (name, namespace)。
 
-    串流的 response.output_item.done 事件才是客戶端派發工具呼叫的依據，
-    所以每個 function_call / custom_tool_call 項目都要在送出前補上 namespace。
+    串流的 response.output_item.done 事件才是客户端派发工具呼叫的依据，
+    所以每个 function_call / custom_tool_call 项目都要在送出前补上 namespace。
     """
     if not mapping or not isinstance(item, dict):
         return item
@@ -5231,7 +6532,7 @@ def stamp_namespace(item, mapping):
 
 
 def apply_namespace_to_calls(output_items, mapping):
-    """替 Responses 的 function_call / custom_tool_call 補上 namespace。"""
+    """替 Responses 的 function_call / custom_tool_call 补上 namespace。"""
     if not mapping or not isinstance(output_items, list):
         return output_items, 0
     fixed = 0
@@ -5313,10 +6614,10 @@ def web_tools_active(body):
 
 
 def sum_usage(total, part):
-    """把一輪的 token 用量累加起來。
+    """把一轮的 token 用量累加起来。
 
-    代跑網路工具會多跑好幾次上游，那些 token 是真的花掉的，所以記帳要加總，
-    不能讓最後一輪蓋掉前面幾輪。
+    代跑网路工具会多跑好几次上游，那些 token 是真的花掉的，所以记帐要加总，
+    不能让最后一轮盖掉前面几轮。
     """
     if not isinstance(part, dict):
         return total
@@ -5336,9 +6637,9 @@ _CITATION_MD_RE = re.compile(r"\[([^\]\n]{1,200})\]\((https?://[^)\s]+)\)")
 
 
 def build_citations(text, sources):
-    """把模型實際引用到的來源轉成 url_citation annotations。
+    """把模型实际引用到的来源转成 url_citation annotations。
 
-    只標註真的有出現在工具輸出裡的網址 —— 模型自己編的連結不會被當成引用。
+    只标注真的有出现在工具输出里的网址 —— 模型自己编的连结不会被当成引用。
     """
     text = str(text or "")
     if not text or not sources:
@@ -5393,12 +6694,12 @@ def build_citations(text, sources):
 
 def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
                                 drop_tools=False):
-    """執行反代自己代跑的網路工具，把結果餵回模型，回傳新的上游連線。
+    """执行反代自己代跑的网路工具，把结果喂回模型，回传新的上游连线。
 
-    drop_tools=True 表示這是最後一輪：把網路工具從工具清單收回，模型沒有東西
-    可以再呼叫，只能用手上的結果把話講完。舊版在回合用盡時合成一個
-    resp_wrapup（status=completed、output=[]）收尾，那等於把失敗偽裝成正常
-    結束，客戶端看到的就是「講到一半斷掉」——issue #43。
+    drop_tools=True 表示这是最后一轮：把网路工具从工具清单收回，模型没有东西
+    可以再呼叫，只能用手上的结果把话讲完。旧版在回合用尽时合成一个
+    resp_wrapup（status=completed、output=[]）收尾，那等于把失败伪装成正常
+    结束，客户端看到的就是「讲到一半断掉」——issue #43。
     """
     convo = holder.get("convo_messages")
     if convo is None:
@@ -5713,8 +7014,8 @@ def responses_to_chat(payload):
         flat_tools, ns_map = expand_namespace_tools(payload["tools"])
         chat["tools"] = _tools_for_chat(flat_tools)
         chat["_namespace_map"] = ns_map
-    # 客戶端宣告 web_search / web_fetch 時，把那份宣告換成我們的
-    # function（見 wb_webtools.install_tool_defs）。
+    # 客户端宣告 web_search / web_fetch 时，把那份宣告换成我们的
+    # function（见 wb_webtools.install_tool_defs）。
     # 看板开关关闭时原样透传，客户端自己的同名工具不受影响。
     if local_web_tools_enabled():
         wants = wb_webtools.client_wants_web(payload.get("tools"))
@@ -6514,7 +7815,7 @@ def stream_responses_events(upstream, model, holder):
     saw_done = False
     custom_names = set(holder.get("custom_names") or ())
     ns_map = holder.get("namespace_map") or {}
-    # 由反代代跑的網路工具呼叫，收集起來不轉發給客戶端
+    # 由反代代跑的网路工具呼叫，收集起来不转发给客户端
     _internal_calls = {}
     # Only reach for same-named calls when this request's definitions were the
     # gateway's own (see web_tools_active); otherwise they belong to the client.
@@ -6557,7 +7858,7 @@ def stream_responses_events(upstream, model, holder):
             "summary": [{"type": "summary_text", "text": "".join(reason_parts)}],
         }
     def _annotations():
-        """引用來源：只認工具真的回傳過的網址。"""
+        """引用来源：只认工具真的回传过的网址。"""
         try:
             return build_citations("".join(text_parts), holder.get("web_sources") or [])
         except Exception:
@@ -6648,7 +7949,7 @@ def stream_responses_events(upstream, model, holder):
                 full_text = clean_text
         if dsml_calls and not tool_calls_map:
             for dc in dsml_calls:
-                # DSML 形狀的網路工具呼叫一樣由反代執行
+                # DSML 形状的网路工具呼叫一样由反代执行
                 if _own_web_tools and wb_webtools.is_internal_tool(dc.get("name")):
                     entry = _internal_calls.setdefault(dc.get("id") or _new_id("call_"),
                                                        {"name": dc.get("name"), "arguments": "{}"})
@@ -6686,8 +7987,8 @@ def stream_responses_events(upstream, model, holder):
                     "output_index": out_idx,
                     "item": fc_item,
                 })
-        # 這一輪如果有代跑的網路工具呼叫，就把完成事件留給下一輪，
-        # 否則客戶端會以為整個回合已經結束（舊版是在回合用盡時補一個合成的
+        # 这一轮如果有代跑的网路工具呼叫，就把完成事件留给下一轮，
+        # 否则客户端会以为整个回合已经结束（旧版是在回合用尽时补一个合成的
         # resp_wrapup，那才是 issue #43 真正的病灶）。
         if _internal_calls:
             holder.setdefault("internal_calls", []).extend(
@@ -6695,8 +7996,8 @@ def stream_responses_events(upstream, model, holder):
                 for v in _internal_calls.values()
             )
             holder["suppress_completion"] = True
-            # 讓 App 畫出原生的「已搜尋網路」卡片：對每個代跑的呼叫送出
-            # web_search_call 項目與生命週期事件。
+            # 让 App 画出原生的「已搜寻网路」卡片：对每个代跑的呼叫送出
+            # web_search_call 项目与生命周期事件。
             for _v in _internal_calls.values():
                 _nm = str(_v.get("name") or "")
                 try:
@@ -6781,8 +8082,8 @@ def stream_responses_events(upstream, model, holder):
         if not holder.get("suppress_completion"):
             yield ev("response.completed", {"response": final})
 
-    # 只有第一輪開場。第二輪以後再送一次 response.created，客戶端會
-    # 看到同一則回應被開了兩次。
+    # 只有第一轮开场。第二轮以后再送一次 response.created，客户端会
+    # 看到同一则回应被开了两次。
     if not holder.get("suppress_lifecycle"):
         yield ev("response.created", {"response": resp_obj("in_progress")})
         yield ev("response.in_progress", {"response": resp_obj("in_progress")})
@@ -6825,7 +8126,7 @@ def stream_responses_events(upstream, model, holder):
                 fn_name = fn.get("name") or ""
                 fn_args = fn.get("arguments") or ""
                 call_id = tc.get("id") or ""
-                # web_search / web_fetch 由反代執行，不轉發給客戶端
+                # web_search / web_fetch 由反代执行，不转发给客户端
                 if idx in _internal_calls or (
                         _own_web_tools and fn_name
                         and wb_webtools.is_internal_tool(fn_name)):
@@ -6861,9 +8162,9 @@ def stream_responses_events(upstream, model, holder):
                     else:
                         item["type"] = "function_call"
                         item["arguments"] = ""
-                    # namespace 必須在 output_item.added 就帶上（照 CiderCC-UwU
-                    # proxy.mjs openItem 的做法）。事後才補只會改到 done，
-                    # 客戶端早就從 added 事件派發過了。
+                    # namespace 必须在 output_item.added 就带上（照 CiderCC-UwU
+                    # proxy.mjs openItem 的做法）。事后才补只会改到 done，
+                    # 客户端早就从 added 事件派发过了。
                     stamp_namespace(item, ns_map)
                     yield ev("response.output_item.added", {
                         "output_index": out_idx,
@@ -6993,6 +8294,23 @@ def stream_responses_events(upstream, model, holder):
 # ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
+def _if_none_match_hit(header_value, etag):
+    """If-None-Match 头是否命中给定的 ETag。
+
+    RFC 7232 §3.2：字段值是一个逗号分隔的 entity-tag 列表，且 If-None-Match
+    用弱比较——W/ 前缀忽略，所以 W/"x" 与 "x" 等同；"*" 匹配任何已存在的表示。
+    """
+    for token in header_value.split(","):
+        token = token.strip()
+        if token == "*":
+            return True
+        if token.startswith("W/"):
+            token = token[2:].strip()
+        if token and token == etag:
+            return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # Which configured API key the caller used, set by _key_ok(). Its bound
@@ -7392,7 +8710,7 @@ class Handler(BaseHTTPRequestHandler):
                 "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
                 % (model, served, name, used))
     def _banned_model_error(self, model):
-        """被封鎖的模型直接報錯，不碰上游、不扣任何點數。"""
+        """被封锁的模型直接报错，不碰上游、不扣任何点数。"""
         if not is_model_banned(model):
             return ""
         return banned_model_message(model)
@@ -7464,11 +8782,23 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/usage") or path.startswith("/v1/usage"):
             return True
+        if path.startswith("/activity"):
+            return True
         if path.startswith("/tasks") or path.startswith("/scheduler"):
             return True
         if path.startswith("/settings"):
             return True
+        if path.startswith("/updates"):
+            return True
         if path.startswith("/logs"):
+            return True
+        # The pricing table is the panel's own view of the estimate, not part
+        # of the OpenAI-compatible surface: its writes (/pricing/refresh,
+        # /pricing/mapping) were already panel-only, and the read side returns
+        # the same management state plus resolved project-local file paths.
+        if path.startswith("/pricing"):
+            return True
+        if path.startswith("/agents"):
             return True
         return False
     def do_OPTIONS(self):
@@ -7517,6 +8847,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_usage_perf(query)
         if path == "/usage/timeseries":
             return self._get_usage_timeseries(query)
+        if path == "/activity/history":
+            return self._get_activity_history(query)
         if path == "/tasks":
             return self._get_tasks(query)
         if path == "/scheduler":
@@ -7525,6 +8857,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_pricing()
         if path == "/settings":
             return self._get_settings()
+        if path == "/updates":
+            return self._get_updates()
         if path == "/proxy/slots":
             if not self._panel_ok():
                 return self._error(
@@ -7537,6 +8871,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._get_logs_export()
         if path == "/settings/reveal":
             return self._get_settings_reveal(query)
+        if path == "/agents":
+            return self._get_agents()
         return self._error(404, "not found", "invalid_request_error")
     def _get_dashboard(self):
         return self._dashboard()
@@ -7620,6 +8956,29 @@ class Handler(BaseHTTPRequestHandler):
             page = 1
         req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
         return self._json(200, recent_usage(limit, realm=req_realm, page=page))
+
+    def _get_activity_history(self, query):
+        """账号每日活动的结构化历史（issue #34）。只读，供面板的签到记录用。
+
+        筛选条件写错时返回 400 而不是静默忽略：调用方拿着一个被忽略的
+        result=failed 会以为「这几天没有失败」，实际上它拿回的是全部结果。
+        """
+        if not self._authorized():
+            return
+
+        def first(name):
+            values = query.get(name) or [""]
+            return (values[0] if values else "") or ""
+
+        try:
+            payload = wb_activity.query(range_key=first("range") or None,
+                                        uid=first("uid"),
+                                        task=first("task"),
+                                        result=first("result"),
+                                        limit=first("limit") or None)
+        except ValueError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        return self._json(200, payload)
 
     def _get_accounts_credits(self):
         if not self._authorized():
@@ -7813,6 +9172,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         return self._json(200, runtime_settings_view())
 
+    def _get_updates(self):
+        """What the running build is, and whether a newer stable release exists.
+
+        Read-only and cheap: it reports the last check's outcome, never runs
+        one. The panel's "check now" is the POST below.
+        """
+        if not self._authorized():
+            return
+        if UPDATES:
+            return self._json(200, UPDATES.status())
+        return self._json(200, {
+            "current_version": running_version(),
+            "latest_version": None, "update_available": False,
+            "enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
+            "checking": False, "last_attempt": None, "last_success": None,
+            "last_error": "", "release_url": "", "published_at": "",
+            "msg": "更新检查未运行",
+        })
+
     def _get_logs(self, query):
         if not self._authorized():
             return
@@ -7863,10 +9241,61 @@ class Handler(BaseHTTPRequestHandler):
                 body = fh.read()
         except Exception as exc:
             return self._error(500, f"dashboard.html unavailable: {exc}")
+        # The static file carries a placeholder; replace it with the instance
+        # default so the first paint already uses the right language.
+        language = wb_settings.ui_language(ACCOUNTS_DIR)
+        body = body.replace(
+            b'data-ui-language="__WB_UI_LANGUAGE__"',
+            ('data-ui-language="%s"' % language).encode("utf-8"),
+        )
+        # 面板首页是纯静态资源（服务端逐字节原样发出、不含任何机密），所以可以
+        # 允许浏览器存储副本、每次打开再回源校验：校验命中回 304（无 body），
+        # 省下整页（约 470KB）的重复下载，手机 / Tailscale 远程访问体感最明显。
+        #
+        # 校验符必须覆盖**所有**影响响应体的输入，不只是文件本身：body 还取决于
+        # 上面注入的 ui_language——用户改一次界面语言，文件没动、body 却变了；
+        # 若 tag 只看文件，客户端带旧 tag 回来会拿到 304 + 旧语言的页面。所以 tag
+        # 由 (文件 mtime_ns, size, language) 三者派生：前两个代表文件字节（本文件
+        # 只在应用更新时被整体替换、从不原地修改），第三个就是本次实际注入的值，
+        # 三者组合变化 ⇔ 响应字节变化。mtime 用纳秒精度，同一秒内的两次替换也能
+        # 得到不同 tag。
+        etag = None
+        try:
+            st = os.stat(DASHBOARD_HTML)
+            # 强校验符（不带 W/ 前缀）：响应是「文件字节 + 本次语言」的精确副本，
+            # tag 变 ⇔ 字节变。
+            etag = '"%x-%x-%s"' % (st.st_mtime_ns, st.st_size, language)
+        except Exception:
+            # stat 取不到（或时间戳无法表示）不是致命错误：退化为一律按普通
+            # 200 处理，只是这一次没有条件请求支持，绝不让面板页本身打不开。
+            etag = None
+        # 只认 If-None-Match，不发送、也不理会 If-Modified-Since。Last-Modified
+        # 只能描述文件的 mtime，而响应体还取决于语言：日期无法表达这个输入，
+        # 一旦发布出去，偏好日期的客户端就会拿它校验，语言一变就拿到过期的
+        # 304。ETag 覆盖全部输入、单靠它就足够完备，所以干脆不提供日期——
+        # 不发布它，客户端就没有用它的理由（RFC 7232 §2.2 里 Last-Modified 只是
+        # SHOULD，响应体并非单一文件、没有可一致表达的修改日期，只发 ETag 完备）。
+        if etag is not None:
+            inm = self.headers.get("If-None-Match")
+            if inm is not None and _if_none_match_hit(inm, etag):
+                # 304 不带 body：浏览器手里已有一份，一个字节都不用再传。也不带
+                # Content-Length：304 按 RFC 7230 §3.3.3 在空行处结束，再报全量
+                # 长度反而会诱使客户端 / 代理等待一个永远不会来的 body。校验符和
+                # Cache-Control 必须原样重发（RFC 7232 §4.1），否则缓存会丢掉状态。
+                self.send_response(304)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        # no-cache 而不是 no-store：允许存储，但每次使用前必须回源校验；配合
+        # 上面的校验符，校验命中的代价是一次 304 而不是整页约 470KB。不加
+        # max-age：没有它浏览器每次打开都会校验，应用更新后新版页面立即生效。
+        self.send_header("Cache-Control", "no-cache")
+        if etag is not None:
+            self.send_header("ETag", etag)
         self.end_headers()
         self.wfile.write(body)
     def _read_chunked_body(self, max_bytes=MAX_PAYLOAD_BYTES):
@@ -8185,6 +9614,15 @@ class Handler(BaseHTTPRequestHandler):
                 wb_settings.set_credits_refresh_hours(ACCOUNTS_DIR, hours)
             if CREDITS_REFRESHER:
                 CREDITS_REFRESHER.wake()
+        if "ui_language" in payload:
+            # Instance-wide default language. The dashboard overrides this per
+            # browser with localStorage; this value is the fallback when no
+            # browser-local preference exists.
+            raw = payload.get("ui_language")
+            if not isinstance(raw, str) or raw not in ("zh", "zh-Hant", "en"):
+                return self._error(400, "ui_language must be zh, zh-Hant or en",
+                                   "invalid_request_error")
+            reply["ui_language"] = wb_settings.set_ui_language(ACCOUNTS_DIR, raw)
         if "pricing_variant_inherit" in payload:
             # Strictly a JSON boolean, like the other switches: "false" as a
             # string would be truthy and silently keep the feature on.
@@ -8226,6 +9664,28 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_local_web_tools(ACCOUNTS_DIR, raw)
             reply["local_web_tools"] = raw
+        if "accounts_collapsed" in payload:
+            # A disclosure state, and the only thing this branch may touch: the
+            # submission carries just this key, so the settings it does not name
+            # survive the write.
+            raw = payload.get("accounts_collapsed")
+            if not isinstance(raw, bool):
+                return self._error(400, "accounts_collapsed must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_accounts_collapsed(ACCOUNTS_DIR, raw)
+            reply["accounts_collapsed"] = raw
+        if "update_check_enabled" in payload:
+            # Strictly a JSON boolean, like the switches above: "false" as a
+            # string would be truthy and silently start the daily GitHub call.
+            raw = payload.get("update_check_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "update_check_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_update_check_enabled(ACCOUNTS_DIR, raw)
+            reply["update_check_enabled"] = raw
+            if UPDATES and raw:
+                # Turning it on should not wait out the rest of the poll sleep.
+                UPDATES.wake()
         if "upstream" in payload:
             raw = payload.get("upstream")
             if not isinstance(raw, dict):
@@ -8344,6 +9804,194 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"candidates": discover_proxy_slots()})
         return self._error(404, "not found", "invalid_request_error")
 
+    # ---- one-click agent integration (wb_agents) ----
+
+    def _agents_base_url_hint(self):
+        """Best guess at the URL a local client should point at.
+
+        Derived from the bound socket; a 0.0.0.0 bind is unreachable for a
+        client, so it is reported as 127.0.0.1 instead.
+        """
+        host, port = "", 0
+        try:
+            host, port = self.server.server_address[:2]
+        except Exception:
+            pass
+        host = str(host or "").strip() or "127.0.0.1"
+        if host in ("0.0.0.0", "::", ""):
+            host = "127.0.0.1"
+        return "http://%s:%d/v1" % (host, int(port or 0))
+
+    def _agents_models(self):
+        """Flat model list for the picker; bundled intl+cn catalog, deduped.
+
+        Live sources stay out of this path on purpose: the panel must answer
+        even when the upstream is down, so a failure here is simply a shorter
+        list, never an error.
+        """
+        models = []
+        seen = set()
+        try:
+            try:
+                entries = fetch_models()
+            except Exception:
+                entries = []
+            if entries:
+                sources = ((mid, meta) for mid, meta in entries)
+            else:
+                sources = (
+                    (item.get("id"), item)
+                    for item in (list(getattr(wb_catalog, "STATIC_INTL_MODELS", []))
+                                 + list(getattr(wb_catalog, "STATIC_CN_MODELS", [])))
+                    if isinstance(item, dict)
+                )
+            for mid, meta in sources:
+                mid = str(mid or "").strip()
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                meta = meta if isinstance(meta, dict) else {}
+                entry = {"id": mid}
+                ctx = meta.get("maxInputTokens")
+                window = meta.get("contextWindow")
+                if isinstance(window, dict) and window.get("defaultLength"):
+                    ctx = window.get("defaultLength")
+                if not ctx and isinstance(window, dict):
+                    lengths = window.get("supportedLengths") or []
+                    ctx = lengths[-1] if lengths else None
+                if ctx:
+                    try:
+                        entry["context_window"] = int(ctx)
+                    except (TypeError, ValueError):
+                        pass
+                out = meta.get("maxOutputTokens")
+                if out:
+                    try:
+                        entry["max_output"] = int(out)
+                    except (TypeError, ValueError):
+                        pass
+                name = meta.get("name")
+                if name:
+                    entry["name"] = name
+                models.append(entry)
+        except Exception:
+            pass
+        return models
+
+    def _get_agents(self):
+        keys = []
+        try:
+            for entry in configured_keys():
+                if entry.get("enabled"):
+                    keys.append({
+                        "id": entry.get("id"),
+                        "name": entry.get("name") or "",
+                        "enabled": True,
+                    })
+        except Exception:
+            keys = []
+        return self._json(200, {
+            "clients": list(wb_agents.overview(ACCOUNTS_DIR).values()),
+            "models": self._agents_models(),
+            "keys": keys,
+            "global_key_set": bool(API_KEY),
+            "auth_required": auth_required(),
+            "gateway": {"base_url": self._agents_base_url_hint()},
+        })
+
+    def _agents_resolve_key(self, payload, warnings):
+        """Pick the gateway key to hand to the client, per the payload.
+
+        Returns the key string, or None when the request should fail. The
+        failure message is appended to `warnings` only for the soft-fallback
+        case; hard failures raise via the caller's 400 mapping.
+        """
+        key_id = str(payload.get("key_id") or "").strip()
+        if key_id == "__global":
+            return API_KEY or None
+        keys = configured_keys()
+        if key_id:
+            for entry in keys:
+                if entry.get("id") == key_id:
+                    return entry.get("key") or None
+            raise wb_agents.AgentConfigError(
+                "no configured key with id %r" % key_id)
+        # Default: the global key when set, else the first enabled panel key.
+        if API_KEY:
+            return API_KEY
+        for entry in keys:
+            if entry.get("enabled"):
+                return entry.get("key") or None
+        return None
+
+    def _handle_agents_apply(self, payload):
+        client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+        if not client_id:
+            return self._error(400, "client is required", "invalid_request_error")
+        base_url = str(payload.get("base_url") or "").strip()
+        if not re.match(r"^https?://", base_url):
+            return self._error(
+                400, "base_url must start with http:// or https://",
+                "invalid_request_error")
+        model = str(payload.get("model") or "").strip() or None
+        models = payload.get("models")
+        if not models:
+            # Fall back to the gateway's discovered catalog so clients that embed
+            # model definitions (OpenCode, DSH, Crush) receive the full model list
+            # even when the front-end omitted the field.
+            models = self._agents_models()
+        if not isinstance(models, list):
+            return self._error(400, "models must be a list",
+                               "invalid_request_error")
+        # A runaway picker must not turn into a megabyte config file.
+        models = models[:80]
+        cleaned_models = []
+        for item in models:
+            if isinstance(item, dict) and item.get("id"):
+                cleaned_models.append(item)
+            elif isinstance(item, str) and item.strip():
+                cleaned_models.append({"id": item.strip()})
+        warnings = []
+        try:
+            api_key = self._agents_resolve_key(payload, warnings)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        if not api_key:
+            if auth_required():
+                return self._error(
+                    400, "no gateway key available - 请先配置 API Key",
+                    "invalid_request_error")
+            api_key = "wb-local"
+            warnings.append("gateway has no key configured; wrote placeholder "
+                            "'wb-local' (auth is off, so any value works)")
+        try:
+            result = wb_agents.integrate(
+                ACCOUNTS_DIR, client_id, base_url, api_key,
+                model=model, models=cleaned_models)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._error(500, "agents apply failed: %s" % exc)
+        result["warnings"] = warnings
+        log("agents apply: client=%s base_url=%s model=%s files=%d"
+            % (client_id, base_url, model or "-", len(result.get("files") or [])),
+            tag="agents")
+        return self._json(200, result)
+
+    def _handle_agents_restore(self, payload):
+        client_id = str(payload.get("client") or payload.get("client_id") or "").strip()
+        if not client_id:
+            return self._error(400, "client is required", "invalid_request_error")
+        try:
+            result = wb_agents.restore(ACCOUNTS_DIR, client_id)
+        except wb_agents.AgentConfigError as exc:
+            return self._error(400, str(exc), "invalid_request_error")
+        except Exception as exc:
+            return self._error(500, "agents restore failed: %s" % exc)
+        log("agents restore: client=%s files=%d"
+            % (client_id, len(result.get("restored") or [])), tag="agents")
+        return self._json(200, result)
+
     def _handle_panel(self, path):
         """Panel login, logout and the settings screen (password + API key)."""
         payload = self._payload_or_error()
@@ -8452,9 +10100,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_accounts_import(payload)
         return self._error(404, "unknown account endpoint", "invalid_request_error")
     def _route_accounts_product(self, payload):
-        """切換出站身分（cli <-> workbuddy），並即時回傳結果。
+        """切换出站身分（cli <-> workbuddy），并即时回传结果。
 
-        官方有兩套身分、兩條配額線。某條滿了可以切到另一條繼續用。
+        官方有两套身分、两条配额线。某条满了可以切到另一条继续用。
         """
         target = str(payload.get("product") or "").strip().lower()
         uid = payload.get("uid")
@@ -8477,9 +10125,9 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             try:
                 if account.set_product(target):
-                    # 立刻落盤：set_product() 只改記憶體，而面板上這一下是操作者
-                    # 的明確選擇，不能等到別的路徑（refresh / 簽到 / 查積分）剛好
-                    # 存檔才生效——切完就重啟容器的人會白白丟掉這次切換。
+                    # 立刻落盘：set_product() 只改记忆体，而面板上这一下是操作者
+                    # 的明确选择，不能等到别的路径（refresh / 签到 / 查积分）刚好
+                    # 存档才生效——切完就重启容器的人会白白丢掉这次切换。
                     try:
                         account.save(ACCOUNTS_DIR)
                     except Exception as exc:
@@ -8624,6 +10272,19 @@ class Handler(BaseHTTPRequestHandler):
             "accounts_count": len(targets)
         })
 
+    def _route_update_check(self):
+        """Run one release check now, on the operator's explicit request.
+
+        Inline rather than "started, poll /updates": it is a single bounded
+        GitHub request, and the answer is what the button is for. `manual=True`
+        ignores both the daily switch and the 24h window.
+        """
+        if not UPDATES:
+            return self._json(200, {"ok": False, "msg": "更新检查未运行"})
+        status = UPDATES.check(manual=True)
+        status["ok"] = True
+        return self._json(200, status)
+
     def _route_scheduler_trigger(self, payload):
         if SCHEDULER:
             return self._json(200, SCHEDULER.trigger_now())
@@ -8715,7 +10376,7 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.checkin()
+            res = account.checkin(trigger="manual")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
@@ -8729,7 +10390,7 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.daily_chat()
+            res = account.daily_chat(trigger="manual")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
         return self._json(200, {"results": results, "accounts": account_views()})
 
@@ -8748,7 +10409,7 @@ class Handler(BaseHTTPRequestHandler):
         for account in targets:
             if account is None:
                 continue
-            res = account.daily_chat_web()
+            res = account.daily_chat_web(trigger="manual")
             log("account %s: 网页通道打卡 -> %s"
                 % (account.uid[:8], res.get("conversation") if res.get("ok") else res.get("error")),
                 level="INFO" if res.get("ok") else "WARN")
@@ -9027,8 +10688,8 @@ class Handler(BaseHTTPRequestHandler):
         # so it cannot replay a prior turn. Silently ignoring the field would
         # answer a follow-up as if it were a fresh conversation - the client
         # gets a normal-looking reply with the context missing. Say so instead.
-        # 拒絕 namespace 工具，逼 Codex fallback 成 flat 工具清單。
-        # 不這樣做的話，MCP／外掛工具全部會被 app 判定為不可執行。
+        # 拒绝 namespace 工具，逼 Codex fallback 成 flat 工具清单。
+        # 不这样做的话，MCP／外挂工具全部会被 app 判定为不可执行。
         if payload.get("previous_response_id"):
             return self._error(
                 400,
@@ -9127,8 +10788,8 @@ class Handler(BaseHTTPRequestHandler):
                   "realm": realm}
         first_ms = None
         try:
-            # 一輪跑完如果模型要的是 web_search / web_fetch，就由反代
-            # 執行、把結果餵回去再跑一輪。客戶端從頭到尾只看到一則連續的回應。
+            # 一轮跑完如果模型要的是 web_search / web_fetch，就由反代
+            # 执行、把结果喂回去再跑一轮。客户端从头到尾只看到一则连续的回应。
             rounds = 0
             total_usage = None
             while True:
@@ -9140,13 +10801,13 @@ class Handler(BaseHTTPRequestHandler):
                         first_ms = int((time.time() - t_start) * 1000)
                     self.wfile.write(clean_responses_frame(frame))
                     self.wfile.flush()
-                # 每一輪的 token 都是真的花掉的，記帳要加總
+                # 每一轮的 token 都是真的花掉的，记帐要加总
                 total_usage = sum_usage(total_usage, holder.get("usage"))
                 internal = holder.get("internal_calls") or []
                 if not internal:
                     break
                 rounds += 1
-                # 用完就收回工具，讓模型自己收尾；這裡不合成任何事件。
+                # 用完就收回工具，让模型自己收尾；这里不合成任何事件。
                 give_up = rounds > wb_webtools.MAX_WEB_ROUNDS
                 try:
                     upstream.close()
@@ -9179,8 +10840,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
         finally:
-            # 代跑多輪時 upstream 會被換掉，外層的 with 只認得最開始那一條，
-            # 最後一條要在這裡收掉。
+            # 代跑多轮时 upstream 会被换掉，外层的 with 只认得最开始那一条，
+            # 最后一条要在这里收掉。
             try:
                 upstream.close()
             except Exception:
@@ -9193,13 +10854,13 @@ class Handler(BaseHTTPRequestHandler):
         return
 
     def _responses_nonstream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
-        # 跟串流那條一樣：客戶端宣告 web_search / web_fetch 時由反代代跑。
-        # 中間那幾輪對客戶端不可見，最後才組成一個 Responses 物件回傳；不這樣
-        # 做的話 web_search 的 function_call 會直接漏給客戶端，客戶端只會回
+        # 跟串流那条一样：客户端宣告 web_search / web_fetch 时由反代代跑。
+        # 中间那几轮对客户端不可见，最后才组成一个 Responses 物件回传；不这样
+        # 做的话 web_search 的 function_call 会直接漏给客户端，客户端只会回
         # 一句 unsupported call。
         sources = []
         rounds = 0
-        # 開關關閉時不攔同名呼叫：那是客戶端自己的工具。
+        # 开关关闭时不拦同名呼叫：那是客户端自己的工具。
         web_tools = web_tools_active(base_body)
         while True:
             try:
@@ -9408,6 +11069,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/updates/check":
+            # Panel-only management write, like the pricing ones. No body to
+            # read: the action takes no parameters, so a button that posts
+            # nothing must not be answered with "invalid JSON body".
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_update_check()
         if path in ("/pricing/refresh", "/pricing/mapping"):
             # Panel-only management writes (the pricing table is the panel's
             # own view of the estimate). Registered here because the generic
@@ -9431,6 +11099,17 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             return self._handle_proxy_slots(path, payload)
+        if path in ("/agents/apply", "/agents/restore"):
+            if not self._panel_ok():
+                return self._error(
+                    401, "panel password required", "invalid_request_error"
+                )
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            if path == "/agents/apply":
+                return self._handle_agents_apply(payload)
+            return self._handle_agents_restore(payload)
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
@@ -9487,8 +11166,8 @@ class Handler(BaseHTTPRequestHandler):
             _chat_slots.release()
 
     def _dispatch_chat_post(self, path, payload):
-        # 先擋背景請求：Codex 自己發的（記憶整理／環境建議／自動複核）
-        # 不算「使用者實際使用」，一律本地拒絕，不碰上游。
+        # 先挡背景请求：Codex 自己发的（记忆整理／环境建议／自动复核）
+        # 不算「使用者实际使用」，一律本地拒绝，不碰上游。
         if BLOCK_BACKGROUND_REQUESTS:
             reason = background_request_reason(payload)
             if reason:
@@ -9676,6 +11355,15 @@ class Handler(BaseHTTPRequestHandler):
                      fp=fp, account=account.uid, key=self._key_id(), effort=effort)
         return self._json(200, result)
 
+def running_version():
+    """The version this process reports, e.g. "1.6.17".
+
+    tests/_test_release_engineering.py pins the two version literals and asserts
+    they agree, so the update checker reads the running one from the handler
+    instead of becoming a third copy that could drift away from both.
+    """
+    return Handler.server_version.split("/", 1)[-1]
+
 def main():
     args = _parse_cli_args()
     _apply_cli_overrides(args)
@@ -9725,6 +11413,9 @@ def _apply_cli_overrides(args):
     if args.usage_dir:
         USAGE_DIR = os.path.abspath(args.usage_dir)
         USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
+    # 账号活动历史与用量日志同目录，并且要在任何后台线程起来之前定下来：调度器
+    # 的第一轮巡检不能落在 --usage-dir 生效之前，否则记录会写进默认目录。
+    wb_activity.set_data_dir(USAGE_DIR)
 
 def _probe_running_instance(args):
     # Refuse to start a second copy. On Windows SO_REUSEADDR lets two sockets
@@ -9831,6 +11522,16 @@ def _bootstrap_runtime(args):
     global CREDITS_REFRESHER
     CREDITS_REFRESHER = wb_accounts.CreditsRefresher(POOL)
     CREDITS_REFRESHER.start()
+    global UPDATES
+    # Release discovery only: the checker asks GitHub what the newest stable
+    # release is and reports it. It never downloads, replaces or restarts
+    # anything, and with the daily switch off (the default) it sends nothing.
+    UPDATES = wb_updates.UpdateChecker(
+        current_version=running_version(),
+        settings_dir=ACCOUNTS_DIR,
+        log=lambda msg: add_log_entry("[更新] %s" % msg, tag="update"),
+    )
+    UPDATES.start()
     return api_key_generated
 
 def _report_first_run(args):

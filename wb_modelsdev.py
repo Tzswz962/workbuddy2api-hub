@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""wb_modelsdev.py — 模型 context/output 四級查找（panel context_catalog.go + modelsdev.go）。
+"""wb_modelsdev.py — 模型 context/output 四级查找（panel context_catalog.go + modelsdev.go）。
 
-查找鏈（每個欄位獨立）：
-  1. 上游動態值（remote > 0）權威；
-  2. 內建知識表 CONTEXT_FALLBACK（panel 實測 + models.dev 共識值，CN/global 共用）；
-  3. 本地 model.json 快取（models.dev 索引的持久化，accounts 目錄）；
-  4. models.dev 按需拉取（異步、5s 超時、失敗靜默；拉到後寫 model.json）。
+查找链（每个栏位独立）：
+  1. 上游动态值（remote > 0）权威；
+  2. 内建知识表 CONTEXT_FALLBACK（panel 实测 + models.dev 共识值，CN/global 共用）；
+  3. 本地 model.json 快取（models.dev 索引的持久化，accounts 目录）；
+  4. models.dev 按需拉取（异步、5s 超时、失败静默；拉到后写 model.json）。
 
-未知 context → 1_000_000（寧可高估：低估會讓客戶端提前截斷上下文）；未知
-output → None（輸出上限沒有「高估安全側」，不編造、省略字段）。
-純標準庫，Python 3.9 兼容。
+未知 context → 1_000_000（宁可高估：低估会让客户端提前截断上下文）；未知
+output → None（输出上限没有「高估安全侧」，不编造、省略字段）。
+纯标准库，Python 3.9 兼容。
 """
 
 import json
@@ -31,7 +31,7 @@ CACHE_FILENAME = "model.json"
 VENDOR_SOURCES = ("zai", "moonshotai", "moonshotai-cn", "openai", "google",
                   "deepseek", "minimax")
 
-# 內建知識表（panel context_catalog.go 移植；值為實測 / models.dev 共識）。
+# 内建知识表（panel context_catalog.go 移植；值为实测 / models.dev 共识）。
 CONTEXT_FALLBACK = {
     # GLM (z-ai)
     "glm-5.2": (1000000, 131072),

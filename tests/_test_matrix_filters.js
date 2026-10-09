@@ -64,11 +64,32 @@ const perf = {
   by_model_acct: {},
 };
 
-// The alternation must be grouped: writing 筛选结果合计|全部模型合计[...]
-// makes the trailing part apply to the second branch only, so the capture is
-// undefined whenever the label is "Filtered" and the check fails spuriously.
-const summaryReq = (o) => { const m = o.match(/(?:筛选结果合计|全部模型合计)[\s\S]*?<td data-label="请求数">([^<]*)</); return m ? m[1] : null; };
-const summaryTok = (o) => { const m = o.match(/<td data-label="总 Token"><b style="color:var\(--accent\)">([^<]*)</); return m ? m[1] : null; };
+/* Read a cell out of the matrix's summary row - the row that carries the
+ * summary label. Anchoring on that row is what keeps the numbers honest: every
+ * data row carries a 总 Token cell of its own, so a cell found anywhere else in
+ * the table must not be able to answer for the summary (issue #58). A cell's
+ * inner markup is presentation, not contract - <b> vs <strong>, how an inline
+ * style is spelled or ordered, an extra attribute on the <td> - so only the
+ * cell's visible text is compared.
+ *
+ * The label stays a grouped alternation: ungrouped, a trailing pattern would
+ * bind to the second branch only, the trap the old summaryReq() called out. */
+const SUMMARY_LABEL = /(?:筛选结果合计|全部模型合计)/;
+function summaryRow(out) {
+  const label = SUMMARY_LABEL.exec(out);
+  if (!label) return null;
+  const start = out.lastIndexOf('<tr', label.index);
+  const end = out.indexOf('</tr>', label.index);
+  return (start < 0 || end < start) ? null : out.slice(start, end);
+}
+function summaryCell(out, label) {
+  const row = summaryRow(out);
+  if (!row) return null;
+  const cell = row.match(new RegExp('<td[^>]*data-label="' + label + '"[^>]*>([\\s\\S]*?)</td>'));
+  return cell ? cell[1].replace(/<[^>]*>/g, '').trim() : null;
+}
+const summaryReq = (out) => summaryCell(out, '请求数');
+const summaryTok = (out) => summaryCell(out, '总 Token');
 let pass = 0, fail = 0;
 const check = (label, cond, extra) => { if (cond) { pass++; console.log('  [PASS] ' + label); } else { fail++; console.log('  [FAIL] ' + label + (extra ? '  ' + extra : '')); } };
 

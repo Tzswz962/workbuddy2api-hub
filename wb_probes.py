@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""wb_probes.py — 真實輸出上限探測結果（panel scripts/probe_max_tokens.py 的 hub 化）。
+"""wb_probes.py — 真实输出上限探测结果（panel scripts/probe_max_tokens.py 的 hub 化）。
 
-網關送 max_tokens=1,000,000 時上游會靜默鉗制到模型真實上限；探測腳本送一次
-「要求超長輸出」的請求，若 finish_reason == "length" 則本次 completion_tokens
-就是上游的鉗制值。結果寫 accounts/output_probes.json，/v1/models 對應模型標注
-output_clamp / max_output_tokens_clamped（僅標注，不覆蓋模型規格值）。
+网关送 max_tokens=1,000,000 时上游会静默钳制到模型真实上限；探测脚本送一次
+「要求超长输出」的请求，若 finish_reason == "length" 则本次 completion_tokens
+就是上游的钳制值。结果写 accounts/output_probes.json，/v1/models 对应模型标注
+output_clamp / max_output_tokens_clamped（仅标注，不覆盖模型规格值）。
 
-純標準庫，Python 3.9 兼容。
+纯标准库，Python 3.9 兼容。
 """
 
 import json

@@ -47,6 +47,25 @@ PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
 # reads as on: an install that predates the setting behaves exactly as it did,
 # and only an explicit false turns the feature off.
 PRICING_ENABLED_KEY = "pricing_enabled"
+# Whether the panel's account section is collapsed. Missing, or anything that is
+# not the boolean true, reads as expanded: a fresh install and a value a hand
+# edit or an older client left behind both keep the default view, and only an
+# explicit true hides the accounts.
+ACCOUNTS_COLLAPSED_KEY = "accounts_collapsed"
+
+# Instance-wide default UI language. The dashboard can override this per
+# browser with localStorage; this key is the fallback when no override exists.
+UI_LANGUAGE_KEY = "ui_language"
+UI_LANGUAGE_DEFAULT = "zh"
+UI_LANGUAGE_VALUES = ("zh", "zh-Hant", "en")
+
+# Whether the gateway checks GitHub for a newer release once a day. Missing key
+# reads as off - the opposite of the switches above - because turning it on
+# makes the gateway send a request on its own schedule.
+UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
+# The last-check bookkeeping for that daily check. One small object, never a
+# general update-state store: see update_check_state().
+UPDATE_CHECK_STATE_KEY = "update_check"
 
 _lock = threading.RLock()
 
@@ -897,6 +916,25 @@ def set_pricing_enabled(accounts_dir, enabled):
     return enabled
 
 
+def ui_language(accounts_dir):
+    """Instance-wide default UI language (zh / zh-Hant / en)."""
+    value = load(accounts_dir).get(UI_LANGUAGE_KEY)
+    if isinstance(value, str) and value in UI_LANGUAGE_VALUES:
+        return value
+    return UI_LANGUAGE_DEFAULT
+
+
+def set_ui_language(accounts_dir, value):
+    """Persist the instance-wide default UI language."""
+    if not isinstance(value, str) or value not in UI_LANGUAGE_VALUES:
+        raise ValueError("ui_language must be zh, zh-Hant or en")
+    with _lock:
+        data = load(accounts_dir)
+        data[UI_LANGUAGE_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+
 UPSTREAM_DEFAULTS = {
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
@@ -1072,6 +1110,92 @@ def set_local_web_tools(accounts_dir, enabled):
         data["local_web_tools"] = enabled
         save(accounts_dir, data)
     return enabled
+
+
+def accounts_collapsed(accounts_dir):
+    """Whether the panel's account section is collapsed.
+
+    Expanded unless the stored value is the boolean true. `is True` is the whole
+    normalisation: a hand-edited "false", a 1, an object or a missing key all
+    read as expanded, so none of them can hide the accounts by accident. The
+    panel only ever writes a real boolean through set_accounts_collapsed.
+    """
+    return load(accounts_dir).get(ACCOUNTS_COLLAPSED_KEY) is True
+
+
+def set_accounts_collapsed(accounts_dir, collapsed):
+    """Persist the account-section disclosure state. Returns the stored boolean."""
+    collapsed = bool(collapsed)
+    with _lock:
+        data = load(accounts_dir)
+        data[ACCOUNTS_COLLAPSED_KEY] = collapsed
+        save(accounts_dir, data)
+    return collapsed
+
+
+def update_check_enabled(accounts_dir):
+    """Whether the gateway checks for a newer release once a day.
+
+    Off unless the operator turns it on, and off for an install that predates
+    the key: this is the one setting here whose missing value means "no", since
+    enabling it makes the gateway talk to GitHub on its own schedule. The manual
+    check in the panel ignores this switch entirely.
+    """
+    return load(accounts_dir).get(UPDATE_CHECK_ENABLED_KEY) is True
+
+
+def set_update_check_enabled(accounts_dir, enabled):
+    """Persist the daily-check switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[UPDATE_CHECK_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def update_check_state(accounts_dir):
+    """The last-check bookkeeping: when it ran, and the version it saw.
+
+    Deliberately three fields. The 24h cadence needs `last_attempt` to survive a
+    restart, and `latest_version` is what lets the panel answer right after one;
+    everything else about a check lives in memory. Nothing from the HTTP
+    exchange - URL, headers, body - is ever stored here.
+    """
+    stored = load(accounts_dir).get(UPDATE_CHECK_STATE_KEY)
+    stored = stored if isinstance(stored, dict) else {}
+    out = {"last_attempt": 0.0, "last_success": 0.0, "latest_version": ""}
+    for key in ("last_attempt", "last_success"):
+        value = stored.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            out[key] = float(value)
+    version = stored.get("latest_version")
+    if isinstance(version, str):
+        out["latest_version"] = version.strip()[:32]
+    return out
+
+
+def record_update_check(accounts_dir, at=None, success=False, latest_version=""):
+    """Write one check's outcome. Returns the stored state.
+
+    One narrow write path on purpose: a checker that could write arbitrary keys
+    into settings.json would turn it into an update-state database, which is
+    what this is meant not to become.
+    """
+    stamp = float(at if at is not None else time.time())
+    with _lock:
+        data = load(accounts_dir)
+        state = data.get(UPDATE_CHECK_STATE_KEY)
+        state = dict(state) if isinstance(state, dict) else {}
+        state["last_attempt"] = stamp
+        if success:
+            state["last_success"] = stamp
+        version = str(latest_version or "").strip()[:32]
+        if version:
+            state["latest_version"] = version
+        data[UPDATE_CHECK_STATE_KEY] = state
+        save(accounts_dir, data)
+    return update_check_state(accounts_dir)
 
 
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")

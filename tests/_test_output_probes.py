@@ -61,10 +61,10 @@ class ProbeFileTests(unittest.TestCase):
 
 class ProbeRunTests(unittest.TestCase):
     def test_dry_run_sends_nothing(self):
-        result = wb_probes.probe_model("http://127.0.0.1:8789", "k", "m1",
+        result = wb_probes.probe_model("http://127.0.0.1:8788", "k", "m1",
                                        dry_run=True)
         self.assertTrue(result["dry_run"])
-        self.assertEqual(result["url"], "http://127.0.0.1:8789/v1/chat/completions")
+        self.assertEqual(result["url"], "http://127.0.0.1:8788/v1/chat/completions")
         self.assertEqual(result["request"]["max_tokens"], 1000000)
 
     def test_length_finish_reason_is_the_clamp(self):
@@ -74,7 +74,7 @@ class ProbeRunTests(unittest.TestCase):
                 "usage": {"completion_tokens": 32000, "total_tokens": 32100},
             })
 
-        result = wb_probes.probe_model("http://127.0.0.1:8789", "k", "m1",
+        result = wb_probes.probe_model("http://127.0.0.1:8788", "k", "m1",
                                        urlopen=fake_urlopen)
         self.assertEqual(result["clamped"], 32000)
         self.assertEqual(result["finish_reason"], "length")
@@ -86,7 +86,7 @@ class ProbeRunTests(unittest.TestCase):
                 "usage": {"completion_tokens": 120, "total_tokens": 200},
             })
 
-        result = wb_probes.probe_model("http://127.0.0.1:8789", "k", "m1",
+        result = wb_probes.probe_model("http://127.0.0.1:8788", "k", "m1",
                                        urlopen=fake_urlopen)
         self.assertIsNone(result["clamped"])
         self.assertEqual(result["observed_completion_tokens"], 120)
