@@ -2296,6 +2296,67 @@ def remaining_usage_etag():
     return _cache_etag("remaining", "all", built_at)
 
 
+# ---------------------------------------------------------------------------
+# 剩余用量优先调度（开关默认关，见 wb_settings.remaining_priority_enabled）
+#
+# 「快达到估计限额的 (账号, 模型) 先被交出」：估计剩余占预算的比例越小权重
+# 越高，分派侧（AccountPool._pick_remaining_first）只对权重 > 1 的组合做平滑
+# 加权轮询。分档而不是线性：面板上说得清（剩不到 30% 开始加权、5% 以内最重），
+# 测试里也钉得住确切数字。权重表由请求路径每请求推给池——数据方向与
+# apply_daily_* 一致，池不反向依赖本模块。
+# ---------------------------------------------------------------------------
+_REMAINING_PRIORITY_BANDS = ((0.05, 4), (0.15, 3), (0.30, 2))
+
+
+def _remaining_schedule_weight(remaining, budget):
+    """估计剩余对应的调度权重：1 = 不加权，2..4 = 越接近耗尽越重。
+
+    没有可比较的尺度时不猜：预算样本缺失（budget 为 None/0）或剩余未知
+    （remaining 为 None）一律不加权。剩余 <= 0 也不加权——它没有「先用掉」
+    的意义（真正用满的组合正在冷却，本来就不可用；estimated 口径下它只是
+    下界，不值得把流量往一个可能已经耗尽的组合上压）。
+    """
+    try:
+        remaining = float(remaining)
+        budget = float(budget)
+    except (TypeError, ValueError):
+        return 1
+    if remaining <= 0 or budget <= 0:
+        return 1
+    ratio = remaining / budget
+    for ceiling, weight in _REMAINING_PRIORITY_BANDS:
+        if ratio <= ceiling:
+            return weight
+    return 1
+
+
+def remaining_priority_enabled():
+    """优先调度开关（默认关）。"""
+    return wb_settings.remaining_priority_enabled(ACCOUNTS_DIR) is True
+
+
+def remaining_schedule_weights():
+    """{(uid, model): 权重}：估计剩余接近耗尽的组合，权重 > 1。
+
+    只读剩余估算载荷的既有字段（rows 的 uid / model / remaining / budget），
+    不碰折叠与预算的实现。载荷自带短 TTL：面板在轮询时本来就维持着它，请求
+    路径这里拿到的基本都是缓存，重建只发生在 TTL 到点时（与面板同款成本）。
+    best-effort：任何失败都只意味着这一次不加权，绝不能连累请求本身。
+    """
+    try:
+        payload = remaining_usage()
+        weights = {}
+        for row in payload.get("rows") or []:
+            weight = _remaining_schedule_weight(row.get("remaining"),
+                                                row.get("budget"))
+            if weight > 1:
+                weights[(row.get("uid") or "", row.get("model") or "")] = weight
+        return weights
+    except Exception as exc:
+        log("remaining priority weights unavailable: %s" % exc)
+        return {}
+
+
 _free_models_cache = {"at": 0.0, "data": None}
 _FREE_MODELS_TTL = 60.0
 
@@ -6339,8 +6400,12 @@ def runtime_settings_view():
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
+        "remaining_priority_enabled":
+            wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
         "accounts_collapsed": wb_settings.accounts_collapsed(ACCOUNTS_DIR),
+        "accounts_separate_tab": wb_settings.accounts_separate_tab(ACCOUNTS_DIR),
         "key_before_hidden": wb_settings.key_before_hidden(ACCOUNTS_DIR),
+        "hidden_pages": wb_settings.hidden_pages(ACCOUNTS_DIR),
         "update_check_enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
         "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
         "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
@@ -6388,34 +6453,59 @@ AFFINITY_DEBUG = os.environ.get("WB_AFFINITY_DEBUG", "0").lower() in (
 # 阈值不能设得太低，否则会波及正常长度的对话（本实例 94% 的请求缓存命中率
 # 来自亲和）。设 0 表示不限制，保持 1.6.x 的原有行为。
 AFFINITY_MAX_MSGS = int(os.environ.get("WB_AFFINITY_MAX_MSGS", "400") or 0)
-def derive_affinity_key(messages):
-    """Derive a stable affinity key from a conversation's stable prefix.
-    The first two messages (system + first user turn) stay byte-identical for
-    the whole life of a conversation, so hashing them pins every later turn of
-    that conversation to the same upstream account - exactly what prompt
-    caching needs. Distinct conversations differ in their first user turn and
-    therefore still spread across the pool.
+# 超限对话改成【页内轮转】而不是撒到整个池子。
+#
+# 为什么：整池轮转下每个账号要等「池子大小」轮才再见到这段对话，间隔一旦
+# 超过上游缓存的存活期就整段漏。线上实测（2026-10-10，37706 条请求）：超限
+# 对话占 59% 的 prompt token，却贡献了 64% 的漏掉量，签名是只命中约 24k 的
+# 系统提示（账号见过同一客户端的系统提示、没见过这段历史）——典型的「落在
+# 没预热过的账号上」。页内轮转把「再见到」的周期从「池子大小」轮缩到 size
+# 轮，页里每个账号都留着前缀；同时超大请求体仍摊在 size 个账号上，不是压回
+# 一个（那正是 400 条上限要解决的断连问题）。
+#
+# 取值：≥2 = 页大小（账号数）；1 = 和普通对话一样钉住（等于取消上限）；
+# 0 = 保持 1.6.x 的整池轮转。页的划分见 wb_accounts.AccountPool._page_slice。
+AFFINITY_PAGE_SIZE = int(os.environ.get("WB_AFFINITY_PAGE_SIZE", "3") or 0)
+def affinity_route(messages):
+    """This conversation's (session_key, page).
 
-    Conversations longer than AFFINITY_MAX_MSGS deliberately get no key: they
-    are the ones whose oversized bodies make the upstream drop the connection,
-    and pinning them only guarantees the next turn is oversized too.
+    `session_key` is the stable conversation key; `page` is the (index, size)
+    of the pool page a conversation past AFFINITY_MAX_MSGS rotates over, or
+    None for every other case (short conversations, the page switched off, and
+    conversations whose client supplied its own session key). Both come from
+    the same head hash, so every turn of a conversation agrees on its key and
+    its page without any server-side state.
     """
     if not AFFINITY_BY_PREFIX:
-        return None
+        return None, None
     try:
         msgs = messages or []
         if not msgs:
-            return None
+            return None, None
+        head = msgs[:2]
+        blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        digest = hashlib.sha256(blob).hexdigest()[:16]
+        key = "pfx-" + digest
         if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
+            if AFFINITY_PAGE_SIZE > 1:
+                page = (int(digest[:8], 16) % AFFINITY_PAGE_SIZE, AFFINITY_PAGE_SIZE)
+                if AFFINITY_DEBUG:
+                    log("affinity: %d msgs (> %d), page %d/%d"
+                        % (len(msgs), AFFINITY_MAX_MSGS, page[0], page[1]))
+                return key, page
+            if AFFINITY_PAGE_SIZE == 1:
+                # Pinned like any other conversation: the cap is switched off.
+                return key, None
             if AFFINITY_DEBUG:
                 log("affinity: skip %d msgs (> %d), letting the pool rotate"
                     % (len(msgs), AFFINITY_MAX_MSGS))
-            return None
-        head = msgs[:2]
-        blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        return "pfx-" + hashlib.sha256(blob).hexdigest()[:16]
+            return None, None
+        return key, None
     except Exception:
-        return None
+        return None, None
+def derive_affinity_key(messages):
+    """Conversation key only; see affinity_route for the pool page."""
+    return affinity_route(messages)[0]
 def prompt_fingerprint(messages):
     """Privacy-safe fingerprint of the outgoing prompt.
     Cache hits need a byte-identical prefix, so these hashes answer "is my
@@ -8690,6 +8780,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # share the same fold, and calling them separately paid for it three
     # times on every request.
     apply_daily_guards()
+    # 剩余用量优先调度（开关默认关）：把「估计剩余接近耗尽」的 (账号, 模型)
+    # 权重推给池，让它们先接单。只在开关打开时读剩余估算（载荷有短 TTL，热路径
+    # 上是缓存命中）；关着时推空表，把上一次可能留下的权重清掉，下一个请求就
+    # 回到与从前逐字节一致的纯轮询。
+    if POOL is not None:
+        POOL.apply_remaining_weights(
+            remaining_schedule_weights() if remaining_priority_enabled() else None)
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
     # 复用调用方已建好的 body：/v1/chat/completions 在进这里之前已经 build 过
@@ -8700,9 +8797,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                      else build_upstream_body(payload))
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
     # 位置放在 build_upstream_body 之后，保证键与真正发往上游的消息一致
-    # （该函数可能在最前面插入 SYSTEM_PROMPT）。
+    # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
+    # 有值（页内轮转），客户端自带会话键的请求不参与。
+    affinity_page = None
     if not session_key:
-        session_key = derive_affinity_key(upstream_body.get("messages"))
+        session_key, affinity_page = affinity_route(upstream_body.get("messages"))
         if session_key and AFFINITY_DEBUG:
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
@@ -8722,9 +8821,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # once per retry, so a settings read never lands in the retry loop.
     header_timeout, idle_timeout = upstream_timeouts()
     max_attempts = max(2, total) + 1 + (MAX_PRODUCT_SWITCHES if auto_switch else 0)
+    # 每次失败都把【出错的那个账号】从这段对话的历史里降级（demote），而不是
+    # 忘掉整段对话：重选时优先回到还留着这段前缀的暖号（见 SessionAffinity），
+    # 一次大 prompt 的冷启动比重选一次账号贵得多。
     for _attempt in range(max_attempts):
         account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
+                                        exclude=tried, model=model,
+                                        page=affinity_page) if POOL else None
         if account is None:
             if transient_hits and _attempt < max_attempts - 1:
                 tried.clear()
@@ -8732,7 +8835,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 continue
             break
         if account.realm != realm:
-            if session_key and POOL: POOL.affinity.unbind(session_key)
+            if session_key and POOL: POOL.affinity.demote(session_key, account.uid)
             continue
         tried.add(account.uid)
         last_uid = account.uid
@@ -8771,7 +8874,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                         % (account.uid[:8], credential_scope_phrase(detail), wait,
                            account.soft_streak))
                     if session_key and POOL:
-                        POOL.affinity.unbind(session_key)
+                        POOL.affinity.demote(session_key, account.uid)
                     last_error = exc
                     last_429 = exc
                     last_429_detail = detail
@@ -8820,12 +8923,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     except Exception:
                         pass
                     if session_key and POOL:
-                        POOL.affinity.unbind(session_key)
+                        POOL.affinity.demote(session_key, account.uid)
                     continue
                 log("account %s throttled on '%s' (429), retry in %ds"
                     % (account.uid[:8], model, int(wait)))
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 last_429 = exc
                 last_429_detail = detail
@@ -8849,7 +8952,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     continue
                 log("upstream 403 for '%s' (content review), passing through" % model)
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 last_403_detail = detail
                 break
@@ -8862,13 +8965,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 log("account %s out of credits (402), parked until 04:00"
                     % account.uid[:8])
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
             if exc.code == 401:
                 log("account %s rejected (HTTP 401), rotating" % account.uid[:8])
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 account.note_error("HTTP 401",
                                    cooldown=60,
                                    single_account=(total <= 1))
@@ -8880,13 +8983,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 log("upstream %s for '%s', retrying (fails=%d)"
                     % (exc.code, model, account.fails))
                 if session_key and POOL:
-                    POOL.affinity.unbind(session_key)
+                    POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
             raise
         except Exception as exc:
             if session_key and POOL:
-                POOL.affinity.unbind(session_key)
+                POOL.affinity.demote(session_key, account.uid)
             if is_transient(exc):
                 transient_hits += 1
                 account.note_unknown_failure("connection: %s" % type(exc).__name__)
@@ -12702,6 +12805,18 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_local_web_tools(ACCOUNTS_DIR, raw)
             reply["local_web_tools"] = raw
+        if "remaining_priority_enabled" in payload:
+            raw = payload.get("remaining_priority_enabled")
+            if not isinstance(raw, bool):
+                return self._error(400, "remaining_priority_enabled must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_remaining_priority_enabled(ACCOUNTS_DIR, raw)
+            reply["remaining_priority_enabled"] = raw
+            if not raw and POOL is not None:
+                # 关掉就立刻清掉池里上一次推的权重，不等下一个请求；打开则
+                # 由下一个请求照常推（此刻就算推也要先折一次剩余估算，没必要
+                # 为一个开关多付这一趟）。
+                POOL.apply_remaining_weights(None)
         if "accounts_collapsed" in payload:
             # A disclosure state, and the only thing this branch may touch: the
             # submission carries just this key, so the settings it does not name
@@ -12712,6 +12827,15 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_accounts_collapsed(ACCOUNTS_DIR, raw)
             reply["accounts_collapsed"] = raw
+        if "accounts_separate_tab" in payload:
+            # Same shape again: strictly a JSON boolean, because "false" as a
+            # string would be truthy and silently split the nav.
+            raw = payload.get("accounts_separate_tab")
+            if not isinstance(raw, bool):
+                return self._error(400, "accounts_separate_tab must be true or false",
+                                   "invalid_request_error")
+            wb_settings.set_accounts_separate_tab(ACCOUNTS_DIR, raw)
+            reply["accounts_separate_tab"] = raw
         if "key_before_hidden" in payload:
             # Same shape as accounts_collapsed: one disclosure state per
             # submission, and strictly a JSON boolean, because "false" as a
@@ -12722,6 +12846,20 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_key_before_hidden(ACCOUNTS_DIR, raw)
             reply["key_before_hidden"] = raw
+        if "hidden_pages" in payload:
+            # A list of page keys, and the only thing this branch may touch: the
+            # submission carries just this key, so the settings it does not name
+            # survive the write. A bare string would iterate character by
+            # character and hide nothing but garbage, so anything that is not a
+            # list of strings is rejected outright rather than normalised away.
+            raw = payload.get("hidden_pages")
+            if not isinstance(raw, list) or any(not isinstance(k, str) for k in raw):
+                return self._error(400, "hidden_pages must be a list of page keys",
+                                   "invalid_request_error")
+            # Reply with the normalised list, not the raw one: keys the request
+            # spelled wrong are dropped on the way in, so the panel echoes back
+            # what was actually stored.
+            reply["hidden_pages"] = wb_settings.set_hidden_pages(ACCOUNTS_DIR, raw)
         if "update_check_enabled" in payload:
             # Strictly a JSON boolean, like the switches above: "false" as a
             # string would be truthy and silently start the daily GitHub call.

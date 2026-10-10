@@ -45,6 +45,7 @@ const SETTINGS = {
   auto_switch_product: true,
   daily_chat_web: false,
   local_web_tools: true,
+  remaining_priority_enabled: true,
   version: 'v1.6.14',
   accounts_dir: '/data/accounts',
   usage_dir: '/data/usage',
@@ -148,9 +149,12 @@ global.__toasts = toasts;
   assert.equal(element('setAutoSwitch').checked, true);
   assert.equal(element('setDailyChatWeb').checked, false);
   assert.equal(element('setLocalWebTools').checked, true);
+  assert.equal(element('setRemainingPriority').checked, true,
+    '剩余用量优先调度的复选框没写回');
+  assert.equal(element('setRemainingPriorityState').textContent, '(已启用)');
   assert.equal(element('setLimitsPerRealm').checked, true, '有分版本覆盖时应勾上');
 
-  realLog('loadSettings 完整性断言通过（14 项）');
+  realLog('loadSettings 完整性断言通过（16 项）');
 })().catch(e => {
   console.log = realLog;
   console.error(e && e.stack || e);

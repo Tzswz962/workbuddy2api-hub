@@ -2103,29 +2103,86 @@ def _human_delta(seconds):
     return "%d min" % int(seconds / 60)
 
 class SessionAffinity(object):
-    def __init__(self, ttl=7200, max_entries=5000):
+    """Which upstream account served a conversation, so the next turn can go
+    back to it.
+
+    Each conversation keeps a short most-recently-used list rather than a single
+    account. The front entry is what `get()` returns - the account the last turn
+    went to. The entries behind it are the accounts that served the conversation
+    before that, most recent first: when the front one is unusable (cooling,
+    parked, disabled) the next pick prefers an account this conversation has
+    already warmed upstream over a cold one, so the prompt cache survives the
+    move instead of being rebuilt from scratch. Every entry expires on its own
+    clock, so an account the conversation has not visited for a while drops out
+    by itself.
+
+    The history is small on purpose (`history`, 3): it is a list of accounts
+    that may still hold the conversation's prefix, not a load-balancing device.
+    """
+
+    def __init__(self, ttl=7200, max_entries=5000, history=3):
         self.ttl = ttl
         self.max_entries = max_entries
+        self.history = max(1, int(history))
         self.bindings = {}
         self._lock = threading.Lock()
+    def _live(self, key, now):
+        """The conversation's unexpired entries, dropping the rest in place."""
+        entries = self.bindings.get(key) or []
+        live = [entry for entry in entries if entry[1] > now]
+        if live:
+            self.bindings[key] = live
+        else:
+            self.bindings.pop(key, None)
+        return live
     def get(self, key):
+        """The account the last turn went to (slides its expiry), or None."""
         if not key: return None
         with self._lock:
-            entry = self.bindings.get(key)
-            if not entry: return None
-            uid, exp = entry
-            if time.time() > exp:
-                self.bindings.pop(key, None)
-                return None
-            self.bindings[key] = (uid, time.time() + self.ttl)
+            now = time.time()
+            live = self._live(key, now)
+            if not live: return None
+            uid, _exp = live[0]
+            live[0] = (uid, now + self.ttl)
             return uid
+    def recent(self, key):
+        """Every unexpired account of this conversation, most recent first."""
+        if not key: return []
+        with self._lock:
+            return [uid for uid, _exp in self._live(key, time.time())]
     def bind(self, key, uid):
+        """Make `uid` the front entry, deduped and capped at `history`."""
         if not key or not uid: return
+        now = time.time()
         with self._lock:
             if len(self.bindings) >= self.max_entries:
-                now = time.time()
-                self.bindings = {k: v for k, v in self.bindings.items() if v[1] > now}
-            self.bindings[key] = (uid, time.time() + self.ttl)
+                self.bindings = {k: v for k, v in self.bindings.items()
+                                 if v and v[0][1] > now}
+            entries = [entry for entry in (self.bindings.get(key) or [])
+                       if entry[0] != uid]
+            entries.insert(0, (uid, now + self.ttl))
+            self.bindings[key] = entries[:self.history]
+    def demote(self, key, uid=None):
+        """Drop one account from the conversation, keeping the others.
+
+        The failure paths use this instead of `unbind`: the account that just
+        failed (429 / 402 / 401 / 5xx / dropped connection) must not be handed
+        the next attempt, but the accounts before it may still hold this
+        conversation's prefix upstream - the next pick should try them before
+        falling back to a cold one. Dropping the front entry is the default;
+        pass `uid` to drop a specific one.
+        """
+        if not key: return
+        with self._lock:
+            entries = self.bindings.get(key) or []
+            if uid is None:
+                entries = entries[1:]
+            else:
+                entries = [entry for entry in entries if entry[0] != uid]
+            if entries:
+                self.bindings[key] = entries
+            else:
+                self.bindings.pop(key, None)
     def unbind(self, key):
         if not key: return
         with self._lock:
@@ -2301,6 +2358,18 @@ class AccountPool(object):
         # keyed by uid (see _weighted_pick). Runtime-only: a restart just
         # restarts the rotation.
         self._expiry_weights = {}
+        # 剩余用量优先调度：wb_proxy 每请求推来的 {(uid, model): 权重}（只有它
+        # 读得到剩余估算）。空表 = 不启用——开关关着、或没有任何组合接近估计
+        # 限额——选择就是原来的纯轮询。纯派生值，不落盘。
+        self._remaining_weights = {}
+        # 这条偏好自己的平滑加权轮询累计值，键是 (uid, model)：与临期的
+        # _expiry_weights 分开，两个偏好各自记各自的轮次。
+        self._remaining_pick_state = {}
+        # 页内轮转（超限对话）的每页游标，键是 (页号, 页大小)；整池轮转仍用
+        # _cursor，两条轮转互不挪动对方的位置。派生值，不落盘。
+        self._page_cursors = {}
+        # uid 排序表的缓存：池成员没变就直接复用，变了重建（见 _page_ranks）。
+        self._page_order_cache = None
         self.affinity = SessionAffinity()
 
     def load(self):
@@ -2534,6 +2603,28 @@ class AccountPool(object):
                 account.expiring_window_days = _realm_limit(values, account.realm)
         return values
 
+    def apply_remaining_weights(self, weights):
+        """换上 wb_proxy 算好的 (账号, 模型) 权重表（剩余用量优先调度）。
+
+        数据方向与 apply_daily_* 同款：只有 wb_proxy 读得到剩余估算（折叠、
+        预算与载荷都在那边），池不反向依赖它，只存派生值。None / 空表表示
+        「不启用」——开关关着，或这一刻没有组合接近估计限额——把上次的权重
+        清掉，选择立即回到纯轮询（开关关时行为与从前逐字节一致）。
+        权重 <= 1 的条目没有偏好意义，直接丢弃。返回存下来的表（测试用）。
+        """
+        table = {}
+        for pair, weight in (weights or {}).items():
+            try:
+                uid, model = pair
+                weight = int(weight)
+            except (TypeError, ValueError):
+                continue
+            if weight > 1:
+                table[(str(uid), str(model))] = weight
+        with self._lock:
+            self._remaining_weights = table
+        return table
+
     def apply_daily_token_limit(self, values=None, usage=None):
         """Re-resolve the daily token guard for every account.
 
@@ -2674,24 +2765,51 @@ class AccountPool(object):
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
         return sum(1 for a in snapshot if a.enabled and a.access_token and a.ready(model=model))
 
-    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None):
+    def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
+                         page=None):
+        """Pick the account for one turn of a conversation.
+
+        Three shapes, in order of preference:
+
+        * A bound conversation (the normal case) keeps the account the last turn
+          went to.
+        * When that account is unusable right now (cooling, parked, disabled),
+          the conversation's other warm accounts are tried before the pool's own
+          preferences - they may still hold its prefix upstream (see
+          SessionAffinity). The account that serves the turn becomes the new
+          front entry, and the one it replaced stays behind it as a fallback.
+        * `page` marks a conversation that is past the affinity length cap: it
+          does not pin, it rotates over one page of the pool (an (index, size)
+          pair), so every account of the page keeps a warm copy without piling
+          every oversized body onto a single account.
+        """
         exclude = exclude or set()
-        if session_key:
-            bound_uid = self.affinity.get(session_key)
-            if bound_uid and bound_uid not in exclude:
-                account = self.get(bound_uid)
+        if session_key and page is None:
+            for uid in self.affinity.recent(session_key):
+                if uid in exclude:
+                    continue
+                account = self.get(uid)
                 if account and account.realm == realm and account.ready(model=model):
+                    self.affinity.bind(session_key, uid)
                     return account
-                self.affinity.unbind(session_key)
-        account = self.pick(realm=realm, exclude=exclude, model=model)
-        if account and session_key:
+        account = self.pick(realm=realm, exclude=exclude, model=model, page=page)
+        if account is None and page is not None:
+            # The page has nobody usable right now. Serving the conversation
+            # from outside it beats not serving it at all.
+            account = self.pick(realm=realm, exclude=exclude, model=model)
+        # A page conversation is not bound on purpose: its rotation is what keeps
+        # every account of the page warm, and a binding would pin it back to one
+        # (the state it was released from). The page cursor carries its rotation.
+        if account and session_key and page is None:
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None):
+    def pick(self, realm=None, exclude=None, model=None, page=None):
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if page is not None:
+            snapshot = self._page_slice(snapshot, page)
         if not snapshot:
             return None
         # Expiring-credits preference: accounts whose soonest-expiring credit
@@ -2705,7 +2823,13 @@ class AccountPool(object):
         account = self._pick_expiring_first(snapshot, exclude, model)
         if account is not None:
             return account
-        return self._rotate_pick(snapshot, exclude, model)
+        # 剩余用量优先调度（开关默认关）：估计剩余接近耗尽的 (账号, 模型) 接着
+        # 被优先交出（见 _pick_remaining_first）。权重表为空时这条路径直接
+        # 返回 None，落到与从前完全相同的纯轮询上。
+        account = self._pick_remaining_first(snapshot, exclude, model)
+        if account is not None:
+            return account
+        return self._rotate_pick(snapshot, exclude, model, cursor_key=page)
 
     def _pick_expiring_first(self, snapshot, exclude, model):
         """Serve the in-window accounts first, or None when none can.
@@ -2743,13 +2867,64 @@ class AccountPool(object):
             return 1
         return max(1, int(round(window - days)) + 1)
 
-    def _weighted_pick(self, ready):
-        """Smooth weighted round-robin over the ready accounts.
+    def _pick_remaining_first(self, snapshot, exclude, model):
+        """剩余估算接近耗尽的 (账号, 模型) 优先接单，或 None（没有可交的）。
 
-        nginx's algorithm: every account accrues its weight each pick, the
+        与临期积分那条同款的两层结构：只有权重 > 1（快达到估计限额）的组合
+        进入这一层，它们之间按剩余多少平滑加权轮询——越接近耗尽分到的流量
+        越多，但同层之内没有谁独占。没有加权的可选项，或它们此刻都不可用
+        （冷却、限额、被排除）时落回纯轮询，一个快耗尽的组合不会把整个模型
+        卡死。剩余为 0 与没有预算样本的组合由 wb_proxy 侧就不进表：前者没有
+        「先用掉」的意义（冷却中的本来也不可用），后者没有可比较的尺度。
+        """
+        if not model:
+            return None
+        table = self._remaining_weights
+        if not table:
+            return None
+        ready = []
+        for account in snapshot:
+            if account.uid in exclude:
+                continue
+            weight = table.get((account.uid, model))
+            if weight is None or weight <= 1:
+                continue
+            if not account.ready(model=model):
+                continue
+            ready.append((account, weight))
+        if not ready:
+            return None
+        return self._smooth_weighted_pick(
+            [(account, (account.uid, model), weight) for account, weight in ready],
+            "_remaining_pick_state",
+            keep_uids=set(a.uid for a in snapshot))
+
+    def _weighted_pick(self, ready):
+        """临期积分那条的入口：在窗口内的账号之间平滑加权轮询。"""
+        return self._smooth_weighted_pick(
+            [(account, account.uid, self._expiry_weight(account))
+             for account in ready], "_expiry_weights")
+
+    def _smooth_weighted_pick(self, entries, state_name, keep_uids=None):
+        """Smooth weighted round-robin over (account, key, weight) triples.
+
+        nginx's algorithm: every entry accrues its weight each pick, the
         largest running total wins, and the winner pays back the whole round's
-        weight. Equal weights degenerate to a plain rotation, so the
-        same-day-expiry accounts keep alternating.
+        weight. Equal weights degenerate to a plain rotation, so same-weight
+        entries keep taking turns.
+
+        `key` is what the rotation state is kept under - a uid for the
+        expiring-credits window, a (uid, model) pair for the remaining-usage
+        preference - and `state_name` names the pool attribute holding that
+        state, so the two preferences never share a rotation.
+
+        Without `keep_uids` the state is pruned to exactly the entries taking
+        part this pick (the expiring window's behaviour). The remaining-usage
+        preference passes every account still in the pool instead: pruning by
+        the current pick alone would drop another model's (or another realm's)
+        rotation every time it is someone else's turn, and a rotation that
+        restarts every pick collapses the weights into "always the first
+        entry". Entries of accounts that really left the pool are dropped.
 
         The rotation state is shared by every request thread, so the
         read-modify-write runs under the pool lock. The `ready()` checks that
@@ -2757,31 +2932,86 @@ class AccountPool(object):
         holding the lock across one expiring credential would serialise every
         dispatch in the realm behind it.
         """
-        ready_uids = set(a.uid for a in ready)
-        weights = [(account, self._expiry_weight(account)) for account in ready]
+        keys = set(key for _account, key, _weight in entries)
         with self._lock:
-            state = dict((uid, value) for uid, value in self._expiry_weights.items()
-                         if uid in ready_uids)
+            stored = getattr(self, state_name)
+            if keep_uids is None:
+                state = dict((key, value) for key, value in stored.items()
+                             if key in keys)
+            else:
+                state = dict((key, value) for key, value in stored.items()
+                             if key[0] in keep_uids)
             total = 0
             chosen = None
-            for account, weight in weights:
-                state[account.uid] = state.get(account.uid, 0) + weight
+            for account, key, weight in entries:
+                state[key] = state.get(key, 0) + weight
                 total += weight
-                if chosen is None or state[account.uid] > state[chosen.uid]:
-                    chosen = account
+                if chosen is None or state[key] > state[chosen[1]]:
+                    chosen = (account, key)
             if chosen is None:
                 return None
-            state[chosen.uid] -= total
-            self._expiry_weights = state
-        return chosen
+            state[chosen[1]] -= total
+            setattr(self, state_name, state)
+        return chosen[0]
 
-    def _rotate_pick(self, group, exclude, model):
-        """Round-robin one group of accounts, advancing the shared cursor."""
+    def _page_slice(self, snapshot, page):
+        """The accounts on one page of the pool.
+
+        A page is a fixed slot: an account's rank among the realm's accounts
+        (sorted by uid) modulo the page size. Ranking inside the realm - not
+        across the whole pool, and not by load order or file name - is what
+        keeps a page the size it says it is: with a mixed-realm pool, ranking
+        globally would leave a page with one usable account for this realm and
+        pin its conversations, the state the length cap exists to leave. Uid
+        order also keeps a conversation's page stable across restarts and
+        reloads; adding or removing an account reshuffles at most one slot per
+        page.
+
+        A page cannot be larger than the realm: a size that covers every
+        account (or more) means the page is the realm's whole pool.
+        """
+        try:
+            index, size = int(page[0]), int(page[1])
+        except (TypeError, ValueError, IndexError):
+            return snapshot
+        ranks = self._page_ranks(snapshot)
+        if size <= 1 or size >= len(ranks):
+            return snapshot
+        out = []
+        for account in snapshot:
+            rank = ranks.get(account.uid)
+            if rank is not None and rank % size == index % size:
+                out.append(account)
+        return out
+
+    def _page_ranks(self, snapshot):
+        """uid -> rank among the snapshot's accounts, cached until it changes.
+
+        The snapshot is the realm-filtered pool (readiness is not part of it),
+        so the ranks - and therefore the pages - only move when an account is
+        added to or removed from that realm.
+        """
+        uids = tuple(sorted(a.uid for a in snapshot if a.uid))
+        cached = self._page_order_cache
+        if cached is not None and cached[0] == uids:
+            return cached[1]
+        ranks = dict((uid, rank) for rank, uid in enumerate(uids))
+        self._page_order_cache = (uids, ranks)
+        return ranks
+
+    def _rotate_pick(self, group, exclude, model, cursor_key=None):
+        """Round-robin one group of accounts, advancing its cursor.
+
+        The whole-pool rotation keeps the single `_cursor` it always had. A
+        page rotation keeps its own cursor per page, so page picks and plain
+        picks never move each other's position.
+        """
         total = len(group)
         if total == 0:
             return None
         with self._lock:
-            start = self._cursor
+            start = (self._page_cursors.get(cursor_key, 0) if cursor_key is not None
+                     else self._cursor)
         for offset in range(total):
             index = (start + offset) % total
             account = group[index]
@@ -2789,7 +3019,10 @@ class AccountPool(object):
                 continue
             if account.ready(model=model):
                 with self._lock:
-                    self._cursor = (index + 1) % total
+                    if cursor_key is not None:
+                        self._page_cursors[cursor_key] = (index + 1) % total
+                    else:
+                        self._cursor = (index + 1) % total
                 return account
         return None
 
