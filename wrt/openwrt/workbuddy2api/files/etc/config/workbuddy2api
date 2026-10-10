@@ -28,7 +28,9 @@ config workbuddy2api 'main'
 	# 话别调太大（限额计数也吃这份缓存；限额为 0 时无影响）。
 	option stats_ttl '900'
 
-	# 面板缓存预热器（workbuddy2api-warm，cron 每 12 分钟跑一遍）：
-	# 提前把统计页 4 个时间窗与 /usage 汇总重算好，用户切页不用等。
+	# 面板缓存预热器（workbuddy2api-warm，cron 每 2 分钟跑一遍）：
+	# 提前把 /usage 汇总、统计页的矩阵（带 range）与 analytics/timeseries 时间窗、
+	# 面板自己轮询的 realm 接口（intl/cn）与 by-account 重算好，用户切页不用等。
+	# 全部命中时一轮只有毫秒级成本；只有真的重建过（慢）或失败才写 syslog。
 	# 0 = 关闭（面板仍可用，只是缓存过期后第一次打开要等十几秒）。
 	option warm '1'

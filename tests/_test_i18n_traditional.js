@@ -37,6 +37,9 @@ function makeElement(tag, id) {
       toggle() {}, contains() { return false; },
     },
     hasAttribute(k) { return Object.prototype.hasOwnProperty.call(attrs, k); },
+    // 面板的 doAttrs() 会先问一次 hasAttributes() 来跳过完全没属性的元素
+    // （整树 walk 的固定开销），假元素也得按真 DOM 把成员补齐。
+    hasAttributes() { return Object.keys(attrs).length > 0; },
     getAttribute(k) { return attrs[k] == null ? null : attrs[k]; },
     setAttribute(k, v) { attrs[k] = String(v); },
   };

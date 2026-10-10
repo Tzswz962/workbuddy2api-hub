@@ -131,7 +131,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 101 个套件：76 个 Python + 25 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 111 个套件：83 个 Python + 28 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -228,6 +228,25 @@ Codex App 这类客户端会在 Responses 请求里声明 `web_search` / `web_fe
 
 模块内部设计与新增客户端的方法见 **[docs/CONTRIBUTING-智能体配置.md](docs/CONTRIBUTING-智能体配置.md)**。
 
+### 9. 剩余用量估算（数据看板 → 剩余用量估算）
+
+上游按 **24 小时窗口**给「账号 × 模型」配额（用满时 429 / code 6004 会带上重置墙钟），但从不告诉你这个窗口的预算是多少。看板新增的「剩余用量估算」区块把它反推出来：
+
+- **预算 = 撞线账号窗口用量的平均**：账号撞线（收到带重置时刻的 429）的那一刻，它在该模型上「自窗口起点以来的成功用量」就是预算的一个样本；按区域聚合、先按账号平均再跨账号平均。样本在 429 处理的那一刻就记进 `usage/limit-events.jsonl`（重试循环里只有最后一个账号会留下带归属的 429 用量行，光靠日志会漏掉大部分撞线），历史日志里带账号的 429 行作为补充，两者按「账号 + 模型 + 重置时刻」去重。
+- **已用从每个账号自己的重置时刻起算**：窗口起点取该账号该模型最近一次重置时刻；重置时刻在未来的组合（正在冷却）剩余记 0 并显示恢复时间。
+- **没有撞线记录的组合标「按 24h 估算」**：窗口起点未知时按最近 24 小时用量统计——窗口起点必然落在最近 24h 内，所以这是剩余量的**下界**（偏保守，不会高估）。
+- 接口 `GET /usage/remaining`（需面板会话）返回 `budgets`（每个区域 × 模型的预算均值 / 区间 / 样本数）与 `rows`（每个账号 × 模型：已用、预算、剩余、窗口起点、是否冷却、是否估算），区块只读不写，不参与请求路径（唯一的请求路径接触点是撞线时记一行事件）。
+- **查询侧不做重复计算**：每个「账号 × 模型」的用量缓冲是**时间戳 + 累计和**两个列表（窗口求和 = 两次二分 + 一次相减，O(log n)，内存约 16 字节/行），载荷再挂一个短 TTL（`WB_REMAINING_TTL`，默认 15 秒）并支持 `ETag` / `If-None-Match`：面板 5 秒一轮的轮询在 TTL 内直接拿上次算好的载荷（连日志尾部都不再扫），带条件请求时回 304。实测（2 万行缓冲）：单次重建 ~0.7ms（旧版逐行重算 ~1.8ms）、轮询一分钟 2.9ms（旧版 21.5ms）、缓冲内存 321KB（旧版 2.3MB）。
+
+### 10. 积分获取历史（数据看板 → 积分获取历史）
+
+「积分扣减历史」看的是花掉的部分，这一块补上进账的部分：上游对每个账号返回一份**积分包清单**（每日活跃奖励的 Bonus Pack、免费套餐、活动包…），每个包带面额、发放时间与到期时间。区块把全部账号的包摊平成一张表、新的在前：
+
+- 列：时间（发放）/ 账号 / 区域 / 名称 / **来源** / 积分 / 剩余 / 到期 / 状态；
+- 状态按「过期 > 用完 > 在扣减 > 可用」归类：**生效中**（上游标了 `in_usage`，当前正从它扣减）、**可用**、**已用完**、**已过期**；`no_expiry` 的包显示「不过期」；
+- **来源**：上游自带的发放原因原样显示（如「Buddy 加油站签到」「成长计划奖励」「官方活动发放」）；国际版的 Bonus Pack 30/50 没有原因字段，按官方规则推断为「每日活跃奖励」（悬停里注明这是推断）。我们自己的**签到 / 每日活跃**记录也会按时间关联上去（取发放前 2 小时内最近的一次尝试，带成功 / 失败），悬停即可对上「本机动作：每日签到 10-10 00:07 成功」——一次发放到底由哪次动作带来，一眼可见；
+- 摘要行给出笔数、合计面额、合计剩余与**快照时刻**。接口 `GET /accounts/credits/grants` 只读内存里的积分快照、**不发上游请求**——数字的新鲜度取决于最近一次「一键刷新积分」（签到与每日活跃打卡也会顺带刷新它），所以要看最新的包先点账号页那个按钮。
+
 ---
 
 ## 三、账号添加与管理
@@ -303,6 +322,9 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 | POST | /scheduler/trigger | 手动立即执行后台巡检保活 |
 | GET | /activity/history | 账号每日活动历史：签到与每日活跃的每一次真实尝试（`range` / `uid` / `task` / `result` / `limit`，最新在前） |
 
+| GET | /accounts/credits/grants | 积分获取历史：各账号积分包（发放时间 / 面额 / 剩余 / 到期 / 状态），只读内存快照、不发上游请求 |
+| GET | /usage/remaining | 剩余用量估算：每个账号 × 模型在当前 24h 窗口的已用 / 预算 / 剩余（预算取撞线账号的平均用量；需面板会话） |
+
 ---
 
 ## 六、版本更新记录 (Changelog)
@@ -311,10 +333,40 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
+- **小响应不再白付 40ms、突发并发不再卡 1 秒**（[PR #237](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/237)，感谢 [@aodianjun](https://github.com/aodianjun)）：服务端关掉 Nagle（响应头与响应体两次 write 不再互相等 ACK，werkzeug/uvicorn 同做法），listen backlog 从 stdlib 默认的 5 提到 128（面板打开一页就是 ~7 个并发）。真机（OpenWrt / Celeron N2840）：`/health` 中位 50.0ms → 1.41ms，64 并发突发「卡 ≥1s」43/64 → 0/64。顺带把单请求体上限默认从 50MB 收到 16MB（`WB_MAX_PAYLOAD_BYTES` 可调回）——读 body 发生在 chat 信号量之前，路由器上几个并发大 body 就能把内存打穿。
+
+- **面板轮询不再自己把自己堵住**（[PR #238](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/238)，感谢 [@aodianjun](https://github.com/aodianjun)）：`getJSON` 加 URL 级单飞（冷窗口时同一 URL 曾发 13 份、6 份并发，还把 `/accounts`、`/scheduler` 一起堵住）；日志页改成只 append 新行、最近请求渲染前比指纹跳过；英文界面的 i18n 观察者加 WeakMap 缓存；修掉会话失效后 401 轮询停不下来的 bug；`/v1/models?realm=all` 轮询从 5s 改为 10 分钟 TTL。
+
+- **请求热路径提速**（[PR #239](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/239)，感谢 [@aodianjun](https://github.com/aodianjun)）：指纹判定从小写副本上的字面量 `in` 走（等价性按 `re.IGNORECASE` 的 Unicode 特例归一化后逐码点验证），`/v1/chat/completions` 不再重复构建上游 body，token 估算改单遍扫描，`wb_settings.load` 加 (path, mtime, size) 缓存（写入仍即时可见）。168KB 请求的 pre-upstream 合计 48.07ms → 18.50ms。
+
+- **用量聚合最后两个全量读者改增量，外加三个 bug**（[PR #240](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/240)，感谢 [@aodianjun](https://github.com/aodianjun)）：`perf_stats` 加窗口预过滤（`range=today` 389~422ms → 211ms）、`count_usage_rows` 改增量折叠（319ms → 0.23ms，位置校验不过才从零重数）；修掉 checkpoint 空闲也整份重写（每 900s 白写 120KB）、`wb_agents.integrate()` 回滚分支的 `NameError`（多文件客户端写一半失败时既不回滚也不写 state）、两处死代码。
+
+- **OpenWrt 预热器覆盖面板真正轮询的接口**（[PR #241](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/241)，感谢 [@aodianjun](https://github.com/aodianjun)）：预热清单 5 → 20 个目标（补上带 range 的 `/usage`、`/usage/perf` 与 `realm=intl|cn`、by-account、timeseries 四个窗口），服务启动后后台预热一次，预热 cron 由 `*/12` 收紧到 `*/2`（缓存命中不延长 TTL，间隔必须显著小于 TTL）。
+
+- **按 API Key 归属表可收起「(切换前)」行**（[PR #242](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/242)，感谢 [@LeoK77S](https://github.com/LeoK77S)）：表头新增与「启用价估算」同款的开关，默认显示、偏好存服务端；同时「启动参数」只在日志里确实出现过它的用量时才占一行（面板有 key 时它恒为 0）。
+
+- **登录限流按真实来源 IP 分桶**（[PR #243](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/243)，感谢 [@aodianjun](https://github.com/aodianjun)）：反代部署下所有浏览器与缓存预热器共用一个 `127.0.0.1` 桶，一个人连错 5 次就把所有人锁 60 秒。现在只在对端可信（回环或 `WB_TRUSTED_PROXIES` 列出的代理）时才读 `X-Real-IP` / `X-Forwarded-For`，否则仍按对端地址分桶——公网客户端伪造头换不了桶。阈值、窗口与会话语义一行未动。
+
+- **上游连接复用**（[PR #245](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/245)，感谢 [@aodianjun](https://github.com/aodianjun)）：urllib 写死 `Connection: close`，每个请求都要重新 TCP+TLS 握手（真机裸握手 TCP 55.5ms、TLS 118.0ms，是请求路径上最大的一笔）。新增 `wb_upstream_pool.py`：按（目标, 代理串）分池复用连接，每键最多 2 条空闲、LIFO、90s 回收、取出探活、复用前重置读超时、只在 body 读到自然结尾时归还。真机 A/B：14 条流式请求的 TCP 连接 14 → 1，loopback p50 19.9ms → 13.3ms、经真实 RTT 链路 36.2ms → 20.4ms。只在「还没发出请求体 / 还没读到任何响应字节」时安全重试一次；非 http(s) 目标、非 HTTP 代理、3xx 一律回退原路径，`WB_UPSTREAM_KEEPALIVE=0` 可整条关掉。
+
+- **每日活跃打卡的日志带上网页通道结果**（issue #236）：国际版打卡分两步，桌面端那条轻量对话几乎不会失败，真正决定 30/50 积分的是网页通道会话——而巡检日志只写「✓ 每日活跃对话成功」，网页通道失败时面板上完全看不出来，只能等第二天发现积分没涨。现在巡检与手动打卡的日志都直接带上结果（`网页通道 completed：N 段输出，N ms` / `网页通道失败：<原因>`），与国内签到那条日志的写法一致。
+
+- **一键配置只在网关本机可用，服务端形态整个不加载；顺带修掉第 5 个 Tab 挤坏移动端顶栏**（issue #246，感谢 [@houfukude](https://github.com/houfukude)）：这个功能写的是「网关进程所在机器」的客户端配置，只有浏览器和网关同一台机器时成立——服务端 / Docker / OpenWrt 部署下看板是远程打开的，改了也到不了用户自己的电脑。
+  - `wb_agents` 改成**懒加载**：路由命中且判定通过才 import，用不到它的部署零常驻、零探测、零备份；
+  - 新增可用性判定：请求来源**只认回环**（`127.0.0.1` / `::1` / `::ffff:127.0.0.1`），容器（`/.dockerenv`、`/proc/1/cgroup` 里的 docker/containerd/kubepods）与 OpenWrt（`/etc/openwrt_release`、`os-release` 的 `ID=openwrt`）标记另算一道、压过来源判定；不通过时 `GET /agents` 回 `enabled:false`，`/agents/apply`、`/agents/restore` 直接 403；
+  - 看板启动时用新增的廉价接口 `GET /agents/available` 判定（不 import、不探测），判定为不可用就把入口整个撤掉，`?tab=agents` 的书签退回网关页；本机打开看板的行为一点没变；
+  - **移动端顶栏**：≤640px 主 Tab 行改成横向滚动（与 `.page-nav` 在 ≤860px 的做法一致），按钮保持可读宽度、放得下时仍然平分整行——issue 里的实测溢出（414px +5px、360px +19px、320px +59px）全部归零，390px 五个 Tab 一行放得下；
+  - 测试：`tests/_test_agents.py` +11 项、`tests/_test_panel_route_auth.py` +4 项（远程来源读 `enabled:false`、写 403、容器标记压过回环、能力探测两侧答案）、`tests/_test_agent_ui.js` +3 项（入口隐藏与书签回退）；`tests/_mobile_check.py` 的 `nav-equal-width` 不再写死 4 个 Tab，改钉「标签不截断 / 不顶出导航条 / 填满整行」三条几何性质。
+
+- **剩余用量估算：把上游 24h 窗口的预算反推出来**（[PR #247](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/247)，感谢 [@aodianjun](https://github.com/aodianjun)）：上游按 24 小时窗口给「账号 × 模型」配额（用满即 429 / code 6004，带重置墙钟），预算数字却从不公开。新增 `GET /usage/remaining` 与数据看板「剩余用量估算」区块：**预算 = 撞线账号在窗口内用量的平均**（撞线那一刻该账号「自窗口起点以来的成功用量」就是一个样本；按区域聚合，先按账号平均、再跨账号平均），**已用从各账号自己的重置时刻起算**，重置时刻还在未来的组合（冷却中）剩余记 0 并显示恢复时间；没有撞线记录的组合按最近 24h 统计并标「按 24h 估算」——窗口起点必然落在最近 24h 内，所以那是剩余量的下界，偏保守。样本由 429 处理路径**实时**写进 `usage/limit-events.jsonl`：一次请求的重试可能接连撞好几个账号，而日志里只有最后那个账号留着带归属的 429 行，光靠日志会漏掉大部分撞线；历史日志里带账号的 429 行作补充，按（账号 + 模型 + 重置时刻）去重。新增 `tests/_test_remaining_usage.py`（15 项）与 `tests/_test_remaining_usage.js`（26 项）。
+
+- **perf(usage): 剩余用量估算不再重复计算**（[PR #248](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/248)，感谢 [@aodianjun](https://github.com/aodianjun)）：每个「账号 × 模型」的用量缓冲从 deque-of-tuple 换成**时间戳 + 累计和**（窗口求和 = 两次二分 + 一次相减，O(log n)，约 16 字节/行），载荷挂 15 秒短 TTL（`WB_REMAINING_TTL`）并支持 `ETag` / `If-None-Match`：面板 5 秒一轮的轮询在 TTL 内复用上次算好的载荷（连日志尾部都不再扫），带条件请求时回 304。实测 2 万行缓冲：轮询一分钟 21.5ms → 2.9ms、缓冲内存 2.3MB → 321KB（116 → 16 字节/行）、热重建 1.8ms → 0.7ms；并修掉一处裁剪后累计和的重基错误（`tests/_test_remaining_usage.py` 的 600 行对拍用例抓到的，15 → 18 项）。
+
+- **「国际版每日活跃打卡」的说明精简**：设置页那段解释删掉实现细节与「会消耗少量积分」的提示，只留「国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话。默认开启。」；英文与正體中文词条同步。
+
+- **数据看板新增「积分获取历史」**：原来只有扣减（花掉的积分），现在把上游发给每个账号的**积分包清单**（每日活跃奖励的 Bonus Pack、免费套餐、活动包…）摊平成一张表——发放时间 / 账号 / 区域 / 名称（悬停看发放原因）/ 积分 / 剩余 / 到期 / 状态，新的在前；状态按「过期 > 用完 > 在扣减 > 可用」归类（`in_usage` 的包标「生效中」，`no_expiry` 的显示「不过期」），并新增**来源**列：上游的发放原因原样显示（「Buddy 加油站签到」「成长计划奖励」「官方活动发放」），国际版 Bonus Pack 30/50 按官方规则推断为「每日活跃奖励」；网关自己的签到 / 每日活跃记录按时间关联到发放上（发放前 2 小时内最近一次尝试），悬停即可对上「本机动作：每日签到 10-10 00:07 成功」。摘要行给出笔数与合计并标**快照时刻**。新增 `GET /accounts/credits/grants`（管理面路由）：只读内存里的积分快照、**不发上游请求**，数字随「一键刷新积分」（签到 / 每日活跃打卡也会刷新它）更新。新增 `tests/_test_credit_grants.py`（36 项，含关联窗口与历史投影）与 `tests/_test_credit_grants.js`（23 项）。
+
 已发布版本的完整记录（v1.4.5 ~ v1.6.19，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
-
----
-
 ## 七、致谢与引用声明 (Credits & References)
 
 协议兼容、风控规避与任务链路设计过程中，参考并吸纳了以下开源项目的经验与逆向成果：

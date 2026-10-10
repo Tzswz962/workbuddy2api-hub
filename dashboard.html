@@ -80,9 +80,9 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:right;padding:9px 12px;border-bottom:1px solid var(--line);
   font-variant-numeric:tabular-nums;vertical-align:middle}
 th{color:var(--dim);font-weight:600;font-size:12px;white-space:nowrap;background:var(--panel2)}
-/* 积分扣减历史：外层容器自己纵向滚动，表头不钉住的话滑到下面就看不出哪列是哪列。
-   表头本来就有 --panel2 底色（不透明），加 sticky 即可盖住滚上来的行。 */
-#creditHistoryTable thead th{position:sticky;top:0;z-index:2;
+/* 积分扣减 / 获取历史：外层容器自己纵向滚动，表头不钉住的话滑到下面就看不出
+   哪列是哪列。表头本来就有 --panel2 底色（不透明），加 sticky 即可盖住滚上来的行。 */
+#creditHistoryTable thead th,#creditGrantsTable thead th{position:sticky;top:0;z-index:2;
   box-shadow:inset 0 -1px 0 var(--line)}
 th:first-child{border-top-left-radius:8px;border-bottom-left-radius:8px}
 th:last-child{border-top-right-radius:8px;border-bottom-right-radius:8px}
@@ -431,6 +431,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 #analyticsKpiCards .card .k{font-size:11px;white-space:nowrap;margin-bottom:3px;font-weight:600;color:var(--dim)}
 #analyticsKpiCards .card .s{font-size:10px;white-space:normal;line-height:1.35;margin-top:2px;color:var(--dim)}
 .model-pill{display:inline-flex;align-items:center;gap:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px;margin:2px 4px 2px 0;white-space:nowrap}
+/* 归属表表头里的行开关，直接复用设置页的 .switch 胶囊样式，只是表头比
+   设置页紧凑，把 40px 的最小高度收掉。 */
+.key-row-switch{min-height:0}
 .log-line{display:flex;align-items:flex-start;gap:8px;padding:3px 6px;border-radius:4px;font-family:Consolas,Monaco,'Courier New',monospace;font-size:12px;line-height:1.55;transition:background .1s}
 .log-line:hover{background:rgba(255,255,255,.05)}
 .log-ts{color:#64748b;font-variant-numeric:tabular-nums;flex-shrink:0;user-select:none}
@@ -457,8 +460,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   h1 span{font-size:11px;margin-left:6px}
   .gh-link{width:36px;height:36px;flex-shrink:0}
   .theme-btn{width:36px;height:36px}
-  .main-nav{display:flex;width:100%;gap:2px;padding:3px;order:3}
-  .main-nav-btn{flex:1;justify-content:center;padding:8px 4px;font-size:12px;min-height:36px;white-space:nowrap}
+  /* 窄屏下主 Tab 一排摆不下就横向滚动，而不是把行内容顶出导航条：5 个 Tab 的
+     min-content 和已经超过这段留给导航的宽度（右侧按钮组占了 84px），继续用
+     flex:1 平分只会把按钮压到 min-content 并溢出（issue #246 实测 320px 溢出
+     59px、414px 起就不等宽）。做法与 .page-nav 在 ≤860px 时一致：按钮保持
+     可读宽度，摆不下就滚动；放得下时仍然平分整行。 */
+  .main-nav{display:flex;width:100%;gap:2px;padding:3px;order:3;overflow-x:auto;
+    -webkit-overflow-scrolling:touch;scrollbar-width:thin}
+  .main-nav-btn{flex:1;justify-content:center;padding:8px 2px;font-size:12px;min-height:36px;white-space:nowrap}
   .meta{width:100%;text-align:left;font-size:11px;line-height:1.5;order:4}
   .meta .meta-secondary{display:none}
   /* Table → card */
@@ -536,6 +545,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 /* ===== Small phone: ≤400px ===== */
 @media (max-width: 400px){
   h1{font-size:14px}
+  /* 小屏再挤一点：5 个 Tab 在 375px（iPhone SE/mini 一档）正好塞进一行 */
+  .main-nav{gap:1px;padding:2px}
   .main-nav-btn{font-size:11px;padding:7px 2px}
   #cards{grid-template-columns:1fr 1fr;gap:6px}
   #cards .card .v{font-size:16px}
@@ -719,6 +730,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     'CNY（策略记录的汇率，': 'CNY (rate recorded with the policy,',
     'GitHub 项目仓库': 'GitHub repository',
     'Key 维度只从本次升级之后开始记录：更早的请求没有这个字段，会一直留在「(切换前)」里且不会再增长。': 'Per-key attribution starts only with this upgrade: earlier requests have no such field, so they stay under (before switch) and never grow.',
+    '收起「(切换前)」': 'Collapse "(before switch)"',
+    '只影响这张表的显示，不改变任何统计口径：收起后那一行的用量依然计入合计': 'Only changes how this table is drawn, not any accounting: a folded row still counts toward the totals',
     'OpenRouter 价估算': 'OpenRouter estimate',
     'OpenRouter 价估算：按 OpenRouter 公布的模型价折算，覆盖该账号在所选区间内的请求；按条件定价的模型（输入长度阈值或时段）按每条请求取档；单条请求实际用的策略、三档单价与匹配来源见「最近请求」里那条的悬停提示': 'OpenRouter estimate: converted from the model prices OpenRouter publishes, covering the requests of this account in the selected range; conditionally priced models (input-length thresholds or time windows) are tiered per request; the policy a single request actually used, its three unit prices and the match source are in the hover tip of that row in Recent requests',
     'OpenRouter 价估算：按该行（模型·区域·账号）的 token 消耗折算；按条件定价的模型（输入长度阈值或时段）按每条请求取档；单条请求实际用的策略、三档单价与匹配来源见「最近请求」里那条的悬停提示': 'OpenRouter estimate: converted from the token usage of this row (model · region · account); conditionally priced models (input-length thresholds or time windows) are tiered per request; the policy a single request actually used, its three unit prices and the match source are in the hover tip of that row in Recent requests',
@@ -757,6 +770,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '上次:': 'Last:',
     '上次取价': 'Last price fetch',
     '上次失败：': 'Last failure:',
+    '上游按 24 小时窗口给每个账号、每个模型配额；预算 = 撞线账号在窗口内用量的平均值（上游不给这个数字，只能撞线时反推），已用从各账号自己的重置时刻起算。没有撞线记录（或记录已过期）的组合按最近 24 小时保守估计（标「按 24h 估算」）。': 'The upstream grants each account a per-model quota inside a 24h window. The budget is the average window usage of the accounts that hit the cap (the upstream never publishes it, so it is inferred when one does), and each account\'s used amount counts from its own reset clock. Pairs with no cap on record (or a stale one) are estimated from the last 24h and marked "est. from last 24h".',
     '上游中断': 'Upstream interrupted',
     '上面的美元单价按它折算成人民币）': ', converted to CNY at that rate)',
     '下一页': 'Next',
@@ -841,6 +855,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '关闭': 'Close',
     '内置': 'Built-in',
     '冷却': 'Cooling',
+    '冷却至 ': 'Cooling until ',
     '出口': 'Exit',
     '出口已更新': 'Exit updated',
     '出口更新失败:': 'Updating the exit failed:',
@@ -885,6 +900,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '剩': 'left',
     '剩余可用': 'Remaining',
     '剩余可用积分': 'Remaining credits',
+    '剩余用量估算': 'Remaining usage estimate',
     '剩余积分 / 额度': 'Credits / quota left',
     '剩余积分 ·': 'Credits left ·',
     '剩余额度最大': 'Most quota left',
@@ -892,6 +908,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '勾选要导入为槽位的出口：': 'Tick the exits to import as slots:',
     '匹配来源：': 'Match source:',
     '区域': 'Region',
+    '区间': 'range',
     '单价 · USD /': 'unit price · USD /',
     '单价（USD /': 'unit price (USD /',
     '即将到期': 'Expiring soon',
@@ -933,7 +950,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '国际版 (Global)': 'Global',
     '国际版 (Global) · www.workbuddy.ai': 'Global · www.workbuddy.ai',
     '国际版每日活跃打卡': 'Global daily activity check-in',
-    '国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话（在 console/as 下建一个带 prompt 的会话）。实测只有网页端对话会被计入官方「每日活跃」，桌面身分的对话不计入。默认开启。': 'When a Global account checks in, besides the light desktop-identity chat it also runs one web-channel session (a session with a prompt is created under console/as). In practice only web-side chats count toward the official daily activity; desktop-identity chats do not. On by default.',
+    '国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话。默认开启。': 'When a Global account checks in, besides the light desktop-identity chat it also runs one web-channel session. On by default.',
     '在家待命中': 'At home, idle',
     '在浏览器里打开下方链接并完成登录授权': 'Open the link below in a browser and finish the sign-in authorization',
     '域名': 'Domain',
@@ -1091,6 +1108,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '把)': ')',
     '把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响': 'Assign enabled accounts with no exit to enabled proxy slots in order; accounts that are already bound are left alone',
     '拉取积分明细失败:': 'Fetching credit details failed:',
+    '按 24h 估算': 'est. from last 24h',
     '按 API Key 的消耗归属': 'Usage attributed by API key',
     '按 OpenRouter 公布的模型价折算的等价 token 花费': 'Equivalent token cost converted from the model prices OpenRouter publishes',
     '按 OpenRouter 模型价折算的等价 token 花费': 'Equivalent token cost converted from OpenRouter model prices',
@@ -1100,6 +1118,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '推理': 'Reasoning',
     '提示词前缀命中复用比': 'Share of prompt-prefix reuse',
     '搜索包名/代码/来源…': 'Search package name / code / source...',
+    '样本': 'samples',
     '操作': 'Actions',
     '操作失败': 'Operation failed',
     '操作失败:': 'Operation failed:',
@@ -1142,6 +1161,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '暂无数据': 'No data',
     '暂无日志可导出': 'No logs to export',
     '暂无账号用量数据': 'No account usage data yet',
+    '暂无数据（需要账号先有用量或撞线记录）': 'No data yet (needs usage or a cap on record)',
+    '暂无预算样本：等某个账号把某个模型的窗口用满（撞线）后自动出现。': 'No budget samples yet: they appear once an account fills a model\'s window (hits the cap).',
     '更新时间:': 'Updated:',
     '更新时间: -': 'Updated: -',
     '最低保留积分': 'Minimum reserved credits',
@@ -1229,13 +1250,35 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '每日活跃打卡 (国际版)': 'Daily activity check-in (Global)',
     '每日积分限额': 'Daily credit limit',
     '临期积分优先': 'Expiring credits first',
-    '账号最早到期的积分包进入该天数窗口时，分派优先使用这些账号，避免快到期的积分被浪费；窗口内按到期先后使用，同一天到期的账号之间仍轮询。填 0 表示关闭。': 'When an account\'s soonest-expiring credit package falls inside this many days, dispatch prefers those accounts so credits about to lapse are not wasted. Inside the window the earliest expiry is used first; accounts expiring on the same day still take turns. 0 turns it off.',
+    '账号「最早到期的积分包」（还有剩余、且到期会真正作废的那些）距今不超过该天数时，分派优先使用临期积分的账号——分到的流量更多、越接近到期份额越大，但不会全压在一个账号上（到期日相同或相近的账号彼此等权）；这些账号暂时都不可用（冷却、达日限额等）时，其他账号照常顶上。填 0 表示关闭；天数取自各账号最近一次刷新的积分数据。': 'When the soonest-expiring credit package of an account (one that still has credits and would really lapse) is within this many days, dispatch prefers the accounts with expiring credits - they get a larger share, and the closer to expiry the bigger - but never all of it in one account (accounts expiring on or around the same day carry equal weight); when none of them is usable (cooling down, over a daily limit), the other accounts serve as usual. 0 turns it off; the day counts come from the most recent credit refresh of each account.',
     '启用临期优先': 'Enable expiring-credits first',
     '已开启临期积分优先': 'Expiring-credits priority on',
     '已关闭临期积分优先': 'Expiring-credits priority off',
     '积分数据刷新间隔（小时）': 'Credit refresh interval (hours)',
     '已保存积分数据刷新间隔': 'Credit refresh interval saved',
     '积分数据刷新间隔请填 0 或正整数（0 = 关闭后台刷新）': 'Credit refresh interval must be 0 or a positive integer (0 turns the background refresh off)',
+    '积分获取历史': 'Credit grants',
+    '积分获取历史已刷新': 'Credit grants refreshed',
+    '积分获取历史加载失败: ': 'Loading the credit grants failed: ',
+    '各账号积分包的上游发放记录（每日活跃奖励、免费套餐、活动包…）。数据是最近一次「刷新积分」的快照，要更新的数字先点账号页的「一键刷新积分」。': 'Packages the upstream granted to each account (daily activity rewards, free plan, campaigns...). This is the snapshot from the last credit refresh; use "Refresh credits" on the accounts page for fresh numbers.',
+    '共 ': 'Total ',
+    ' 笔 · 合计 ': ' grants · granted ',
+    ' · 剩余 ': ' · left ',
+    ' · 数据截至 ': ' · snapshot ',
+    '剩余': 'Left',
+    '到期': 'Expires',
+    '已用完': 'Used up',
+    '不过期': 'No expiry',
+    '暂无积分获取记录': 'No credit grants yet',
+    '暂无积分获取记录（上游只返回当前仍可见的积分包，先点「一键刷新积分」拉一次）': 'No credit grants on record (the upstream only returns packages still visible; run "Refresh credits" once)',
+    '来源': 'Source',
+    '每日活跃奖励': 'Daily activity reward',
+    '上游发放原因：': 'Upstream reason: ',
+    '本机动作：': 'Gateway action: ',
+    '每日签到': 'Daily check-in',
+    '每日活跃打卡': 'Daily activity check-in',
+    '成功': 'succeeded',
+    '按包名与面额推断（官方规则：每日活跃 30 / Pro 50 积分）': 'Inferred from the package name and size (official rule: 30 for daily activity, 50 on Pro)',
     '每日签到 (国内版)': 'Daily check-in (China)',
     '每日签到:': 'Daily check-in:',
     '每账号每日上限（token）': 'Daily cap per account (tokens)',
@@ -1247,7 +1290,6 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '没有启用的代理槽，请先在「设置 → 账号代理槽」添加并保存': 'No proxy slot is enabled; add and save one under Settings → Account proxy slots first',
     '注意：切换后的身分会被保存，重启后继续沿用，不会自动回到 WB。': 'Note: the switched identity is saved and kept after a restart; it does not go back to WB on its own.',
     '注意：开启后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号的额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本。': 'Note: with this on, the gateway goes out to fetch the URLs the model asks for (only literal private addresses are blocked), and every proxied round makes one extra upstream call and spends more of that account quota; on Chinese networks DuckDuckGo may be unreachable, and the model then gets error text.',
-    '注意：网页通道会真的起一次任务，消耗该账号少量积分，换来的是每日 30/50 积分活跃奖励。': 'Note: the web channel really runs a task and spends a few credits from that account, in exchange for the daily 30/50 credit activity reward.',
     '活跃打卡成功': 'Activity check-in succeeded',
     '流式': 'Streaming',
     '浅色': 'Light',
@@ -1282,6 +1324,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '生效中': 'Active',
     '生效时间': 'Effective from',
     '用于打开本看板。默认密码为': 'Used to open this dashboard. The default password is',
+    '用量 ≥80%': 'usage ≥80%',
     '用量占比': 'Usage share',
     '用量日志目录': 'Usage log directory',
     '由网关代跑': 'run by the gateway',
@@ -1311,6 +1354,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '积分后仅免费模型可用': 'credits, only free models are allowed',
     '积分限额': 'Credit limit',
     '积分，超出后仅免费模型)': 'credits, beyond which only free models are allowed)',
+    '窗口 ': 'Window ',
+    '窗口起点': 'Window start',
+    '窗口内已用': 'Used this window',
     '立即保活刷新': 'Keep-alive refresh now',
     '立即取价': 'Fetch prices now',
     '立即巡检保活': 'Run the keep-alive check now',
@@ -1347,6 +1393,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '估算价格': 'Estimated cost',
     '估算价格（国内版）': 'Estimated cost (China)',
     '估算价格（国际版）': 'Estimated cost (Global)',
+    '估算剩余': 'Estimated left',
     '网关调用量': 'Gateway calls',
     '网关调用量（国内版）': 'Gateway calls (China)',
     '网关调用量（国际版）': 'Gateway calls (Global)',
@@ -1397,6 +1444,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '其他客户端': 'Other Clients',
     '已配置': 'Configured',
     '已检测到': 'Detected',
+    ' / 共 ': ' / ',
     '未检测到': 'Not Detected',
     '网关地址': 'Gateway URL',
     '默认模型': 'Default Model',
@@ -1425,6 +1473,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '该槽位被': 'This slot is used by',
     '该模型今日已达限额，仅此模型受限（本地 0 点恢复）': 'This model reached the daily limit; only this model is restricted (resets at local midnight)',
     '该模型暂无定价数据': 'No pricing data for this model yet',
+    '当前窗口的起点未知（没有撞线记录，或记录已过期），已用按最近 24 小时统计，是剩余量的下界': 'The start of the current window is unknown (no cap on record, or a stale one); used counts the last 24h, a lower bound of what is left',
     '该账号仅此模型受限；时间为本地时间': 'only this model is restricted for this account; times are local',
     '该账号属于': 'This account belongs to the',
     '说明': 'Description',
@@ -1525,7 +1574,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '面板访问密码': 'Panel access password',
     '页 / 共': '/',
     '页 · 共': '·',
+    '项 · 冷却中': 'items · cooling',
     '预计稍后归来': 'Expected back later',
+    '预算 ≈ ': 'budget ≈ ',
     '颜色主题': 'Color theme',
     '颜色主题:': 'Color theme:',
     '额度利用率:': 'Quota utilization:',
@@ -1645,6 +1696,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "上下文窗口": "上下文視窗",
     "上下文缓存命中率": "上下文快取命中率",
     "上游 429": "上游 429",
+    "上游": "上游",
     "上游中断": "上游中斷",
     "上游限流": "上游限流",
     "下载为 .log 文件": "下載為 .log 檔案",
@@ -1731,7 +1783,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "启用自动切换": "啟用自動切換",
     "启用调度": "啟用排程",
     "回收密钥": "回收金鑰",
-    "国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话（在 console/as 下建一个带 prompt 的会话）。实测只有网页端对话会被计入官方「每日活跃」，桌面身分的对话不计入。默认开启。": "國際版帳號每日打卡時，除桌面端身分的輕量對話外，再走一次網頁通道的會話（在 console/as 下建一個帶 prompt 的會話）。實測只有網頁端對話會被計入官方「每日活躍」，桌面身分的對話不計入。預設開啟。",
+    "国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话。默认开启。": "國際版帳號每日打卡時，除桌面端身分的輕量對話外，再走一次網頁通道的會話。預設開啟。",
     "在浏览器里打开下方链接并完成登录授权": "在瀏覽器裡開啟下方連結並完成登入授權",
     "备注名称": "備註名稱",
     "复制": "複製",
@@ -1898,7 +1950,6 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "没有启用的代理槽，请先在「设置 → 代理槽」添加并保存": "沒有啟用的代理槽，請先在「設定 → 代理槽」新增並儲存",
     "注意：切换后的身分会被保存，重启后继续沿用，不会自动回到 WB。": "注意：切換後的身分會被儲存，重啟後繼續沿用，不會自動回到 WB。",
     "注意：开启后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号的额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本。": "注意：開啟後閘道會主動出網抓取模型給出的 URL（只擋字面私網地址），且每輪代跑都會多跑一次上游、多消耗該帳號的額度；國內網路下 DuckDuckGo 可能連不上，那時模型拿到的是錯誤文字。",
-    "注意：网页通道会真的起一次任务，消耗该账号少量积分，换来的是每日 30/50 积分活跃奖励。": "注意：網頁通道會真的起一次任務，消耗該帳號少量積分，換來的是每日 30/50 積分活躍獎勵。",
     "测试通过 (": "測試透過 (",
     "浏览器拒绝了复制操作": "瀏覽器拒絕了複製操作",
     "添加 WorkBuddy 账号 (OAuth 授权)": "新增 WorkBuddy 帳號 (OAuth 授權)",
@@ -1926,6 +1977,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "积分扣减历史已刷新": "積分扣減歷史已重新整理",
     "积分数据刷新间隔请填 0 或正整数（0 = 关闭后台刷新）": "積分資料重新整理間隔請填 0 或正整數（0 = 關閉後臺重新整理）",
     "积分数据刷新间隔（小时）": "積分資料重新整理間隔（小時）",
+    "窗口": "視窗",
     "立即保活刷新": "立即保活重新整理",
     "立即拉取最新日志": "立即拉取最新日誌",
     "等待授权回调完成（自动检测）": "等待授權回撥完成（自動檢測）",
@@ -2003,7 +2055,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "账号已成功启用": "帳號已成功啟用",
     "账号当日消耗的 token 达到该值后暂停接单，请求自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示不限（不限额）；与「保留积分」各自独立，任一命中都会暂停接单。": "帳號當日消耗的 token 達到該值後暫停接單，請求自動切到其他帳號；本地時間 0 點後自動恢復。填 0 表示不限（不限額）；與「保留積分」各自獨立，任一命中都會暫停接單。",
     "账号当日消费的积分达到该值后，只允许请求免费模型（目录中标记为 x0.00 的模型），需要花费积分的模型自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示关闭（默认）。": "帳號當日消費的積分達到該值後，只允許請求免費模型（目錄中標記為 x0.00 的模型），需要花費積分的模型自動切到其他帳號；本地時間 0 點後自動恢復。填 0 表示關閉（預設）。",
-    "账号最早到期的积分包进入该天数窗口时，分派优先使用这些账号，避免快到期的积分被浪费；窗口内按到期先后使用，同一天到期的账号之间仍轮询。填 0 表示关闭。": "帳號最早到期的積分包進入該天數視窗時，分派優先使用這些帳號，避免快到期的積分被浪費；視窗內按到期先後使用，同一天到期的帳號之間仍輪詢。填 0 表示關閉。",
+    "账号「最早到期的积分包」（还有剩余、且到期会真正作废的那些）距今不超过该天数时，分派优先使用临期积分的账号——分到的流量更多、越接近到期份额越大，但不会全压在一个账号上（到期日相同或相近的账号彼此等权）；这些账号暂时都不可用（冷却、达日限额等）时，其他账号照常顶上。填 0 表示关闭；天数取自各账号最近一次刷新的积分数据。": "帳號「最早到期的積分包」（還有剩餘、且到期會真正作廢的那些）距今不超過該天數時，分派優先使用臨期積分的帳號——分到的流量更多、越接近到期份額越大，但不會全壓在一個帳號上（到期日相同或相近的帳號彼此等權）；這些帳號暫時都不可用（冷卻、達日限額等）時，其他帳號照常頂上。填 0 表示關閉；天數取自各帳號最近一次重新整理的積分資料。",
     "账号池不可用": "帳號池不可用",
     "账号池未初始化": "帳號池未初始化",
     "账号，之后相关请求都会走该账号": "帳號，之後相關請求都會走該帳號",
@@ -2386,14 +2438,35 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     var inst = document.documentElement.getAttribute('data-ui-language');
     if(inst === 'en' || inst === 'zh' || inst === 'zh-Hant') lang = inst;
   }
+  // allowed() 的结果按元素缓存。观察者每收到一条 DOM 变动记录，都会从被改动的
+  // 节点沿祖先链一路检查到根；EN 界面下这条链是每个 tick 都要重走一遍的固定开销
+  // （实测 CPU profile 里 allowed + hasAttribute 占 i18n 开销的大头）。判据只看
+  // 祖先链上的 SKIP 标签 / data-no-i18n / logTerminalBody，全是静态标记，所以
+  // 结论对元素是稳定的；命中缓存时整条链一次返回。用 WeakMap，元素被回收时
+  // 缓存条目一起消失，不会把 DOM 泄漏到全局。
+  var ALLOWED_CACHE = (typeof WeakMap === 'function') ? new WeakMap() : null;
   function allowed(el){
+    var chain = [];
+    var verdict = true;
+    var settled = false;   // 结论是否已经"钉死"（命中缓存或撞上标记）
     while(el && el.nodeType === 1){
-      if(SKIP[el.tagName]) return false;
-      if(el.hasAttribute && el.hasAttribute('data-no-i18n')) return false;
-      if(el.id === 'logTerminalBody') return false;
+      if(ALLOWED_CACHE){
+        var cached = ALLOWED_CACHE.get(el);
+        if(cached !== undefined){ verdict = cached; settled = true; break; }
+      }
+      if(SKIP[el.tagName]){ verdict = false; settled = true; break; }
+      if(el.hasAttribute && el.hasAttribute('data-no-i18n')){ verdict = false; settled = true; break; }
+      if(el.id === 'logTerminalBody'){ verdict = false; settled = true; break; }
+      chain.push(el);
       el = el.parentNode;
     }
-    return true;
+    // 链走到 document 也算钉死；断在游离节点上（还没挂进 DOM）则结果随时可能
+    // 随挂载点改变，不缓存，免得把 true 固化给之后挂到 no-i18n 子树里的节点。
+    if(el && el.nodeType !== 1) settled = true;
+    if(ALLOWED_CACHE && settled){
+      for(var i = 0; i < chain.length; i++) ALLOWED_CACHE.set(chain[i], verdict);
+    }
+    return verdict;
   }
   function doText(node){
     var cur = node.data;
@@ -2409,6 +2482,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     node.data = out;
   }
   function doAttrs(el){
+    // 整树 walk 时绝大多数元素没有任何一个 ATTRS 里的属性；先问一次"有没有属性"
+    // 再进循环，省下每个元素 5 次 hasAttribute 的固定开销（profile 里排名靠前）。
+    if(!el.hasAttributes()) return;
     for(var i = 0; i < ATTRS.length; i++){
       var a = ATTRS[i];
       if(!el.hasAttribute(a)) continue;
@@ -2907,6 +2983,32 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </div>
     </div>
 
+    <!-- 剩余用量估算：上游对「账号 × 模型」的 24 小时窗口还剩多少 -->
+    <section style="margin-bottom:20px" id="remainingUsageSection">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <div>
+          <h2 style="margin:0">剩余用量估算 <em id="remainingUsageWindow" style="font-style:normal;color:var(--dim);font-size:12px"></em></h2>
+          <div style="font-size:12px;color:var(--dim)">上游按 24 小时窗口给每个账号、每个模型配额；预算 = 撞线账号在窗口内用量的平均值（上游不给这个数字，只能撞线时反推），已用从各账号自己的重置时刻起算。没有撞线记录（或记录已过期）的组合按最近 24 小时保守估计（标「按 24h 估算」）。</div>
+        </div>
+        <div style="font-size:12px;color:var(--dim)" id="remainingUsageSummary">-</div>
+      </div>
+      <div id="remainingBudgets" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px"></div>
+      <div style="overflow-x:auto;max-height:340px">
+        <table class="data-cards" id="remainingUsageTable">
+          <thead><tr>
+            <th style="text-align:left">账号</th>
+            <th style="text-align:center;width:64px">区域</th>
+            <th style="text-align:left">模型</th>
+            <th style="text-align:center">窗口起点</th>
+            <th style="text-align:right">窗口内已用</th>
+            <th style="text-align:right">估算剩余</th>
+            <th style="min-width:150px">用量占比</th>
+          </tr></thead>
+          <tbody id="remainingUsageTbody"></tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- Token 时序 + 积分扣减历史 -->
     <section style="margin-bottom:20px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px">
@@ -2933,6 +3035,24 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <table class="data-cards" id="creditHistoryTable">
           <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>积分</th><th>Token</th></tr></thead>
           <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 积分获取历史：上游发给每个账号的积分包（免费套餐 / 每日活跃奖励 / 活动包…） -->
+    <section style="margin-bottom:20px" id="creditGrantsSection">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <div>
+          <h2 style="margin:0">积分获取历史</h2>
+          <div style="font-size:12px;color:var(--dim)">各账号积分包的上游发放记录（每日活跃奖励、免费套餐、活动包…）。数据是最近一次「刷新积分」的快照，要更新的数字先点账号页的「一键刷新积分」。</div>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px" id="creditGrantsSummary">-</div>
+        </div>
+        <button class="sec mini" onclick="loadCreditGrants(this)">刷新</button>
+      </div>
+      <div style="overflow-x:auto;max-height:260px">
+        <table class="data-cards" id="creditGrantsTable">
+          <thead><tr><th>时间</th><th>账号</th><th>区域</th><th>名称</th><th>来源</th><th>积分</th><th>剩余</th><th>到期</th><th>状态</th></tr></thead>
+          <tbody id="creditGrantsTbody"></tbody>
         </table>
       </div>
     </section>
@@ -2964,9 +3084,15 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 
     <!-- 表格 2：按 API Key 的消耗归属 -->
     <section>
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
         <h2 style="margin:0">按 API Key 的消耗归属 <em id="analyticsKeyCount"></em></h2>
-        <div style="font-size:12px;color:var(--dim)">同一批请求按调用方使用的 API Key 再分一次组，用于把消耗归属到人 / 项目</div>
+        <label class="switch key-row-switch" id="keyBeforeSwitch" style="display:none"
+               title="只影响这张表的显示，不改变任何统计口径：收起后那一行的用量依然计入合计">
+          <input id="keyBeforeToggle" type="checkbox" onchange="onKeyBeforeToggle(this)">
+          <span class="switch-track"></span>
+          <span style="font-size:12px">收起「(切换前)」</span>
+        </label>
+        <div style="font-size:12px;color:var(--dim);margin-left:auto">同一批请求按调用方使用的 API Key 再分一次组，用于把消耗归属到人 / 项目</div>
       </div>
       <div style="overflow-x:auto">
         <table id="analyticsKeyTable" class="data-cards">
@@ -3177,7 +3303,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
               <td class="limit-name">
                 <div style="font-weight:600;color:var(--fg)">临期积分优先 <em id="setExpiringWindowState"></em></div>
                 <div style="font-size:12px;color:var(--dim);margin-top:2px">
-                  账号最早到期的积分包进入该天数窗口时，分派优先使用这些账号，避免快到期的积分被浪费；窗口内按到期先后使用，同一天到期的账号之间仍轮询。填 0 表示关闭。
+                  账号「最早到期的积分包」（还有剩余、且到期会真正作废的那些）距今不超过该天数时，分派优先使用临期积分的账号——分到的流量更多、越接近到期份额越大，但不会全压在一个账号上（到期日相同或相近的账号彼此等权）；这些账号暂时都不可用（冷却、达日限额等）时，其他账号照常顶上。填 0 表示关闭；天数取自各账号最近一次刷新的积分数据。
                 </div>
                 <label class="switch" style="margin-top:8px">
                   <input id="setExpiringWindowToggle" type="checkbox" onchange="toggleExpiringWindow(this)">
@@ -3273,10 +3399,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
           <div>
             <h2 style="margin:0">国际版每日活跃打卡 <em id="setDailyChatWebState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
-              国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话（在 console/as 下建一个带 prompt 的会话）。实测只有网页端对话会被计入官方「每日活跃」，桌面身分的对话不计入。默认开启。
-            </div>
-            <div style="font-size:12px;color:var(--warn);margin-top:4px">
-              注意：网页通道会真的起一次任务，消耗该账号少量积分，换来的是每日 30/50 积分活跃奖励。
+              国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话。默认开启。
             </div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
@@ -4567,6 +4690,16 @@ function authHeaders(base){
   return h;
 }
 
+// 同一 URL 的在飞请求只保留一份（单飞）。5 秒轮询、手动切页/切窗口、可见性回调
+// 叠在一起时，同一个 URL 会同时发出好几份完全相同的请求：冷窗口的 /usage 扫描
+// 要十几秒，这几份就全在服务端重跑一遍聚合，还占着浏览器的连接池，把后面的
+// /accounts、/scheduler 一起堵住——"切窗口后面板像死了"有一半是这里自己放大的。
+// 登记表按 URL 键控，后来者直接等第一份的结果；请求落定（无论成败）就摘掉登记项，
+// 下一次轮询照常发新请求，所以不会把"每次都要新数据"的语义变成缓存。
+const GETJSON_INFLIGHT = new Map();
+// 挂死保护：网络层僵住时 fetch 可能永远不落定，登记项会一直占着这个 URL，之后
+// 每一轮轮询都陪它一起等。超过这个时长就把登记项视为已死，放行新请求。
+const GETJSON_STALE_MS = 60000;
 async function getJSON(url, opts){
   // cache 模式分两档，按"响应体在服务端是否有一份 TTL 缓存"来选：
   //
@@ -4580,10 +4713,22 @@ async function getJSON(url, opts){
   //    这里绝不能写 no-store——那会让浏览器连副本都不存，条件请求无从谈起，
   //    服务端的 ETag 也就永远用不上。
   const cache = (opts && opts.revalidate) ? 'no-cache' : 'no-store';
-  const r = await fetch(url, {cache: cache, headers: authHeaders()});
-  if(r.status === 401 || r.status === 403){ panelSessionLost(); throw new Error('unauthorized'); }
-  if(!r.ok) throw new Error(r.status);
-  return r.json();
+  // 键里带上 cache 档位：同一 URL 若一处走可校验、一处走 no-store，两者语义不同
+  // （前者允许浏览器回 304 复用副本），合并会让其中一方悄悄拿到不该拿的副本。
+  const key = cache + ' ' + url;
+  const hit = GETJSON_INFLIGHT.get(key);
+  if(hit && (Date.now() - hit.at) < GETJSON_STALE_MS) return hit.p;
+  const run = async () => {
+    const r = await fetch(url, {cache: cache, headers: authHeaders()});
+    if(r.status === 401 || r.status === 403){ panelSessionLost(); throw new Error('unauthorized'); }
+    if(!r.ok) throw new Error(r.status);
+    return r.json();
+  };
+  // 落定即摘除；只摘自己那一份，别误删后来顶替的登记项（上面超时换新时会顶替）。
+  const entry = {p: null, at: Date.now()};
+  entry.p = run().finally(() => { if(GETJSON_INFLIGHT.get(key) === entry) GETJSON_INFLIGHT.delete(key); });
+  GETJSON_INFLIGHT.set(key, entry);
+  return entry.p;
 }
 // 轮询读取的 fetch 选项：这些接口的响应体由服务端的 TTL 缓存决定，同一份缓存
 // 期间不变，所以可以让浏览器存一份、每次回源校验（服务端 ETag 命中即 304）。
@@ -6057,6 +6202,22 @@ async function refreshInner(gen){
     const m = (t.accounts_map && t.accounts_map[uid]);
     return (m && m.nickname) ? m.nickname : String(uid).slice(0,8);
   };
+  // 5 秒一轮的重画里，内容没变就不碰 DOM：实测 100 行时一次 innerHTML 重写要花
+  // ~10ms 解析 + 50~65ms 强制布局（每个 tick 一个 57~77ms 的长任务），而相邻两轮
+  // 里有 1/4~1/2 的轮次数据逐字节相同——代价全白付。指纹覆盖所有会画进表格的
+  // 输入：行数据本身（JSON 快照，任何字段变化都算）、页码/每页条数/区域、账号
+  // 昵称（来自 /usage 的 accounts_map，与行分开变化）、以及价格列的三个开关
+  // （PRICING_ON、CNY/USD 显示币种、汇率——它们和行数据分开变化，漏一个就会
+  // 让"切换币种"这类操作被指纹挡住、表格停在旧币种上）。相同就整段跳过：
+  // 不重拼 HTML、不重排、不重挂悬停明细。
+  const recentFp = [
+    total, RECENT_PAGE, RECENT_LIMIT, window.VIEW_REALM,
+    PRICING_ON ? '1' : '0', costCurrency, costUsdRate,
+    rows.map(r => acctName(r.account)).join('\u0001'),
+    JSON.stringify(rows),
+  ].join('\u0002');
+  if(recentFp === lastRecentFp) return;
+  lastRecentFp = recentFp;
   COST_TIP_ROWS.clear();
   document.getElementById('recent').innerHTML = rows.length ?
     '<table class="data-cards"><thead><tr><th>时间</th><th>模型</th><th>推理强度</th><th>账号</th><th>模式</th><th>结果</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th>积分</th><th class="pricing-col" style="color:var(--warn)">估算价格</th></tr></thead><tbody>'
@@ -6111,6 +6272,9 @@ let RECENT_LIMIT = parseInt(localStorage.getItem('WB_RECENT_LIMIT') || '20', 10)
 if(![10, 20, 50, 100].includes(RECENT_LIMIT)) RECENT_LIMIT = 20;
 let RECENT_PAGE = 1;
 let RECENT_TOTAL_PAGES = 1;
+// 最近请求表上次真正画进 DOM 的内容指纹（见 refreshInner 里的 recentFp）。
+// 5 秒一轮的重画代价几乎全在布局（100 行实测 50~65ms），数据没变就不该重画。
+let lastRecentFp = null;
 
 function updateRecentLimitButtons(){
   [10, 20, 50, 100].forEach(n => {
@@ -6199,6 +6363,11 @@ function panelSessionLost(){
   PANEL_TIMERS.forEach(t => clearInterval(t));
   PANEL_TIMERS = [];
   if(typeof stopLogPolling === 'function') stopLogPolling();
+  // 「+ 添加账号 (OAuth)」弹窗里的登录轮询不在 PANEL_TIMERS 里，是它自己的一条
+  // 2.5s 定时器。不清它的话：网关重启/会话过期时弹窗还开着，pollLogin 每 2.5 秒
+  // 打一次 /accounts/login/poll，每次 401 又回到这里开闸门，这个标签页就会永远
+  // 每 2.5 秒刷一次 401（实测 9 秒内又发 3 次，永不停止）。
+  if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
   PANEL_TOKEN = '';
   try { sessionStorage.removeItem(PANEL_STORE); } catch(e) {}
   const msg = document.getElementById('panelLoginMsg');
@@ -6286,7 +6455,7 @@ async function startDashboard(){
   await loadSettings();
   await initRealm();
   await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks(),
-                     loadSchedulerStatus(), refresh()]);
+                     loadSchedulerStatus(), refresh(), loadAgentsAvailability()]);
   updateRecentLimitButtons();
   // The head script already resolved this before first paint; re-apply it
   // here so the data loaders for the active page actually run.
@@ -6685,6 +6854,8 @@ async function loadSettings(showToast){
 
     // 账号区折叠：服务端没存过、存坏了，或后端根本没这个字段，都按展开算。
     applyAccountsCollapsed(data.accounts_collapsed === true);
+    // 「(切换前)」行开关同理：只有明确存过 true 才收起，其余都照常显示。
+    applyKeyBeforeHidden(data.key_before_hidden === true);
 
       const creditsHoursInput = document.getElementById('setCreditsRefreshHours');
       if(creditsHoursInput && data.credits_refresh_hours !== undefined){
@@ -7900,7 +8071,25 @@ async function autoAssignSlots(){
   toast('已为 ' + unbound.length + ' 个未绑定账号分配代理出口', 'ok');
 }
 
+/* 智能体配置只在「浏览器和网关进程同一台机器」时成立（issue #246）：服务端 /
+   Docker / OpenWrt 部署下看板是远程打开的，一键配置改的是容器或路由器里的
+   配置目录，到不了用户自己的电脑。服务端据此回 enabled:false，这里把入口整个
+   撤掉；判定失败（网络抖动等）保持可见——本机用户不该因此丢掉这个入口。 */
+let AGENTS_AVAILABLE = true;
+async function loadAgentsAvailability(){
+  try {
+    const r = await getJSON('/agents/available');
+    if(r && r.enabled === false){
+      AGENTS_AVAILABLE = false;
+      const btn = document.getElementById('btnNavAgents');
+      if(btn) btn.style.display = 'none';
+    }
+  } catch(e){}
+}
+
 function switchMainTab(tab){
+  // 入口被撤掉后（?tab=agents 的书签、上次停留的页签）退回网关页
+  if(tab === 'agents' && !AGENTS_AVAILABLE) tab = 'gateway';
   currentMainTab = tab;
   // Remember the page across reloads. The URL is updated so the address bar
   // matches what is on screen and a copied link reopens the same page;
@@ -7982,8 +8171,15 @@ async function loadAgents(showToast){
     renderAgentManualUrls();
     const n = agentClients().filter(c => c.installed || (c.status && c.status !== 'missing')).length;
     if(state){
-      state.textContent = '(已检测到 ' + n + ' 个)';
-      state.style.color = n ? 'var(--accent2)' : 'var(--dim)';
+      // 计数必须按卡片自己的判定来数（agentStatusBadge 认 installed / detected），
+      // 否则会出现「5 张卡片、标题 4 个」的错位（issue #250）：卡片列表是全部
+      // 支持的客户端，检测到的只是其中一部分，两个数字都写出来。
+      const clients = agentClients();
+      const found = clients.filter(c => c.installed || c.detected).length;
+      state.textContent = clients.length > found
+        ? '(已检测到 ' + found + ' / 共 ' + clients.length + ' 个)'
+        : '(已检测到 ' + found + ' 个)';
+      state.style.color = found ? 'var(--accent2)' : 'var(--dim)';
     }
     if(showToast) toast('客户端检测完成', 'ok');
   } catch(e) {
@@ -8214,6 +8410,35 @@ let logAutoScroll = true;
 let logPollTimer = null;
 let logFetching = false;
 let logUserScrolledUp = false;
+// 增量渲染的簿记：DOM 里此刻画着的是"哪个过滤条件下的多少行"。轮询带回新行时
+// 只 append 新增的几行；过滤/搜索变化或状态对不上时才整表重画。
+let logDomKey = null;     // 上次渲染时的过滤条件指纹（logFilterKey()）
+let logDomCount = 0;      // DOM 中当前的 .log-line 行数
+const LOG_DOM_MAX = 2000; // 与 logEntries 的缓冲上限一致，超出就从头部裁
+
+// 过滤谓词抽出来共用：整表渲染与增量 append 必须用同一套判据，否则会出现
+// "新行画上去了、但按当前过滤条件它本不该显示"这类两套逻辑漂移出来的脏数据。
+function logMatchesFilter(item){
+  if(logFilterLevel && item.level !== logFilterLevel) return false;
+  if(logFilterTag && item.tag !== logFilterTag) return false;
+  if(logSearchText){
+    const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
+    if(!haystack.includes(logSearchText)) return false;
+  }
+  return true;
+}
+function logFilterKey(){ return logFilterLevel + '|' + logFilterTag + '|' + logSearchText; }
+// 单行 HTML 只有这一处定义，整表渲染和增量 append 都用它。
+function logLineHtml(item){
+  const lvlCls = 'lvl-' + (item.level || 'INFO');
+  const tagCls = 'tag-' + (item.tag || 'system');
+  return '<div class="log-line">' +
+    '<span class="log-ts">' + escapeHtml(item.time || '') + '</span>' +
+    '<span class="log-lvl ' + lvlCls + '">' + escapeHtml(item.level || 'INFO') + '</span>' +
+    '<span class="log-tag ' + tagCls + '">[' + escapeHtml(item.tag || 'system') + ']</span>' +
+    '<span class="log-msg">' + escapeHtml(item.msg || '') + '</span>' +
+  '</div>';
+}
 
 function startLogPolling(){
   if(logPollTimer) clearInterval(logPollTimer);
@@ -8241,14 +8466,16 @@ async function fetchNewLogs(forceReset){
     const limit = forceReset ? 500 : 200;
     const data = await getJSON('/logs?since_id=' + since + '&limit=' + limit);
     if(data && data.logs){
+      let fresh = null;     // 本轮真正新增的条目（去重后）
+      let dropped = null;   // 因超上限被挤出缓冲的最旧条目
       if(forceReset){
         logEntries = data.logs;
       } else if(data.logs.length > 0){
         const existingIds = new Set(logEntries.map(x => x.id));
-        data.logs.forEach(item => {
-          if(!existingIds.has(item.id)) logEntries.push(item);
-        });
+        fresh = data.logs.filter(item => !existingIds.has(item.id));
+        fresh.forEach(item => logEntries.push(item));
         if(logEntries.length > 2000){
+          dropped = logEntries.slice(0, logEntries.length - 2000);
           logEntries = logEntries.slice(-2000);
         }
       }
@@ -8257,8 +8484,22 @@ async function fetchNewLogs(forceReset){
       } else if(logEntries.length > 0){
         lastLogId = logEntries[logEntries.length - 1].id;
       }
-      renderLogs();
-      updateLogStats();
+      // 渲染策略：只有真的带着新行回来才碰 DOM。
+      //  - 首次进入 / 手动刷新（forceReset）、过滤条件与上次渲染不一致、或 DOM
+      //    里现在是空态：整表重画，顺带把簿记校正回来；
+      //  - 有新增行且条件一致：只把新增的几行 append 上去，被挤出的旧行从头部
+      //    等量删掉；
+      //  - 没有任何新行：直接跳过——旧实现里 `data.logs` 为空数组也真，于是每
+      //    2 秒把整个终端重写一遍，2000 行时每次约 700KB 的 HTML 解析 + 布局
+      //    （实测 layout 254~324ms）全白烧，忙碌时"每 2 秒卡 0.3 秒"就是它。
+      if(forceReset || logDomKey !== logFilterKey() || logDomCount === 0){
+        renderLogs();
+      } else {
+        if(dropped && dropped.length) dropLogDomHead(dropped);
+        if(fresh && fresh.length) appendLogLines(fresh);
+      }
+      // 统计徽章的数字只由 logEntries 决定，缓冲没变就不用重写（少一次 DOM 写）。
+      if(forceReset || (fresh && fresh.length)) updateLogStats();
     }
     if(statusEl) statusEl.textContent = '就绪 · ' + new Date().toLocaleTimeString();
   } catch(e) {
@@ -8370,38 +8611,64 @@ function renderLogs(){
   const body = document.getElementById('logTerminalBody');
   if(!body) return;
 
-  const filtered = logEntries.filter(item => {
-    if(logFilterLevel && item.level !== logFilterLevel) return false;
-    if(logFilterTag && item.tag !== logFilterTag) return false;
-    if(logSearchText){
-      const haystack = ((item.msg || '') + ' ' + (item.tag || '') + ' ' + (item.time || '')).toLowerCase();
-      if(!haystack.includes(logSearchText)) return false;
-    }
-    return true;
-  });
+  const filtered = logEntries.filter(logMatchesFilter);
 
   if(filtered.length === 0){
     body.innerHTML = '<div class="log-empty">暂无匹配的日志记录</div>';
+    logDomKey = logFilterKey();
+    logDomCount = 0;
     return;
   }
 
-  const htmlParts = [];
-  filtered.forEach(item => {
-    const lvlCls = 'lvl-' + (item.level || 'INFO');
-    const tagCls = 'tag-' + (item.tag || 'system');
-    htmlParts.push(
-      '<div class="log-line">' +
-        '<span class="log-ts">' + escapeHtml(item.time || '') + '</span>' +
-        '<span class="log-lvl ' + lvlCls + '">' + escapeHtml(item.level || 'INFO') + '</span>' +
-        '<span class="log-tag ' + tagCls + '">[' + escapeHtml(item.tag || 'system') + ']</span>' +
-        '<span class="log-msg">' + escapeHtml(item.msg || '') + '</span>' +
-      '</div>'
-    );
-  });
-  body.innerHTML = htmlParts.join('');
+  body.innerHTML = filtered.map(logLineHtml).join('');
+  logDomKey = logFilterKey();
+  logDomCount = filtered.length;
 
   if(logAutoScroll && !logUserScrolledUp){
     body.scrollTop = body.scrollHeight;
+  }
+}
+
+// 只把新到的行追加到终端末尾（insertAdjacentHTML 只解析这一段，不碰已有行）。
+// 旧实现每次轮询都把全部行重拼一遍再整体 innerHTML，2000 行时约 700KB/次；
+// 忙碌时新行通常只有几行，append 的代价与新增量成正比。
+function appendLogLines(items){
+  const body = document.getElementById('logTerminalBody');
+  if(!body) return;
+  const visible = items.filter(logMatchesFilter);
+  if(!visible.length) return;   // 新行全被过滤掉：DOM 一个字节都不动
+  body.insertAdjacentHTML('beforeend', visible.map(logLineHtml).join(''));
+  logDomCount += visible.length;
+  // 兜底上限：正常情况下头部裁剪由 dropLogDomHead 按"被挤出的条目"精确完成，
+  // 这里只防簿记与 DOM 万一脱节（比如有人在控制台里手动改过 DOM）。
+  while(logDomCount > LOG_DOM_MAX){
+    const first = body.firstElementChild;
+    if(!first){ logDomCount = 0; break; }
+    body.removeChild(first);
+    logDomCount--;
+  }
+  if(logAutoScroll && !logUserScrolledUp){
+    body.scrollTop = body.scrollHeight;
+  }
+}
+
+// 缓冲超上限时，最旧的条目被挤出 logEntries；DOM 头部也要把"其中当前过滤条件
+// 下曾经画出来的那些行"删掉，否则开着过滤时终端会攒下已经不在缓冲里的旧行，
+// 和切一次过滤后的整表重画结果对不上。按条数从头部删即可：DOM 顺序与条目顺序
+// 一致，被挤出的条目必然是最老的，也就是 DOM 头部的那几行。
+function dropLogDomHead(droppedEntries){
+  const body = document.getElementById('logTerminalBody');
+  if(!body) return;
+  let cut = 0;
+  for(let i = 0; i < droppedEntries.length; i++){
+    if(logMatchesFilter(droppedEntries[i])) cut++;
+  }
+  while(cut > 0){
+    const first = body.firstElementChild;
+    if(!first){ logDomCount = 0; return; }
+    body.removeChild(first);
+    logDomCount--;
+    cut--;
   }
 }
 
@@ -8536,17 +8803,27 @@ function analyticsQuery(){
  * Reads the combined view on purpose. The table carries its own 区域
  * column, so scoping it to the gateway's current exit would hide exactly the
  * models this page exists to compare. */
+// /v1/models?realm=all 的目录在这里只作展示白名单（哪些模型算"已知模型"），
+// 内容变化极慢，却跟着 5 秒轮询每轮重取一份（实测统计页开着约 12~15 次/分钟、
+// 约 24KB/次）。改成一个 TTL：进统计页时取一次，之后最多每 10 分钟回源一次；
+// 取失败不刷新时间戳，下一轮继续重试（和原来"失败也不清空白名单"一致）。
+let matrixModelsAt = 0;
+const MATRIX_MODELS_TTL_MS = 10 * 60 * 1000;
 async function loadAnalyticsMatrix(){
   try{
       const q = analyticsQuery();
+    const needModels = !MATRIX_MODELS.size || (Date.now() - matrixModelsAt) >= MATRIX_MODELS_TTL_MS;
     const [usage, perf, models] = await Promise.all([
       getJSON('/usage' + q, POLL_READ),
       getJSON('/usage/perf' + q, POLL_READ),
       // The catalog is only a display filter, so a failure here must not
       // blank the table; null keeps the previous allowlist.
-      getJSON('/v1/models?realm=all').catch(() => null),
+      needModels ? getJSON('/v1/models?realm=all').catch(() => null) : Promise.resolve(null),
     ]);
-    if(models && models.data) MATRIX_MODELS = new Set(models.data.map(m => m.id));
+    if(models && models.data){
+      MATRIX_MODELS = new Set(models.data.map(m => m.id));
+      matrixModelsAt = Date.now();
+    }
     cachedMatrixData = { usage: usage, perf: perf };
     fillMatrixFilters(usage);
     renderPerfMatrix(usage, perf);
@@ -8882,9 +9159,100 @@ async function loadAnalytics(){
     const data = await getJSON('/usage/analytics' + analyticsQuery(), POLL_READ);
     renderAnalytics(data);
     loadUsageSeries();
+    loadRemainingUsage();
+    loadCreditGrants();
   } catch(err) {
     console.error('loadAnalytics failed:', err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 剩余用量估算（/usage/remaining）
+//
+// 上游按 24 小时窗口给「账号 × 模型」配额，预算 = 撞线账号窗口用量的平均；
+// 这个区块把每个账号当前窗口的剩余列出来。数字随用量实时变化，不跟时间窗
+// 选择器联动（它只描述「现在」），所以载荷不带 range 参数。
+// ---------------------------------------------------------------------------
+async function loadRemainingUsage(){
+  try {
+    const data = await getJSON('/usage/remaining', POLL_READ);
+    renderRemainingUsage(data);
+  } catch(err) {
+    if(!isAuthError(err)) console.error('loadRemainingUsage failed:', err);
+  }
+}
+
+function fmtTok(v){
+  if(v == null) return '—';
+  const n = Number(v) || 0;
+  if(Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if(Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+function renderRemainingUsage(data){
+  const tbody = document.getElementById('remainingUsageTbody');
+  if(!tbody) return;
+  const rows = (data && data.rows) || [];
+  const budgets = (data && data.budgets) || [];
+  const realmName = r => (r === 'cn' ? '国内版' : '国际版');
+
+  const winEm = document.getElementById('remainingUsageWindow');
+  if(winEm){
+    winEm.textContent = data ? ('窗口 ' + (data.window_seconds / 3600) + 'h') : '';
+  }
+  const budgetsEl = document.getElementById('remainingBudgets');
+  if(budgetsEl){
+    budgetsEl.innerHTML = budgets.length
+      ? budgets.map(b => '<span class="badge" style="font-size:11px" title="'
+          + esc('样本 ' + b.n + ' · 区间 ' + fmtTok(b.min) + ' ~ ' + fmtTok(b.max)) + '">'
+          + esc(realmName(b.realm) + ' · ' + b.model) + ' · 预算 ≈ <b>' + fmtTok(b.avg) + '</b>'
+          + ' <span style="color:var(--dim)">(n=' + b.n + ')</span></span>').join(' ')
+      : '<span style="font-size:12px;color:var(--dim)">暂无预算样本：等某个账号把某个模型的窗口用满（撞线）后自动出现。</span>';
+  }
+
+  const summary = document.getElementById('remainingUsageSummary');
+  if(summary){
+    const cooling = rows.filter(r => r.cooling).length;
+    const tight = rows.filter(r => !r.cooling && r.used_pct != null && r.used_pct >= 80).length;
+    summary.textContent = rows.length
+      ? (rows.length + ' 项 · 冷却中 ' + cooling + ' · 用量 ≥80% ' + tight)
+      : '暂无数据';
+  }
+
+  if(!rows.length){
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--dim)">'
+      + '暂无数据（需要账号先有用量或撞线记录）</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const pct = r.used_pct == null ? null : Math.max(0, Math.min(100, r.used_pct));
+    const color = r.cooling || (pct != null && pct >= 90) ? 'var(--bad)'
+      : (pct != null && pct >= 70 ? 'var(--warn)' : 'var(--accent2)');
+    const bar = '<div style="display:flex;align-items:center;gap:6px">'
+      + '<div style="flex:1;height:6px;background:var(--panel2);border:1px solid var(--line);border-radius:3px;overflow:hidden">'
+      + '<div style="height:100%;width:' + (pct == null ? 0 : pct) + '%;background:' + color + ';transition:width .3s ease"></div>'
+      + '</div>'
+      + '<span style="font-size:11px;color:var(--dim);min-width:44px;text-align:right">'
+      + (r.used_pct == null ? '—' : r.used_pct.toFixed(1) + '%') + '</span></div>';
+    const flags = [];
+    if(r.cooling) flags.push('<span class="badge" style="font-size:10px;color:var(--bad)">冷却至 '
+      + esc((r.reset_iso || '').slice(5, 16)) + '</span>');
+      else if(r.estimated) flags.push('<span class="badge" style="font-size:10px;color:var(--dim)" '
+      + 'title="当前窗口的起点未知（没有撞线记录，或记录已过期），已用按最近 24 小时统计，是剩余量的下界">按 24h 估算</span>');
+    const remainCell = r.remaining == null ? '—'
+      : (r.cooling ? '<b style="color:var(--bad)">0</b>' : '<b>' + fmtTok(r.remaining) + '</b>');
+    return '<tr>'
+      + '<td style="text-align:left">' + esc(r.nickname || (r.uid || '').slice(0, 8)) + '</td>'
+      + '<td style="text-align:center">' + esc(realmName(r.realm)) + '</td>'
+      + '<td style="text-align:left">' + esc(r.model) + ' ' + flags.join(' ') + '</td>'
+      + '<td style="text-align:center;font-size:11px;color:var(--dim)">'
+      + esc((r.window_iso || '').slice(5, 16)) + '</td>'
+      + '<td style="text-align:right">' + fmtTok(r.used) + '</td>'
+      + '<td style="text-align:right">' + remainCell + '</td>'
+      + '<td>' + bar + '</td>'
+      + '</tr>';
+  }).join('');
 }
 
 function loadUsageSeries(){
@@ -8992,6 +9360,78 @@ function renderCreditHistory(data){
     + '<td>' + fmt(x.credit) + '</td>'
     + '<td>' + fmt(x.total_tokens || 0) + '</td>'
     + '</tr>').join('') || '<tr><td colspan="5" style="color:var(--dim)">没有积分扣减记录</td></tr>';
+}
+
+// ---------------------------------------------------------------------------
+// 积分获取历史（/accounts/credits/grants）
+//
+// 上游给每个账号一份积分包清单（免费套餐、每日活跃奖励的 Bonus Pack、活动包…），
+// 每个包带面额与发放时间。这个区块把全部账号的包摊平成一张表、新的在前；接口只读
+// 最近一次「刷新积分」留下的快照（不发上游请求），所以摘要里带上快照时刻。
+// ---------------------------------------------------------------------------
+let LAST_GRANTS_DATA = null;
+const GRANT_STATUS_LABEL = {active: '生效中', available: '可用', used_up: '已用完', expired: '已过期'};
+
+async function loadCreditGrants(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }
+  try{
+    const data = await getJSON('/accounts/credits/grants', POLL_READ);
+    renderCreditGrants(data);
+    if(btn) toast('积分获取历史已刷新', 'ok');
+  }catch(e){
+    if(!isAuthError(e)) toast('积分获取历史加载失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '刷新'; }
+  }
+}
+
+function renderCreditGrants(data){
+  if(data) LAST_GRANTS_DATA = data;
+  const d = LAST_GRANTS_DATA || {};
+  const rows = (d.rows || []).slice(0, 100);
+  const s = d.summary || {};
+  const summary = document.getElementById('creditGrantsSummary');
+  if(summary){
+    summary.textContent = rows.length
+      ? ('共 ' + fmt(s.count || rows.length) + ' 笔 · 合计 ' + fmt(s.size || 0)
+         + ' · 剩余 ' + fmt(s.remain || 0)
+         + (d.fetched_iso ? ' · 数据截至 ' + String(d.fetched_iso).slice(5, 16) : ''))
+      : '暂无积分获取记录（上游只返回当前仍可见的积分包，先点「一键刷新积分」拉一次）';
+  }
+  const tbody = document.getElementById('creditGrantsTbody');
+  if(!tbody) return;
+  tbody.innerHTML = rows.map(r => {
+    const status = GRANT_STATUS_LABEL[r.status] || String(r.status || '');
+    const tone = (r.status === 'expired' || r.status === 'used_up') ? 'bad'
+      : (r.status === 'active' ? 'ok' : '');
+    const expiry = r.no_expiry ? '不过期' : String(r.expire_iso || '').slice(5, 16) || '—';
+    // 来源：上游给了发放原因就用它的原文（如「Buddy 加油站签到」「成长计划奖励」），
+    // 没有就按包名与面额推断（国际版的 Bonus Pack 30/50 就是每日活跃奖励）。本机
+    // 签到 / 每日活跃的记录按时间对得上时一并挂进悬停提示，指出这次发放对应哪次动作。
+    const reason = String(r.grant_reason || '').trim();
+    const inferred = !reason && r.realm === 'intl' && /bonus/i.test(String(r.name || ''))
+      && (Number(r.size) === 30 || Number(r.size) === 50);
+    const source = reason || (inferred ? '每日活跃奖励' : '');
+    const tips = [];
+    if(reason) tips.push('上游发放原因：' + reason);
+    if(inferred) tips.push('按包名与面额推断（官方规则：每日活跃 30 / Pro 50 积分）');
+    if(r.action && r.action.task){
+      const task = r.action.task === 'checkin' ? '每日签到' : '每日活跃打卡';
+      tips.push('本机动作：' + task + ' ' + String(r.action.ts || '').slice(5, 16).replace('T', ' ')
+                + ' ' + (r.action.ok ? '成功' : '失败'));
+    }
+    return '<tr>'
+      + '<td>' + esc(String(r.create_iso || '').slice(5, 16) || '—') + '</td>'
+      + '<td title="' + esc(r.uid || '') + '">' + esc(r.nickname || creditAccountLabel(r.uid)) + '</td>'
+      + '<td style="text-align:center">' + esc(r.realm === 'cn' ? '国内版' : '国际版') + '</td>'
+      + '<td' + (r.grant_reason ? ' title="' + esc(r.grant_reason) + '"' : '') + '>' + esc(r.name || '') + '</td>'
+      + '<td' + (tips.length ? ' title="' + esc(tips.join('；')) + '"' : '') + '>' + esc(source || '—') + '</td>'
+      + '<td style="text-align:right">' + fmt(r.size || 0) + '</td>'
+      + '<td style="text-align:right">' + fmt(r.remain || 0) + '</td>'
+      + '<td style="text-align:center;font-size:11px;color:var(--dim)">' + esc(expiry) + '</td>'
+      + '<td style="text-align:center"><span class="badge ' + tone + '">' + esc(status) + '</span></td>'
+      + '</tr>';
+  }).join('') || '<tr><td colspan="9" style="color:var(--dim)">暂无积分获取记录</td></tr>';
 }
 
 /* 第一列的口径随范围切换，标签必须跟着走，否则「本周」的数字会被当成「今日」读。 */
@@ -9141,7 +9581,32 @@ function renderAnalytics(data){
 
 /* 按 API Key 的归属表。口径与账号表完全一致（window 桶 = 当前选中范围），
    所以两张表的请求数应当相等；对不上是数据问题，不是渲染能修的，故这里
-   不隐藏任何一行——(未知 key) 那行正是用来兜住差额的。 */
+   不隐藏任何会兜差额的行——(未知 key) 正是用来兜住差额的。唯一能收起的是
+   「(切换前)」：它是升级前的历史尾巴，只减不增，收起与否都不影响对账。 */
+
+/* 「(切换前)」行开关的状态。表格每 5 秒重绘一次，所以状态不能存在渲染函数
+   里，得放在外面；偏好与账号区折叠一样存服务端的 accounts/settings.json
+   （key_before_hidden），不用 localStorage。 */
+let keyBeforeHidden = false;
+let lastKeyData = null;
+/* 唯一的写入口：内存状态、复选框与表格一起改，三者不会不同步。 */
+function applyKeyBeforeHidden(hidden){
+  keyBeforeHidden = hidden === true;
+  const box = document.getElementById('keyBeforeToggle');
+  if(box) box.checked = keyBeforeHidden;
+  if(lastKeyData) renderKeyTable(lastKeyData);
+  return keyBeforeHidden;
+}
+// 显式选择走既有的 settings save 通道（一个键的 patch，不动别的设置）。
+async function onKeyBeforeToggle(box){
+  const next = !!(box && box.checked);
+  applyKeyBeforeHidden(next);
+  try {
+    await postJSON('/settings/save', {key_before_hidden: next});
+  } catch(e) {
+    toast('「(切换前)」行开关保存失败: ' + e.message, 'bad');
+  }
+}
 function keyRealmCell(k){
   if(k.source === 'bucket') return '<span style="color:var(--dim)">—</span>';
   if(k.realm === 'cn') return '<span class="badge warn" style="font-size:10px">国内版</span>';
@@ -9174,7 +9639,15 @@ function renderKeyTable(data){
   const countEm = document.getElementById('analyticsKeyCount');
   const note = document.getElementById('analyticsKeyNote');
   const keys = data.keys || [];
-  if(countEm) countEm.textContent = keys.length ? '(' + keys.length + ' 把)' : '';
+  lastKeyData = data;
+  const wrap = document.getElementById('keyBeforeSwitch');
+  const box = document.getElementById('keyBeforeToggle');
+  const hasBefore = keys.some(k => k.key === '__before_keys__');
+  // 新装的环境没有这一行，就没得收，开关也不该出现。
+  if(wrap) wrap.style.display = hasBefore ? '' : 'none';
+  if(box) box.checked = keyBeforeHidden;
+  const shown = keyBeforeHidden ? keys.filter(k => k.key !== '__before_keys__') : keys;
+  if(countEm) countEm.textContent = shown.length ? '(' + shown.length + ' 把)' : '';
 
   if(note){
     const named = keys.filter(k => k.source !== 'bucket');
@@ -9182,16 +9655,17 @@ function renderKeyTable(data){
     const parts = [];
     if(!named.length) parts.push('设置里还没有任何 API Key，全部流量都落在下面的未归属行里。');
     if(cross) parts.push('有 ' + cross + ' 把 Key 没有绑定出口，它的积分由国际版与国内版两套价格相加而来，只能当量级看。');
-    parts.push('Key 维度只从本次升级之后开始记录：更早的请求没有这个字段，会一直留在「(切换前)」里且不会再增长。');
+    // 收起那行时就不再解释那行，否则读者找不到话里指的东西。
+    if(!keyBeforeHidden) parts.push('Key 维度只从本次升级之后开始记录：更早的请求没有这个字段，会一直留在「(切换前)」里且不会再增长。');
     note.innerHTML = parts.join(' ');
   }
 
-  if(!keys.length){
+  if(!shown.length){
     tbody.innerHTML = '<tr><td colspan="8" class="empty">暂无 API Key 用量数据</td></tr>';
     return;
   }
 
-  tbody.innerHTML = keys.map(k => {
+  tbody.innerHTML = shown.map(k => {
     const st = k.window || {};
     const sub = {panel:'面板 Key', launcher:'启动参数', bucket:'未归属', builtin:'内置'}[k.source] || '';
     let nameCell = '<td style="text-align:left" data-label="API Key">'

@@ -19,14 +19,19 @@ const code = dashboardScript();
 
 // One shared fake DOM for every dashboard suite: tests/_dom_stub.js.
 const dom = require('./_dom_stub.js');
+const fetchCalls = [];
 dom.installDom({
-  fetch: () => Promise.resolve({ ok:true, status:200, json: () => Promise.resolve({}) }),
+  fetch: (url, options) => {
+    fetchCalls.push({url: String(url), body: options && options.body});
+    return Promise.resolve({ ok:true, status:200, json: () => Promise.resolve({}) });
+  },
 });
 
 let api;
 try {
   api = new Function(code + `
-    ; return { renderKeyTable, keyRealmCell, keyModelPills };`)();
+    ; return { renderKeyTable, keyRealmCell, keyModelPills,
+               onKeyBeforeToggle, applyKeyBeforeHidden };`)();
 } catch (e) {
   console.log('LOAD ERROR:', e.message);
   process.exit(1);
@@ -176,6 +181,48 @@ check('the empty state does not claim a count',
 check('a panel with no keys is told so', document.getElementById('analyticsKeyNote').innerHTML.includes('还没有任何 API Key'));
 api.renderKeyTable({});
 check('a payload without the axis at all does not throw', document.getElementById('analyticsKeyTbody').innerHTML.includes('colspan="8"'));
+
+console.log();
+console.log('[7] the (切换前) legacy row folds away on demand');
+api.renderKeyTable({ keys: keys });
+const wrap = document.getElementById('keyBeforeSwitch');
+const box = document.getElementById('keyBeforeToggle');
+check('the row is shown by default',
+      document.getElementById('analyticsKeyTbody').innerHTML.includes('(切换前)'));
+check('the switch starts off', box.checked === false);
+box.checked = true; api.onKeyBeforeToggle(box);
+out = document.getElementById('analyticsKeyTbody').innerHTML;
+check('flipping it on removes exactly that one row',
+      !out.includes('(切换前)') && (out.match(/<tr>/g) || []).length === 5,
+      (out.match(/<tr>/g) || []).length);
+check('the other unattributed buckets are left alone', out.includes('(无 key)'));
+check('the row count follows the visible rows',
+      document.getElementById('analyticsKeyCount').textContent === '(5 把)');
+check('the footer stops explaining a row that is no longer there',
+      !document.getElementById('analyticsKeyNote').innerHTML.includes('(切换前)'));
+check('the checkbox stays in sync with the state', box.checked === true);
+const saved = fetchCalls[fetchCalls.length - 1];
+check('the choice is saved server-side through the settings channel',
+      !!saved && /\/settings\/save$/.test(saved.url)
+      && JSON.parse(saved.body).key_before_hidden === true,
+      saved && (saved.url + ' ' + saved.body));
+check('nothing is written to the browser store',
+      localStorage.getItem('wb-key-hide-before') === null);
+box.checked = false; api.onKeyBeforeToggle(box);
+check('flipping it back restores the row',
+      document.getElementById('analyticsKeyTbody').innerHTML.includes('(切换前)'));
+check('the off choice is saved too, not just applied',
+      JSON.parse(fetchCalls[fetchCalls.length - 1].body).key_before_hidden === false);
+check('a payload with no such row hides the switch entirely',
+      (api.renderKeyTable({ keys: [key({ name: 'x', realm: 'cn' })] }),
+       wrap.style.display === 'none'));
+// The restore path reads the same single boolean: only a real true folds the
+// row, so a hand-edited "true" or a 1 cannot hide it by accident.
+check('only a stored boolean true folds the row',
+      api.applyKeyBeforeHidden('true') === false
+      && api.applyKeyBeforeHidden(1) === false
+      && api.applyKeyBeforeHidden(true) === true);
+api.applyKeyBeforeHidden(false);
 
 console.log();
 console.log('PASS=' + pass + ' FAIL=' + fail);

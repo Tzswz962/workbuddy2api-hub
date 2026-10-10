@@ -15,6 +15,7 @@ import wb_activity
 import wb_atrest
 import wb_identity
 import wb_settings
+import wb_upstream_pool
 import wb_webagent
 
 # ---------------------------------------------------------------------------
@@ -120,7 +121,20 @@ def opener_for_proxy(proxy):
 
 
 def urlopen(req, timeout=30, proxy=""):
-    """urlopen honouring an optional per-account proxy."""
+    """urlopen honouring an optional per-account proxy, over a keep-alive pool.
+
+    urllib 的 AbstractHTTPHandler.do_open 会写死 Connection: close，每个请求都得
+    重新 TCP+TLS 握手（真机实测 118.0ms，是请求路径上最大的一笔开销）。默认改走
+    wb_upstream_pool：按（目标, 代理串）分池复用连接。不能逐字节对齐 urllib 语义
+    的请求（非 http(s) 目标、非 HTTP 代理、需要跟随的 3xx 重定向）由 PoolBypass
+    回退到下面这条原来的路，行为与改动前一致；WB_UPSTREAM_KEEPALIVE=0 时整条
+    路径都与改动前相同。
+    """
+    if wb_upstream_pool.enabled():
+        try:
+            return wb_upstream_pool.urlopen(req, timeout=timeout, proxy=proxy)
+        except wb_upstream_pool.PoolBypass:
+            pass
     opener = opener_for_proxy(proxy)
     if opener is None:
         return urllib.request.urlopen(req, timeout=timeout)

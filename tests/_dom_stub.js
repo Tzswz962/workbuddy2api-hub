@@ -138,6 +138,9 @@ function makeElement(tag, options) {
     attributes,
     children,
     childNodes: children,
+    // 面板用 firstElementChild 在日志终端里从头部裁行（跳过文本节点），
+    // 真 DOM 的成员，这里也照真 DOM 建模：第一个元素子节点，没有就是 null。
+    get firstElementChild() { return children.find(c => c && c.nodeType === 1) || null; },
     parentNode: null,
     parentElement: null,
     offsetWidth: 0,
@@ -169,7 +172,12 @@ function makeElement(tag, options) {
 
   for (const name of ELEMENT_METHODS) el[name] = NOOP;
 
-  el.appendChild = (child) => { children.push(child); if (child) child.parentNode = el; return child; };
+  // 元素对外的身份是最后返回的那个 Proxy；appendChild 挂 parentNode 时也必须用
+  // 同一个身份。否则 panel 沿 parentNode 上溯看到的"祖先"与 childNodes 里的子
+  // 节点不是同一个对象，按元素做的缓存（WeakMap 键）会整条链失效——真 DOM 里
+  // documentElement === document.documentElement.parentNode 恒成立，桩要一致。
+  let self = el;
+  el.appendChild = (child) => { children.push(child); if (child) child.parentNode = self; return child; };
   el.removeChild = (child) => {
     const i = children.indexOf(child);
     if (i >= 0) children.splice(i, 1);
@@ -186,6 +194,9 @@ function makeElement(tag, options) {
   el.setAttribute = (name, value) => { attributes[name] = String(value); };
   el.getAttribute = (name) => (name in attributes ? attributes[name] : null);
   el.hasAttribute = (name) => name in attributes;
+  // 面板的 i18n doAttrs() 先用 hasAttributes() 跳过完全没属性的元素，
+  // 假元素按真 DOM 建模，免得整段 walk 在测试里抛"未建模成员"。
+  el.hasAttributes = () => Object.keys(attributes).length > 0;
   el.removeAttribute = (name) => { delete attributes[name]; };
   el.addEventListener = (type, fn) => {
     if (!listeners.has(type)) listeners.set(type, []);
@@ -221,7 +232,7 @@ function makeElement(tag, options) {
   el._options = opts;
 
   if (!opts.permissive) {
-    return new Proxy(el, {
+    self = new Proxy(el, {
       get(target, prop) {
         if (typeof prop === 'symbol') return target[prop];
         if (prop === 'then') return undefined;          // never a thenable
@@ -238,9 +249,10 @@ function makeElement(tag, options) {
         return true;
       },
     });
+    return self;
   }
   if (unknown) {
-    return new Proxy(el, {
+    self = new Proxy(el, {
       get(target, prop) {
         if (typeof prop === 'symbol' || prop in target) return target[prop];
         if (prop === 'then') return undefined;
@@ -249,6 +261,7 @@ function makeElement(tag, options) {
       },
       set(target, prop, value) { target[prop] = value; return true; },
     });
+    return self;
   }
   return el;
 }

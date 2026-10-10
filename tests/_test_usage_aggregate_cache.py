@@ -833,10 +833,34 @@ check("没有新字节：不再写（文件被删掉也不补写）", not os.pat
 cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=0)
 restart()
 live()
-check("时间阈值到点：即使没有新字节也写一次", os.path.exists(CACHE))
+check("计时器到点 + 从零折满（确有推进）：写一次", os.path.exists(CACHE))
 with io.open(CACHE, encoding="utf-8") as fh:
     check("写出来的还是完整的 checkpoint",
           json.load(fh).get("schema") == P._USAGE_CACHE_SCHEMA)
+
+# 空闲不重写（本节的靶子）：进度已对齐到 checkpoint，等满一个时间窗口后再
+# 刷新，日志没有新字节 → 不许再写。旧行为：计时器到点就无条件写一份逐字节
+# 相同的 checkpoint，面板开着等于每 900s 白写一份 120KB（纯写放大）。
+cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=900)
+before = os.stat(CACHE).st_mtime_ns
+P._usage_cache_last_attempt -= 901
+live()
+check("计时器到点 + 无推进：不写（空闲不重写）",
+      os.stat(CACHE).st_mtime_ns == before)
+# 同一件事从真实调用路径再走一遍：无新字节的 usage_snapshot(range="today")
+# 是面板轮询每几秒就碰一次的路径（日桶半 → _usage_cache_maybe_save）。
+P._usage_cache_last_attempt -= 901
+P.usage_snapshot(range="today", ttl=0)
+check("无新字节的 usage_snapshot(range=today) 不重写 checkpoint",
+      os.stat(CACHE).st_mtime_ns == before)
+# 有推进（不足字节阈值）：计时器分支照常写——修的是空闲重写，不是计时器
+append_log([row(FROZEN - 100, "m-a", "u1", 500, 50)])
+P._usage_cache_last_attempt -= 901
+live()
+check("计时器到点 + 有新字节（不足字节阈值）：写一次",
+      os.stat(CACHE).st_mtime_ns != before)
+write_log(ROWS)                          # 恢复基线日志，后续用例共用它
+
 # 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
 cache_env(enabled=1)                     # 默认阈值
 before = os.stat(CACHE).st_mtime_ns

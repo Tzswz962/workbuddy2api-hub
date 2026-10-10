@@ -19,6 +19,10 @@ import urllib.error
 _startup_dir = tempfile.TemporaryDirectory(prefix="model-cooldowns-")
 atexit.register(_startup_dir.cleanup)
 os.environ["ACCOUNTS_DIR"] = _startup_dir.name
+# The 429 path now journals a limit event (usage/limit-events.jsonl, the
+# remaining-usage estimate's samples), so the usage dir has to be isolated too
+# or this suite would write that journal into the checkout.
+os.environ["WB_PROXY_USAGE_DIR"] = _startup_dir.name
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import wb_accounts as accounts

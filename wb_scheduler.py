@@ -177,7 +177,10 @@ class Scheduler:
                     res = acc.daily_chat(trigger="scheduler")
                     if res.get("ok"):
                         daily_chat_count += 1
-                        self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功")
+                        # 桌面端那条几乎不会失败，真正决定积分的网页通道就在 msg
+                        # 里（completed：N 段输出 / 失败原因），日志不带上它的话，
+                        # 面板只显示「成功」，第二天才发现积分没到（issue #236）。
+                        self.log(f"✓ 账号 [{uid8}] 每日活跃对话成功: {res.get('msg')}")
                     else:
                         self.log(f"! 账号 [{uid8}] 每日活跃对话失败: {res.get('error') or res.get('msg')}")
                     time.sleep(1.5)

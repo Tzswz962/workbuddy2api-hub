@@ -52,6 +52,11 @@ PRICING_ENABLED_KEY = "pricing_enabled"
 # edit or an older client left behind both keep the default view, and only an
 # explicit true hides the accounts.
 ACCOUNTS_COLLAPSED_KEY = "accounts_collapsed"
+# Whether the panel's per-API-key table folds away its `(切换前)` row - the
+# legacy tail of requests logged before the key field existed. Same
+# normalisation as the disclosure above: only an explicit boolean true hides
+# the row, so a hand edit or an older client cannot drop it by accident.
+KEY_BEFORE_HIDDEN_KEY = "key_before_hidden"
 
 # Instance-wide default UI language. The dashboard can override this per
 # browser with localStorage; this key is the fallback when no override exists.
@@ -80,19 +85,45 @@ def _digest(password, salt_hex, rounds=PBKDF2_ROUNDS):
     ).hex()
 
 
+# settings.json 的解析结果按 (path, mtime, size) 缓存：请求热路径上它被读约 10
+# 次（prompt_config×2 / api_keys×2 / limits_data×3 / auto_switch_product /
+# upstream_config×2），单次 156~273µs，合计 1.6~2.7ms/请求。所有写入都走 save()
+# 的 os.replace 原子替换，mtime/size 必变，所以面板改动仍然即时生效；save() 里
+# 再主动失效一次，连 mtime 精度粗（FAT 只有 2s）的同尺寸改写也不会读到旧值。
+# 调用方拿到的是顶层浅拷贝：与原实现「每次重新解析、返回值随便改」的语义一致
+# （现网所有 setter 都只改顶层键再 save()，嵌套值按约定只读），改返回值也不会
+# 弄脏缓存。
+_load_cache = {"key": None, "value": {}}
+
+
 def load(accounts_dir):
-    """Return the persisted settings, or an empty dict on a fresh install."""
+    """Return the persisted settings, or an empty dict on a fresh install.
+
+    Cached on (path, mtime, size); the returned dict is a fresh top-level copy
+    so callers keep the previous "mutate freely" semantics.
+    """
     path = settings_path(accounts_dir)
     try:
+        info = os.stat(path)
+        key = (path, info.st_mtime, info.st_size)
+    except OSError:
+        key = (path, None, None)
+    with _lock:
+        if _load_cache["key"] == key:
+            return dict(_load_cache["value"])
+    data = {}
+    try:
         with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            return data
+            parsed = json.load(fh)
+        if isinstance(parsed, dict):
+            data = parsed
     except FileNotFoundError:
         pass
     except Exception:
         pass
-    return {}
+    with _lock:
+        _load_cache.update({"key": key, "value": data})
+    return dict(data)
 
 
 def save(accounts_dir, data):
@@ -104,6 +135,9 @@ def save(accounts_dir, data):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
+        # 写完主动失效：不依赖文件系统 mtime 的精度（FAT 只有 2s），保证同尺寸
+        # 改写的下一个 load() 一定重新读盘。
+        _load_cache["key"] = None
         return path
 
 
@@ -1131,6 +1165,27 @@ def set_accounts_collapsed(accounts_dir, collapsed):
         data[ACCOUNTS_COLLAPSED_KEY] = collapsed
         save(accounts_dir, data)
     return collapsed
+
+
+def key_before_hidden(accounts_dir):
+    """Whether the per-API-key table folds away its `(切换前)` row.
+
+    Shown unless the stored value is the boolean true, with the same `is True`
+    normalisation as accounts_collapsed: the row is history worth seeing, so a
+    hand-edited "false", a 1, an object or a missing key must all leave it
+    visible rather than hide it by accident.
+    """
+    return load(accounts_dir).get(KEY_BEFORE_HIDDEN_KEY) is True
+
+
+def set_key_before_hidden(accounts_dir, hidden):
+    """Persist the `(切换前)` row disclosure state. Returns the stored boolean."""
+    hidden = bool(hidden)
+    with _lock:
+        data = load(accounts_dir)
+        data[KEY_BEFORE_HIDDEN_KEY] = hidden
+        save(accounts_dir, data)
+    return hidden
 
 
 def update_check_enabled(accounts_dir):

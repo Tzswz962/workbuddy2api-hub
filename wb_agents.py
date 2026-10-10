@@ -838,8 +838,13 @@ def integrate(accounts_dir, client_id, base_url, api_key, model=None,
         for w_path, w_existed, w_backup in written:
             try:
                 if w_existed and w_backup:
-                    b_path = os.path.join(backup_dir(accounts_dir), w_backup)
-                    _atomic_write_bytes(w_path, _read_bytes(b_path))
+                    # w_backup 是 _backup_file() 记下的**完整备份路径**（state
+                    # 与 restore() 都按整条路径用它），直接读回即可。这里曾经
+                    # 先拼了一次 backup_dir(...)，而那个名字全模块都不存在：
+                    # NameError 被下面的 except 吞掉，于是多文件客户端写一半
+                    # 失败时既不回滚也不写 state——面板显示「未配置」，而
+                    # restore() 又因为查不到记录而拒绝执行。
+                    _atomic_write_bytes(w_path, _read_bytes(w_backup))
                 elif not w_existed and os.path.exists(w_path):
                     os.unlink(w_path)
             except Exception:

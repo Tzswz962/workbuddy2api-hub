@@ -106,12 +106,15 @@ define Package/workbuddy2api/postinst
 	[ -f /etc/config/workbuddy2api ] && chmod 600 /etc/config/workbuddy2api
 	grep -q '^/etc/workbuddy2api$$' /etc/sysupgrade.conf 2>/dev/null || \
 		echo '/etc/workbuddy2api' >> /etc/sysupgrade.conf
-	# 缓存预热：每 12 分钟把面板的贵接口（统计页 4 个时间窗 + /usage 汇总）
-	# 先跑一遍，用户切页不用等十几秒（uci main.warm=0 可关；幂等，
-	# 重复安装/升级不会写重复行）
+	# 缓存预热：每 2 分钟把面板的贵接口（/usage 汇总、统计页矩阵、analytics/
+	# timeseries 时间窗、面板轮询的 realm 接口）先跑一遍。**缓存命中不会延长
+	# TTL**，条目从上次重建起算过期，所以预热间隔必须显著小于 TTL，否则
+	# 「已过期但还没重建」的窗口里用户点开面板就要等全表扫描（TTL 900 + 2
+	# 分钟一轮 → 窗口约 6%，而全部命中时一轮只有毫秒级成本）。uci main.warm=0 可关。
+	# 这一行按规范形式重写（老版本装的是 */12，直接 sed 掉，保证升级后也对齐）
 	mkdir -p /etc/crontabs
-	grep -q 'workbuddy2api-warm' /etc/crontabs/root 2>/dev/null || \
-		echo '*/12 * * * * /usr/bin/workbuddy2api-warm --quiet' >> /etc/crontabs/root
+	sed -i '/workbuddy2api-warm/d' /etc/crontabs/root 2>/dev/null
+	echo '*/2 * * * * /usr/bin/workbuddy2api-warm --quiet' >> /etc/crontabs/root
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 	[ "$${PKG_UPGRADE}" = "1" ] || {
 		/etc/init.d/workbuddy2api disable >/dev/null 2>&1

@@ -64,9 +64,10 @@ sh wrt/openwrt/build-apk.sh <SDK 目录> "$PWD"     # 产物在 wrt/apk/
 - 首次安装不自动启用服务：`uci set workbuddy2api.main.panel_password='...'`、
   `uci commit`，再 `enable` + `start`。
 
-`postinst` 只装一条 cron：`workbuddy2api-warm` 每 12 分钟预热面板的统计缓存
-（`uci main.warm=0` 可关）。init.d 把 `WB_STATS_TTL` 默认调到 900 秒，配合预热器
-让面板点开即出数；这两个默认值是配套的，改一个要一起看。
+`postinst` 只装一条 cron：`workbuddy2api-warm` 每 2 分钟预热面板的统计缓存
+（`uci main.warm=0` 可关），服务每次启动后也会在后台先预热一轮。init.d 把
+`WB_STATS_TTL` 默认调到 900 秒，配合预热器让面板点开即出数；这两个默认值是
+配套的，改一个要一起看。
 
 ## 审计结论（相对 #190 的参考配方）
 
