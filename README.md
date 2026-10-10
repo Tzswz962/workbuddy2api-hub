@@ -131,7 +131,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 111 个套件：83 个 Python + 28 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 113 个套件：84 个 Python + 29 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -157,6 +157,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 ### 3. 国内版自动化
 
 - **每日签到**：一键完成国内版打卡领积分；
+- **自动连续打卡与连登管家**：每日定时为国内版账号上报轻量会话事件（复刻客户端 `chat_request_send`），点亮官方成长中心连登天数与热力墙；自动闭环检查昨日漏签（有补签卡则自动补签保连登）、领取新手礼包/补偿、兑换 7d/14d/28d 连登档位奖励，并自动抽完抽奖次数；
 - **成长任务与积分任务**：自动批量接取未接任务，构造规范行为事件上报点亮（画布创建、灵感案例、模板使用、模型体验、多轮对话等 14 项），并自动领奖入账；
 - **猫猫日常**：自动检查旅行状态，在家自动派出、归来自动领奖。
 
@@ -164,7 +165,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 常驻后台，按固定整点执行自动化运维排程：
 
-- **每日 09:00 & 21:00**：国内版账号自动签到与猫猫旅行闭环；国际版账号执行每日活跃打卡（领官方每日 30/50 积分福利）；
+- **每日 09:00 & 21:00**：国内版账号自动签到、对话活跃上报（点亮连登）与猫猫旅行闭环；国际版账号执行每日活跃打卡（领官方每日 30/50 积分福利）；
 - **每日 22:00**：集中扫描全库账号，Token 剩余寿命不足 2 小时自动调用 Refresh Token 保活；
 - **每日 01:00**：深夜时段执行夜猫子任务；
 - 看板顶部另有「立即巡检保活」与「每日活跃打卡 (国际版)」可随时手动触发。
@@ -332,6 +333,8 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
 ### Unreleased
+
+- **国内版自动连续打卡（对话活跃上报点亮连登）**：国内版每日签到只能领积分但无法推进官方成长中心的「连登天数」（官方只认真实会话行为上报）。现将国内版对话活跃上报接入调度器：每日定时（09:00/21:00）为国内版账号上报规范会话事件（复刻客户端 `chat_request_send`，严格携带 `userId` 并保持每号每天 1 次防风控口径），点亮成长中心连续打卡天数与热力墙；上报后只读查询并回显连登天数，同时持久化记录 `lastActivityReport` 避免重复调用；新增测试套件 `tests/_test_streak_report.py`（10 项）。
 
 - **小响应不再白付 40ms、突发并发不再卡 1 秒**（[PR #237](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/237)，感谢 [@aodianjun](https://github.com/aodianjun)）：服务端关掉 Nagle（响应头与响应体两次 write 不再互相等 ACK，werkzeug/uvicorn 同做法），listen backlog 从 stdlib 默认的 5 提到 128（面板打开一页就是 ~7 个并发）。真机（OpenWrt / Celeron N2840）：`/health` 中位 50.0ms → 1.41ms，64 并发突发「卡 ≥1s」43/64 → 0/64。顺带把单请求体上限默认从 50MB 收到 16MB（`WB_MAX_PAYLOAD_BYTES` 可调回）——读 body 发生在 chat 信号量之前，路由器上几个并发大 body 就能把内存打穿。
 

@@ -670,6 +670,27 @@ def limit_value(accounts_dir, key, realm=None):
     return entry.get("global") or 0
 
 
+def limit_values_many(accounts_dir, keys):
+    """Several guards resolved for every realm, off one settings read.
+
+    limit_values() per key re-reads the file (cached by mtime/size, so a stat)
+    and re-normalizes the whole grouped map every call; the daily guards all
+    want the same map on the request path, so they share one read here. One
+    implementation only: limit_values() is this with a single key.
+    """
+    grouped = limits_data(accounts_dir)
+    out = {}
+    for key in keys:
+        entry = grouped.get(key) or _empty_limit_entry()
+        global_value = entry.get("global") or 0
+        values = {"global": global_value}
+        for realm in LIMIT_REALMS:
+            override = entry.get(realm)
+            values[realm] = global_value if override is None else override
+        out[key] = values
+    return out
+
+
 def limit_values(accounts_dir, key):
     """One guard resolved for every realm plus the global it inherits.
 
@@ -677,13 +698,7 @@ def limit_values(accounts_dir, key):
     the global value when no override is set, so the pool can hand each
     account its own realm without a second settings lookup.
     """
-    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
-    global_value = entry.get("global") or 0
-    values = {"global": global_value}
-    for realm in LIMIT_REALMS:
-        override = entry.get(realm)
-        values[realm] = global_value if override is None else override
-    return values
+    return limit_values_many(accounts_dir, (key,))[key]
 
 
 def set_limit(accounts_dir, key, scope, value):
