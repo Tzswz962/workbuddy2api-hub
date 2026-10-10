@@ -428,7 +428,11 @@ class RouteTests(unittest.TestCase):
                 request = self.Request()
                 request._get_updates()
             self.assertEqual(request.status, 200)
-            self.assertEqual(request.reply["current_version"], proxy.running_version())
+            # 路由报的是 worker 的 current_version（生产里 worker 就是用
+            # running_version() 构造的，这里被换成了用 CURRENT 构造的桩），
+            # 所以跟 CURRENT 比。跟源码版本比会在每次发版时必挂——CURRENT 是
+            # 给下面 pick_latest 那组比较用例用的固定基准，不随发版变。
+            self.assertEqual(request.reply["current_version"], CURRENT)
             self.assertFalse(request.reply["update_available"])
             self.assertEqual(fetcher.calls, [], "a status read must not spend a request")
 

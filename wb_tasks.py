@@ -374,15 +374,64 @@ def report_events(account, events, base=None):
         return False
 
 
+def _travel_status(account):
+    req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/status",
+                                 headers=account.headers("chat"))
+    with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+        d = json.loads(resp.read().decode("utf-8"))
+        return d.get("data") or {}
+
+
+def ensure_buddy(account, gap=1.0):
+    """确保账号已领到 Buddy 实例：没有则完成并领取 first_buddy。
+
+    first_buddy 是 auto 类任务，其奖励（reward_buddy）就是 Buddy 实例；
+    single 任务与猫猫旅行都以它为前提。返回是否已就绪。
+    """
+    tasks = fetch_growth_tasks(account)
+    fb = next((t for t in tasks if t["task_code"] == "first_buddy"), None)
+    if fb is None:
+        return False
+    if fb["status"] == "claimed":
+        return True
+    _progress_one(account, fb, [], gap)
+    tasks = fetch_growth_tasks(account)
+    fb = next((t for t in tasks if t["task_code"] == "first_buddy"), None)
+    return bool(fb and fb["status"] == "claimed")
+
+
+def _travel_depart(account, lid):
+    """派出旅行；返回 (data, err)。成功 data 为响应 data，失败 err 为上游 msg。"""
+    body = json.dumps({"location_id": lid}).encode("utf-8")
+    req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart",
+                                 data=body, method="POST", headers=account.headers("chat"))
+    try:
+        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        if res.get("code") == 0:
+            return res.get("data") or {}, None
+        return None, res.get("msg") or ("code=%s" % res.get("code"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read(300).decode("utf-8", "replace")
+        except Exception:
+            pass
+        try:
+            msg = json.loads(detail).get("msg") or ("HTTP %s" % exc.code)
+        except Exception:
+            msg = "HTTP %s%s" % (exc.code, (": " + detail[:120]) if detail else "")
+        return None, msg
+    except Exception as exc:
+        return None, str(exc)
+
+
 def do_cat_travel(account):
     """检查并执行猫猫旅行 (领奖 / 派出)。"""
     headers = account.headers("chat")
     # 1. 查询状态
     try:
-        req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/status", headers=headers)
-        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            st = d.get("data") or {}
+        st = _travel_status(account)
     except Exception as exc:
         return {"ok": False, "msg": f"查询旅行状态失败: {exc}"}
 
@@ -400,11 +449,6 @@ def do_cat_travel(account):
             return {"ok": False, "msg": f"领奖失败: {e}"}
 
     if state == "idle":
-        # 前置链：first_buddy 完成并领奖后才发放 Buddy 实例，没有它旅行必然
-        # 400 "no active buddy"。给出可执行的提示，而不是把 400 原样抛给用户。
-        if not st.get("buddy_id"):
-            return {"ok": False,
-                    "msg": "还没有 Buddy：需先完成并领取「领取一只 Buddy」任务（新建任务并发起对话）"}
         if st.get("daily_limit_reached"):
             return {"ok": True, "action": "idle", "msg": "猫猫今日已完成旅行，明日 00:00 刷新"}
         # 派出旅行: 官方前端要求 body 携带 {location_id} (目的地清单在
@@ -421,28 +465,20 @@ def do_cat_travel(account):
             _log(f"buddy/travel/config query failed: {exc}")
         if lid is None:
             lid = 1
-        dep_body = json.dumps({"location_id": lid}).encode("utf-8")
-        req_dep = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart", data=dep_body, method="POST", headers=headers)
-        try:
-            with _accounts.urlopen(req_dep, timeout=10, proxy=account.proxy) as resp:
-                dep_res = json.loads(resp.read().decode("utf-8"))
-                if dep_res.get("code") == 0:
-                    loc = ((dep_res.get("data") or {}).get("location") or {}).get("name") or ""
-                    return {"ok": True, "action": "depart", "msg": f"猫猫已出发前往「{loc}」，预计数小时后归来！"}
-                return {"ok": False, "msg": f"派出旅行被上游拒绝: {dep_res.get('msg')}"}
-        except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read(300).decode("utf-8", "replace")
-            except Exception:
-                pass
-            try:
-                msg = json.loads(detail).get("msg") or ("HTTP %s" % exc.code)
-            except Exception:
-                msg = "HTTP %s%s" % (exc.code, (": " + detail[:120]) if detail else "")
-            return {"ok": False, "msg": f"派出旅行失败: {msg}"}
-        except Exception as e:
-            return {"ok": False, "msg": f"派出旅行失败: {e}"}
+        # 状态里的 buddy_id 是"当前旅行实例"的 id，猫在家 (idle) 时恒为 0，
+        # 不能拿它判断有没有 Buddy。以 depart 的 "no active buddy" 为准：
+        # 先直接派，失败再补齐 first_buddy（其奖励即 Buddy 实例）重试一次。
+        data, err = _travel_depart(account, lid)
+        if data is None and "no active buddy" in (err or "").lower():
+            if ensure_buddy(account):
+                data, err = _travel_depart(account, lid)
+            else:
+                return {"ok": False,
+                        "msg": "还没有 Buddy：需先完成并领取「领取一只 Buddy」任务（新建任务并发起对话）"}
+        if data is not None:
+            loc = (data.get("location") or {}).get("name") or ""
+            return {"ok": True, "action": "depart", "msg": f"猫猫已出发前往「{loc}」，预计数小时后归来！"}
+        return {"ok": False, "msg": f"派出旅行失败: {err}"}
 
     if state == "traveling":
         return {"ok": True, "action": "traveling", "msg": "猫猫正在旅行途中，请稍后再来查看！"}

@@ -25,6 +25,29 @@ import wb_accounts as accounts
 import wb_proxy as proxy
 import wb_settings as settings
 
+# The real 429 shapes from the incident environment (issue #70, sanitized).
+# S1 is 229 of the 263 recorded 429s and carries no reset information at all;
+# S2 is the one provably intl body with no reset field (the log keeps only the
+# first 200 characters, so the JSON below is that prefix closed into valid
+# JSON); S3 is a parsed control that names its reset instant.
+S1_BARE = "usage exceeds frequency limit"
+S2_INTL_14003 = ('{"code":14003,"msg":"too many requests",'
+                 '"retry_policy":{"retry":true},'
+                 '"displayMsg":{"en":"Too many requests. Please retry later.",'
+                 '"zh":"请求过于频繁，请稍后重试。"}}')
+# The same body as the gateway sees it: it reads up to 600 characters while the
+# log kept 200, so the real body carries a metadata tail. accountId and
+# credentialId are field names, not scope statements.
+S2_INTL_FULL = ('{"code":14003,"msg":"too many requests",'
+                '"accountId":"<redacted>","credentialId":"<redacted>",'
+                '"requestId":"<redacted>","retry_policy":{"retry":true},'
+                '"displayMsg":{"en":"Too many requests. Please retry later.",'
+                '"zh":"请求过于频繁，请稍后重试。"},"ts":1790500000}')
+S3_INTL_6004 = ('{"code":6004,"msg":"usage exceeds frequency limit, but don\'t '
+                'worry, your usage will reset at 2026-10-06 21:00:09 UTC+8, '
+                'alternatively, you can switch to the other models to continue '
+                'using it."}')
+
 
 class ModelCooldownTests(unittest.TestCase):
     def account(self):
@@ -99,14 +122,15 @@ class ModelCooldownTests(unittest.TestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads), "worker did not stop")
         self.assertEqual(failures, [])
 
-    def drive_one_429(self, account):
+    def drive_one_429(self, account, detail="usage exceeds frequency limit",
+                      stub_parser=True):
         """Drive open_upstream into an upstream 429 with a stubbed urlopen.
 
         Returns the reset instant the stubbed parser reported, so callers can
-        assert the cooldown the gateway recorded.
+        assert the cooldown the gateway recorded. `stub_parser=False` leaves the
+        real parser in place, which is what the unparsed-body case needs.
         """
         reset = time.time() + 600
-        detail = "usage exceeds frequency limit"
         error = urllib.error.HTTPError("https://upstream.invalid", 429, "rate limit", {},
                                        io.BytesIO(detail.encode("utf-8")))
 
@@ -140,9 +164,10 @@ class ModelCooldownTests(unittest.TestCase):
         old_parser = proxy.parse_rate_limit_reset
         proxy.POOL = Pool()
         accounts.urlopen = lambda *args, **kwargs: (_ for _ in ()).throw(error)
-        # Keep these tests on the 429 -> account-list path, independent of the
-        # existing parser's timezone handling.
-        proxy.parse_rate_limit_reset = lambda _detail: reset
+        if stub_parser:
+            # Keep these tests on the model-cooldown path, independent of the
+            # existing parser's timezone handling.
+            proxy.parse_rate_limit_reset = lambda _detail: reset
         try:
             with self.assertRaises(proxy.RateLimited):
                 proxy.open_upstream({"model": "glm-5.3", "messages": [
@@ -161,6 +186,139 @@ class ModelCooldownTests(unittest.TestCase):
         self.assertEqual(row["modelCooldowns"][0]["model"], "glm-5.3")
         self.assertLess(abs(row["modelCooldowns"][0]["expiresAt"] - reset), 2)
         self.assertTrue(account.ready(model="another-model"))
+
+    def test_the_real_bare_429_parks_only_the_model(self):
+        """S1 - 87% of the recorded 429s, no reset information at all.
+
+        It used to be read as an account-level soft limit purely because there
+        was no timestamp, which is how a realm ended up fully cooling while the
+        panel test kept reporting every account healthy.
+        """
+        account = self._drive_unparsed(S1_BARE, "bare-shape")
+        row = account.public()
+        self.assertEqual(account.unscoped_streak, 1,
+                         "the repeat is counted on the model ladder")
+        self.assertEqual(account.soft_streak, 0,
+                         "and never on the credential one")
+        self.assertFalse(row["inCooldown"])
+        self.assertIsNone(row["cooldownFor"])
+        self.assertEqual([item["model"] for item in row["modelCooldowns"]], ["glm-5.3"])
+        self.assertLessEqual(row["modelCooldowns"][0]["expiresAt"] - time.time(), 61,
+                             "first tier is the short window, not 600s")
+        self.assertTrue(account.ready(model="another-model"))
+
+    def test_the_full_intl_14003_body_with_metadata_parks_only_the_model(self):
+        """S2 as the gateway really sees it: the recorded prefix plus the
+        metadata tail the log truncated (accountId / credentialId).
+
+        Field names are not scope evidence - reading them as such put the
+        600s -> 7200s credential ladder back on the most common intl shape.
+        """
+        self.assertIn('"accountId"', S2_INTL_FULL)
+        self.assertIn('"credentialId"', S2_INTL_FULL)
+        account = self._drive_unparsed(S2_INTL_FULL, "intl-14003-full")
+        row = account.public()
+        self.assertEqual(account.soft_streak, 0, "metadata is not scope evidence")
+        self.assertFalse(row["inCooldown"])
+        self.assertIsNone(row["cooldownFor"])
+        self.assertEqual([item["model"] for item in row["modelCooldowns"]], ["glm-5.3"])
+        self.assertTrue(account.ready(model="another-model"))
+
+    def test_the_real_intl_14003_429_parks_only_the_model(self):
+        """S2 - the intl body, recognised by code 14003 (and by its message)."""
+        account = self._drive_unparsed(S2_INTL_14003, "intl-14003")
+        row = account.public()
+        self.assertEqual(account.soft_streak, 0)
+        self.assertFalse(row["inCooldown"])
+        self.assertIsNone(row["cooldownFor"])
+        self.assertEqual([item["model"] for item in row["modelCooldowns"]], ["glm-5.3"])
+        self.assertTrue(account.ready(model="another-model"))
+
+    def test_a_parsed_intl_429_still_parks_until_its_clock(self):
+        """S3 - the control: a named reset instant still drives a model park."""
+        expected = proxy.parse_rate_limit_reset(S3_INTL_6004)
+        self.assertEqual(expected, 1791291609)
+        account = self._drive_unparsed(S3_INTL_6004, "intl-6004")
+        row = account.public()
+        self.assertEqual(account.soft_streak, 0, "a parsed clock is not a streak")
+        self.assertFalse(row["inCooldown"])
+        self.assertEqual([item["model"] for item in row["modelCooldowns"]], ["glm-5.3"])
+        # The named instant is already past for this run, so the park is the 1s
+        # floor - which is what tells it apart from the 60s unparsed window and
+        # from the credential ladder.
+        self.assertLessEqual(row["modelCooldowns"][0]["expiresAt"] - time.time(), 2)
+
+    def _drive_unparsed(self, detail, tag):
+        """Feed one real 429 body through open_upstream, parser left in place."""
+        directory = tempfile.mkdtemp(prefix="real-429-%s-" % tag)
+        old_dir = proxy.ACCOUNTS_DIR
+        proxy.ACCOUNTS_DIR = directory
+        try:
+            account = self.account()
+            self.drive_one_429(account, detail=detail, stub_parser=False)
+            return account
+        finally:
+            proxy.ACCOUNTS_DIR = old_dir
+
+    def test_repeated_real_429s_do_not_amplify_into_an_account_park(self):
+        """S1 three times in a row used to mean 600 -> 1200 -> 2400s on the
+        whole credential. It has to stay three short windows on one model."""
+        directory = tempfile.mkdtemp(prefix="real-429-repeat-")
+        old_dir = proxy.ACCOUNTS_DIR
+        proxy.ACCOUNTS_DIR = directory
+        windows = []
+        try:
+            account = self.account()
+            for round_number in range(3):
+                self.drive_one_429(account, detail=S1_BARE, stub_parser=False)
+                self.assertIsNone(account.public()["cooldownFor"],
+                                  "round %d parked the credential" % round_number)
+                self.assertTrue(account.ready(model="another-model"),
+                                "round %d took a sibling model down" % round_number)
+                windows.append(account.model_cooldowns["glm-5.3"] - time.time())
+                # Let the window lapse, the way it does in production when the
+                # same shape comes back; the streak is what must survive.
+                with account._throttle_lock:
+                    account.model_cooldowns["glm-5.3"] = time.time() - 1
+        finally:
+            proxy.ACCOUNTS_DIR = old_dir
+        self.assertEqual(account.unscoped_streak, 3)
+        self.assertEqual(account.soft_streak, 0, "the credential counter is untouched")
+        self.assertLessEqual(windows[0], 61, "first tier stays short")
+        self.assertLess(windows[0], windows[1], "repetition escalates")
+        self.assertLess(windows[1], windows[2], "repetition keeps escalating")
+        self.assertLessEqual(windows[2], 241, "and stays far below the 2h ceiling")
+
+    def test_unscoped_hits_do_not_lift_the_credential_ladder(self):
+        """Four unscoped S1s, then one credential-scoped body, end to end.
+
+        Sharing one counter made this sequence start the credential ladder at
+        600 * 2**4 - the 7200s ceiling - instead of at 600s.
+        """
+        directory = tempfile.mkdtemp(prefix="mixed-seq-")
+        old_dir = proxy.ACCOUNTS_DIR
+        proxy.ACCOUNTS_DIR = directory
+        try:
+            account = self.account()
+            for _ in range(4):
+                self.drive_one_429(account, detail=S1_BARE, stub_parser=False)
+                with account._throttle_lock:
+                    account.model_cooldowns["glm-5.3"] = time.time() - 1
+            self.assertEqual(account.unscoped_streak, 4)
+            self.assertEqual(account.soft_streak, 0)
+
+            self.drive_one_429(account,
+                               detail='{"msg":"too many requests for this account"}',
+                               stub_parser=False)
+        finally:
+            proxy.ACCOUNTS_DIR = old_dir
+        self.assertEqual(account.soft_streak, 1)
+        self.assertEqual(account.unscoped_streak, 4, "the other ladder is untouched")
+        self.assertLessEqual(
+            account.cooldown_until - time.time(), accounts.SOFT_RATE_BASE + 1,
+            "the credential ladder starts at its own base, not at the ceiling")
+        self.assertEqual([item["model"] for item in account.public()["modelCooldowns"]],
+                         [], "and adds no model window")
 
     def test_the_auto_switch_setting_is_opt_in(self):
         """Off on a fresh install, and only a real JSON boolean turns it on."""

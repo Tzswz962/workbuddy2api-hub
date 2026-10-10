@@ -53,6 +53,7 @@ os.environ["WB_PROXY_USAGE_DIR"] = USAGE_DIR
 os.environ["ACCOUNTS_DIR"] = ACCOUNTS_DIR
 
 import wb_proxy as P
+import wb_accounts
 import wb_pricing
 
 # 这个套件不碰真 accounts/ 目录：ACCOUNTS_DIR 是脚本旁边的硬编码路径，只能
@@ -131,6 +132,12 @@ def first_order_path(a, b, path=""):
                 return hit
         return ""
     return ""
+
+
+def adopted_all(state):
+    """三份状态是否都被采用（by_account 没有指纹，它单独为真说明不了问题）。"""
+    return (state.get("snapshot", 0) > 0 and state.get("analytics", 0) > 0
+            and state.get("by_account", 0) > 0)
 
 
 def check_same_shape(label, cold, loaded):
@@ -295,6 +302,7 @@ def restart():
     P._usage_cache_checkpointed.clear()
     P._usage_cache_last_attempt = time.time()
     P._usage_cache_digest_memo.clear()
+    P._realm_disk_cache.update({"key": None, "map": None})
 
 
 RUNNER = r'''
@@ -400,8 +408,10 @@ print()
 print("[1] 往返：写盘 → 模拟重启加载 → 与不落盘逐字节一致（含键顺序）")
 check("写盘成功", make_checkpoint())
 stored = cache_data()
-check("checkpoint 是一个 schema=2 的 JSON 对象",
-      isinstance(stored, dict) and stored.get("schema") == 2)
+check("checkpoint 是一个 schema=当前版本的 JSON 对象（v3 起带按日分桶）",
+      isinstance(stored, dict) and stored.get("schema") == P._USAGE_CACHE_SCHEMA
+      and stored.get("schema") == 3,
+      stored.get("schema"))
 check("三份状态都写进去了（每个 realm 一份）",
       len(stored["snapshot"]) == 3 and len(stored["by_account"]) == 1
       and len(stored["analytics"]) == 3,
@@ -425,7 +435,7 @@ cache_env_nowrite()
 restart()
 LOADED_RAW, err = live_raw()
 ADOPTED = dict(P._usage_cache_checkpointed)
-check("模拟重启后加载到了 checkpoint", bool(ADOPTED), ADOPTED)
+check("模拟重启后加载到了 checkpoint（三份都被采用）", adopted_all(ADOPTED), ADOPTED)
 check("加载后结果与不落盘逐字节一致", canon(LOADED_RAW or {}) == GOLDEN,
       err or first_diff(GOLDEN, canon(LOADED_RAW or {})))
 # 这是 v1 漏掉的那一类断言：值相等还不够，响应的 JSON 字节里键序是可见的。
@@ -440,8 +450,8 @@ child_raw, child_state = run_child()
 check("新进程结果与不落盘一致", canon(child_raw) == GOLDEN,
       first_diff(GOLDEN, canon(child_raw)))
 check_same_shape("新进程 vs 冷折叠（真·新进程）", GOLDEN_RAW, child_raw)
-check("新进程记录到了加载的 offset（checkpointed 非空）",
-      bool(child_state), child_state)
+check("新进程记录到了加载的 offset（三份都被采用）",
+      adopted_all(child_state), child_state)
 child_off, child_state_off = run_child({"WB_USAGE_CACHE": "0"})
 check("新进程 + 关掉开关：结果一致", canon(child_off) == GOLDEN,
       first_diff(GOLDEN, canon(child_off)))
@@ -562,7 +572,9 @@ restart()
 check("文件不存在：结果回到真值", canon(live()) == GOLDEN)
 
 # 4.2 schema
-mutate_cache(lambda d: d.update({"schema": 3}), "schema 版本不符")
+mutate_cache(lambda d: d.update({"schema": 4}), "schema 版本不符（比当前新）")
+mutate_cache(lambda d: d.update({"schema": 2}),
+             "旧 schema（v2 没有按日分桶）")
 mutate_cache(lambda d: d.update({"schema": 1}),
              "旧 schema（v1 用 sort_keys 写盘，键序不是折叠序）")
 mutate_cache(lambda d: d.update({"schema": True}),
@@ -823,7 +835,8 @@ restart()
 live()
 check("时间阈值到点：即使没有新字节也写一次", os.path.exists(CACHE))
 with io.open(CACHE, encoding="utf-8") as fh:
-    check("写出来的还是完整的 checkpoint", json.load(fh).get("schema") == 2)
+    check("写出来的还是完整的 checkpoint",
+          json.load(fh).get("schema") == P._USAGE_CACHE_SCHEMA)
 # 加载之后不产生「白写」：采用 checkpoint 会把节流基线对齐到加载的 offset
 cache_env(enabled=1)                     # 默认阈值
 before = os.stat(CACHE).st_mtime_ns
@@ -849,6 +862,125 @@ check("同一个进程里重复刷新结果不变", first == second, first_diff(
 restart()
 third = canon(live())
 check("再模拟一次重启结果仍不变", third == GOLDEN, first_diff(GOLDEN, third))
+
+print()
+print("[9] 指纹必须与「账号池加载到哪一步」无关（重启后第一刻就要命中）")
+# 这一节用一份自己的账号目录与日志：
+#   * 账号文件放在磁盘上（指纹的来源）；
+#   * 日志每行都带 realm 字段，归属完全由字段决定——这样「池在不在」不影响
+#     任何数字，断言「命中」时不必纠缠归属口径。
+REAL_ACCOUNTS = os.path.join(_TMP, "accounts-real")
+os.makedirs(REAL_ACCOUNTS, exist_ok=True)
+_ACCT_MTIME = [FROZEN - 2000000.0]
+
+
+def write_account(uid, realm):
+    path = os.path.join(REAL_ACCOUNTS, uid + ".json")
+    io.open(path, "w", encoding="utf-8").write(json.dumps(
+        {"uid": uid, "realm": realm, "accessToken": "", "nickname": uid}))
+    # 指纹的磁盘缓存键含 (size, mtime)：两次写入落在同一个 mtime 刻度上会
+    # 读不到新内容（Windows 的 time.time() 只有 ~15ms 精度），拨到确定前进
+    # 的整数秒上。
+    _ACCT_MTIME[0] += 3600.0
+    os.utime(path, (_ACCT_MTIME[0], _ACCT_MTIME[0]))
+
+
+write_account("u-1", "intl")
+write_account("u-2", "cn")
+SAVED_DIR, SAVED_POOL = P.ACCOUNTS_DIR, P.POOL
+P.ACCOUNTS_DIR = REAL_ACCOUNTS
+try:
+    write_log([
+        row(FROZEN - 5000, "m-a", "u-1", 100, 50),
+        row(FROZEN - 4900, "m-b", "u-2", 200, 20, realm="cn"),
+        row(FROZEN - 4800, "m-a", "u-2", 300, 30, realm="cn"),
+    ])
+    cache_env_off()
+    P.POOL = None
+    restart()
+    NINE_RAW = live()
+    NINE = canon(NINE_RAW)
+
+    # 判据：同一份磁盘 + 同一份配置，三种启动状态算出的指纹必须一模一样。
+    fp_none = P._realm_inputs()
+    P.POOL = wb_accounts.AccountPool(REAL_ACCOUNTS)      # 建好了，还没 load()
+    fp_unloaded = P._realm_inputs()
+    P.POOL.load()                                        # 加载完成
+    fp_loaded = P._realm_inputs()
+    check("指纹与池的加载状态无关（未建/未加载/已加载都相同）",
+          fp_none == fp_unloaded == fp_loaded, (fp_none, fp_unloaded, fp_loaded))
+    check("指纹就是磁盘上的 uid→realm",
+          fp_loaded == (P.CURRENT_REALM, (("u-1", "intl"), ("u-2", "cn"))), fp_loaded)
+
+    # 先写一份 checkpoint（池就绪），再用「池未就绪」的状态加载：必须命中。
+    check("池就绪时写盘成功", make_checkpoint())
+    stored = cache_data()
+    check("落盘的 realm 指纹就是磁盘那份",
+          _entry(stored, "snapshot", None)["realm_inputs"]
+          == P._realm_inputs_key(fp_loaded),
+          _entry(stored, "snapshot", None)["realm_inputs"])
+    P.POOL = wb_accounts.AccountPool(REAL_ACCOUNTS)      # 重启：池还没 load()
+    cache_env_nowrite()
+    restart()
+    got, err = live_canon()
+    check("池未就绪的进程仍然命中 checkpoint（含带 realm 指纹的两份）",
+          adopted_all(P._usage_cache_checkpointed), P._usage_cache_checkpointed)
+    check("池未就绪时的结果与冷折叠一致", got == NINE, err or first_diff(NINE, got or ""))
+    # 池加载完之后：载荷里的 accounts_map/account 由活池派生，数字部分必须仍
+    # 然与全量折叠一致（这一段就是「运行 10 分钟后」的那一态）。
+    P.POOL.load()
+    cache_env_off()
+    restart()
+    NINE_LOADED = canon(live())
+    cache_env_nowrite()
+    restart()
+    got, err = live_canon()
+    check("池加载完之后同样命中且一致", got == NINE_LOADED,
+          err or first_diff(NINE_LOADED, got or ""))
+
+    # 磁盘变了（realm 改了）：指纹必须跟着变，且池没跟上时不许写盘。
+    write_account("u-2", "intl")
+    check("账号文件改了，指纹跟着变",
+          P._realm_inputs() != fp_loaded, P._realm_inputs())
+    check("池还停在旧归属（磁盘与池不一致）",
+          not P._realm_fold_reproducible(P._account_realm_map()))
+    if os.path.exists(CACHE):
+        os.unlink(CACHE)
+    cache_env_force()
+    restart()
+    live()
+    written = cache_data() if os.path.exists(CACHE) else {
+        "snapshot": [], "by_account": [], "analytics": []}
+    check("池没跟上磁盘时 snapshot/analytics 不写（by_account 照写，它不读归属）",
+          written["snapshot"] == [] and written["analytics"] == [],
+          {k: len(v) for k, v in written.items() if isinstance(v, list)})
+    write_account("u-2", "cn")          # 改回来
+    cache_env_off()
+    restart()
+    check("改回来之后指纹回到原值", P._realm_inputs() == fp_loaded, P._realm_inputs())
+
+    # 池整个不存在而磁盘上有账号：折叠根本不查账号映射，这种折叠冷进程复现
+    # 不了 —— 宁可不信任、不写，等池就绪后再用。
+    P.POOL = None
+    if os.path.exists(CACHE):
+        os.unlink(CACHE)
+    cache_env_force()
+    restart()
+    live()
+    written = cache_data() if os.path.exists(CACHE) else {
+        "snapshot": [], "by_account": [], "analytics": []}
+    check("没有池而磁盘上有账号：snapshot/analytics 不写",
+          written["snapshot"] == [] and written["analytics"] == [],
+          {k: len(v) for k, v in written.items() if isinstance(v, list)})
+finally:
+    P.ACCOUNTS_DIR = SAVED_DIR
+    P.POOL = SAVED_POOL
+    write_log(ROWS)
+    cache_env_off()
+    restart()
+    GOLDEN_RAW = live()
+    GOLDEN = canon(GOLDEN_RAW)
+    GOLDEN_OBJ = json.loads(GOLDEN)
 
 shutil.rmtree(_TMP, ignore_errors=True)
 print()

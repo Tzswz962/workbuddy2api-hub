@@ -667,13 +667,13 @@ _perf_cache = {}
 _perf_lock = threading.Lock()
 
 
-def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=None):
-    """Cached wrapper: parsing thousands of rows is CPU-heavy, and the
-    dashboard polls this endpoint every few seconds.
+def _perf_stats_scope(sample, realm, range, since, until):
+    """(过滤用的 realm, since, until, 缓存键) —— perf_stats() 与它的 ETag 共用。
 
-    Rebuilds under the lock so a burst of pollers cannot each start their own
-    scan of the log."""
-    ttl = _STATS_TTL if ttl is None else ttl
+    抽出来只为一件事：取数和派生 ETag 必须走**同一套**键。两边各写一份的话，
+    只要有一处不同（比如一处 realm_scope、一处原始 realm），tag 就会落到另一条
+    缓存条目上，客户端拿到的是一个不描述当前响应体的校验符。
+    """
     r = realm_scope(realm, CURRENT_REALM)
     lo, hi = range_window(range, since, until)
     try:
@@ -685,6 +685,17 @@ def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=
     except Exception:
         key = (5000, r or "all",
                lo if lo is not None else -1, hi if hi is not None else -1)
+    return r, lo, hi, key
+
+
+def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=None):
+    """Cached wrapper: parsing thousands of rows is CPU-heavy, and the
+    dashboard polls this endpoint every few seconds.
+
+    Rebuilds under the lock so a burst of pollers cannot each start their own
+    scan of the log."""
+    ttl = _STATS_TTL if ttl is None else ttl
+    r, lo, hi, key = _perf_stats_scope(sample, realm, range, since, until)
     now = time.time()
     with _perf_lock:
         hit = _perf_cache.get(key)
@@ -693,6 +704,21 @@ def perf_stats(sample=5000, realm=None, ttl=None, range=None, since=None, until=
         data = _perf_stats_uncached(sample, r, since=lo, until=hi)
         _perf_cache[key] = (time.time(), data)
     return data
+
+
+def perf_stats_etag(sample=5000, realm=None, range=None, since=None, until=None):
+    """perf_stats() 当前缓存条目的 ETag；条目还不存在时返回 None。
+
+    _json_cached() 会在取数前后各调用一次并比对，两次一致才把 tag 发出去
+    （见那里的注释）。所以这里只回答"此刻这条缓存条目的戳是什么"，调用方不需要
+    自己安排调用顺序。
+    """
+    _r, _lo, _hi, key = _perf_stats_scope(sample, realm, range, since, until)
+    with _perf_lock:
+        hit = _perf_cache.get(key)
+    if hit is None:
+        return None
+    return _cache_etag("perf", repr(key), hit[0])
 
 
 def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
@@ -1119,6 +1145,20 @@ def free_models_by_realm():
     return out
 
 
+def _usage_snapshot_scope(realm, range, since, until):
+    """(过滤用的 realm, since, until, 缓存键) —— usage_snapshot() 与它的 ETag 共用。
+
+    同 _perf_stats_scope()：键只允许有一个来源，否则 ETag 可能指向另一条缓存。
+    """
+    r = realm_scope(realm, CURRENT_REALM)
+    lo, hi = range_window(range, since, until)
+    # Bounds, not a today/all flag: this week and this month overlap, so a
+    # flag would let one window serve the other's totals from the cache.
+    key = "%s|%s|%s" % (r or "all",
+                        lo if lo is not None else "", hi if hi is not None else "")
+    return r, lo, hi, key
+
+
 def usage_snapshot(realm=None, ttl=None, range=None, since=None, until=None):
     """Cached wrapper: the dashboard polls this every few seconds.
 
@@ -1128,20 +1168,28 @@ def usage_snapshot(realm=None, ttl=None, range=None, since=None, until=None):
     of the same file.
     """
     ttl = _STATS_TTL if ttl is None else ttl
-    r = realm_scope(realm, CURRENT_REALM)
-    lo, hi = range_window(range, since, until)
+    r, lo, hi, key = _usage_snapshot_scope(realm, range, since, until)
     now = time.time()
     with _snap_lock:
-        # Bounds, not a today/all flag: this week and this month overlap, so a
-        # flag would let one window serve the other's totals from the cache.
-        key = "%s|%s|%s" % (r or "all",
-                            lo if lo is not None else "", hi if hi is not None else "")
         hit = _snap_cache.get(key)
         if hit is not None and (now - hit[0]) < ttl:
             return hit[1]
         data = _usage_snapshot_uncached(r, since=lo, until=hi)
         _snap_cache[key] = (time.time(), data)
     return data
+
+
+def usage_snapshot_etag(realm=None, range=None, since=None, until=None):
+    """usage_snapshot() 当前缓存条目的 ETag；条目不存在时返回 None。
+
+    配对调用（取数前后各一次、一致才发）由 _json_cached() 负责，理由见那里。
+    """
+    _r, _lo, _hi, key = _usage_snapshot_scope(realm, range, since, until)
+    with _snap_lock:
+        hit = _snap_cache.get(key)
+    if hit is None:
+        return None
+    return _cache_etag("usage", key, hit[0])
 
 
 def _fold_cost(bucket, cost, model):
@@ -1305,14 +1353,86 @@ def _realm_inputs():
     attributed to the account that served them, or to the model's home realm.
     Importing or dropping an account can therefore move such a row from one
     exit to the other, and a cached aggregate must not outlive that.
+
+    这两样（当前出口 + uid→realm 归属）从**磁盘**同步读，而不是从活账号池的
+    内存映射读。池是启动时从同一份磁盘加载的快照，但「它什么时候加载完」会让
+    同一个进程在不同时刻算出不同的指纹：重启后第一刻的进程算出的是启动期那
+    一份，于是刚写下的 checkpoint 反而被判无效——而那正是它存在的意义（重启
+    后免冷扫）。从磁盘读，任何时刻、任何进程算出来都一样。
+
+    池仍然要查，但只作为「这次折叠能不能被冷进程复现」的判据（见
+    _realm_fold_reproducible），不再进指纹的值。
+    """
+    disk = _account_realm_map()
+    if disk is None:
+        return None
+    return (CURRENT_REALM, disk)
+
+
+_realm_disk_cache = {"key": None, "map": None}
+_realm_disk_lock = threading.Lock()
+
+
+def _account_files_key(directory):
+    """账号目录的便宜指纹：文件名 + (size, mtime)；读不到返回 None。"""
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".json"))
+    except OSError:
+        return None
+    entries = []
+    for name in names:
+        try:
+            info = os.stat(os.path.join(directory, name))
+        except OSError:
+            return None
+        entries.append((name, info.st_size, info.st_mtime_ns))
+    return (directory, tuple(entries))
+
+
+def _account_realm_map(directory=None):
+    """账号文件里的 uid→realm 映射（排序后的元组）；读不到返回 None。
+
+    用账号池自己的加载器推导，而不是在这里复制一份 uid/realm 解析逻辑：复制
+    出来的那份迟早会和 Account 里的逻辑漂移，而漂移意味着指纹描述的东西和
+    折叠读的东西不再是同一个。整份读一次的开销由缓存键挡着——目录下每个
+    *.json 的名字/size/mtime 都没变就直接用上次的结果。
+    """
+    directory = ACCOUNTS_DIR if directory is None else directory
+    key = _account_files_key(directory)
+    if key is None:
+        return None
+    with _realm_disk_lock:
+        cached = _realm_disk_cache
+        if cached["key"] == key:
+            return cached["map"]
+    try:
+        pool = wb_accounts.AccountPool(directory, log=None)
+        pool.load()
+        value = tuple(sorted((a.uid, a.realm) for a in pool.accounts if a.uid))
+    except Exception as exc:
+        log("account realm map unreadable: %s" % exc)
+        return None
+    with _realm_disk_lock:
+        _realm_disk_cache.update({"key": key, "map": value})
+    return value
+
+
+def _realm_fold_reproducible(disk):
+    """这次折叠用的归属，冷启动的进程能不能按同一份磁盘原样复现。
+
+    折叠读的是活账号池，指纹读的是磁盘。两者一致（正常情况：池就是启动时从
+    这份磁盘加载的）时没有疑问；磁盘被改过、池还没重载时两者会短暂不一致，
+    那种折叠写下的 checkpoint 会被冷进程按新归属当成有效，所以不写。池整个
+    不存在时折叠根本不查账号映射——只有磁盘上也没有账号，两边才一致。
     """
     if POOL is None:
-        return (CURRENT_REALM, ())
+        return not disk
     try:
-        return (CURRENT_REALM, tuple(sorted((a.uid, a.realm) for a in POOL.accounts)))
+        pool = tuple(sorted((a.uid, a.realm) for a in POOL.accounts))
     except Exception as exc:
         log("realm inputs unreadable: %s" % exc)
-        return None
+        return False
+    return pool == disk
 
 
 def _scan_usage_from(offset, fold, stop_at=None, skip=None):
@@ -1423,7 +1543,7 @@ def _copy_usage_snapshot(snap):
     return out
 
 
-def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None):
+def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None):
     """Fold one parsed row into a usage snapshot.
 
     One definition for both callers: the all-time fold (fed only the rows past
@@ -1436,6 +1556,10 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None):
     再读 disabled），悬停明细构造出来就被丢掉，所以整扫不建明细、开关也不逐行
     重问。代价是设置改动从下一次扫描起生效；逐行展示路径不受影响，仍然每行
     查、改设置当场可见。
+
+    `also` 是同一行还要折进的第二份同形状快照（按日分桶的窗口半）。过滤、
+    算价与字段提取只做一次，两份各自累加：折叠本来就要求两侧各记一笔，而
+    cost_for_row 与 realm 判定是每行最贵的那部分，只该付一次。
     """
     if r and not row_matches_realm(row, r):
         return
@@ -1449,51 +1573,95 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None):
     # happened, so a later price change cannot rewrite yesterday's totals.
     cost = wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
     model = row.get("model")
+    targets = (snap,) if also is None else (snap, also)
     if outcome != "completed":
-        snap["errors"] += 1
-        # Credit is money already spent: a request that failed after the
-        # upstream had billed for it still consumed credit, so it is summed
-        # here exactly like the analytics page sums it. Token totals keep the
-        # completed-only rule this page has always used, and a client abort is
-        # skipped because its usage block is incomplete.
-        if outcome != "client_aborted":
-            snap["credit"] += (row.get("credit") or 0)
-            _fold_cost(snap, cost, model)
+        for tgt in targets:
+            tgt["errors"] += 1
+            # Credit is money already spent: a request that failed after the
+            # upstream had billed for it still consumed credit, so it is summed
+            # here exactly like the analytics page sums it. Token totals keep
+            # the completed-only rule this page has always used, and a client
+            # abort is skipped because its usage block is incomplete.
+            if outcome != "client_aborted":
+                tgt["credit"] += (row.get("credit") or 0)
+                _fold_cost(tgt, cost, model)
         return
-    snap["requests"] += 1
     # Read each tracked field once: the row lands in four buckets below and
     # every one of them walks the same fields.
     present = [(k, row[k] or 0) for k in USAGE_FIELDS if k in row]
-    for k, value in present:
-        snap[k] += value
-    _fold_cost(snap, cost, model)
     m = model or "unknown"
     rr = row_realm(row)
     acct_id = row.get("account")
     acct_key = acct_id or "(unattributed)"
-    per = snap["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
-    per_realm = snap["by_model_realm"].setdefault(m, {}).setdefault(
-        rr, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
-    per_acct = (snap["by_model_acct"].setdefault(m, {})
-                .setdefault(rr, {})
-                .setdefault(acct_key, {"requests": 0, "accounts": {},
-                                       "cost_cny": 0.0,
-                                       **{k: 0 for k in USAGE_FIELDS}}))
     known = cost["known"]
     cny = cost["cny"] if known else 0.0
-    for bucket in (per, per_realm, per_acct):
-        bucket["requests"] += 1
+    for tgt in targets:
+        tgt["requests"] += 1
         for k, value in present:
-            bucket[k] += value
-        if known:
-            bucket["cost_cny"] += cny
-        if acct_id:
-            accounts = bucket["accounts"]
-            accounts[acct_id] = accounts.get(acct_id, 0) + 1
+            tgt[k] += value
+        _fold_cost(tgt, cost, model)
+        per = tgt["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+        per_realm = tgt["by_model_realm"].setdefault(m, {}).setdefault(
+            rr, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+        per_acct = (tgt["by_model_acct"].setdefault(m, {})
+                    .setdefault(rr, {})
+                    .setdefault(acct_key, {"requests": 0, "accounts": {},
+                                           "cost_cny": 0.0,
+                                           **{k: 0 for k in USAGE_FIELDS}}))
+        for bucket in (per, per_realm, per_acct):
+            bucket["requests"] += 1
+            for k, value in present:
+                bucket[k] += value
+            if known:
+                bucket["cost_cny"] += cny
+            if acct_id:
+                accounts = bucket["accounts"]
+                accounts[acct_id] = accounts.get(acct_id, 0) + 1
 
 
 _usage_snap_state = {}
 _usage_snap_state_lock = threading.Lock()
+
+
+def _usage_snap_state_ready(r, pricing_on):
+    """把 `r` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
+
+    调用方必须已持有 _usage_snap_state_lock。日桶与 all-time 折叠共用这一次
+    扫描（见 _fold_usage_snapshot 的 also），所以窗口半与 all-time 半描述的
+    永远是同一段字节——这正是旧实现用 stop_at 想保证的事。
+    """
+    state = _usage_snap_state.get(r)
+    if state is None:
+        state = _usage_snap_state[r] = {"snap": None, "offset": 0, "key": None,
+                                        "pricing": None, "realm": None,
+                                        "tail": b"", "days": {}, "days_floor": None}
+    pricing = _pricing_inputs(pricing_on)
+    realm = _realm_inputs()
+    log_key = _usage_log_key()
+    if state["snap"] is None:
+        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        if not _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
+            state.update({"snap": _empty_stats(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+    elif (not _pricing_unchanged(state["pricing"], pricing)
+            or state["realm"] != realm
+            or not _log_resume_ok(state, log_key)):
+        state.update({"snap": _empty_stats(), "offset": 0, "tail": b"",
+                      "days": {}, "days_floor": None})
+    state.update({"pricing": pricing, "realm": realm, "key": log_key})
+
+    def fold(row):
+        # 一行折两处：all-time 半 + 它所属那天的窗口半。过滤与算价在
+        # _fold_usage_snapshot 里只做一次。
+        _fold_usage_snapshot(row, state["snap"], r, None, None, pricing_on,
+                             also=_usage_day_bucket(state, row, r,
+                                                    _day_snapshot_bucket))
+
+    offset, error = _scan_usage_from(state["offset"], fold)
+    if error is None:
+        state["offset"] = offset
+        state["tail"] = _log_tail_signature(offset)
+    return state, offset, error
 
 
 def _usage_alltime_snapshot(r, pricing_on=None):
@@ -1507,30 +1675,8 @@ def _usage_alltime_snapshot(r, pricing_on=None):
     them.
     """
     with _usage_snap_state_lock:
-        state = _usage_snap_state.get(r)
-        if state is None:
-            state = _usage_snap_state[r] = {"snap": None, "offset": 0, "key": None,
-                                            "pricing": None, "realm": None,
-                                            "tail": b""}
-        pricing = _pricing_inputs(pricing_on)
-        realm = _realm_inputs()
-        log_key = _usage_log_key()
-        if state["snap"] is None:
-            # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
-            if not _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
-                state.update({"snap": _empty_stats(), "offset": 0, "tail": b""})
-        elif (not _pricing_unchanged(state["pricing"], pricing)
-                or state["realm"] != realm
-                or not _log_resume_ok(state, log_key)):
-            state.update({"snap": _empty_stats(), "offset": 0, "tail": b""})
-        state.update({"pricing": pricing, "realm": realm, "key": log_key})
-        offset, error = _scan_usage_from(
-            state["offset"],
-            lambda row: _fold_usage_snapshot(row, state["snap"], r, None, None,
-                                             pricing_on))
+        state, offset, error = _usage_snap_state_ready(r, pricing_on)
         if error is None:
-            state["offset"] = offset
-            state["tail"] = _log_tail_signature(offset)
             # Copied while the lock is held: the caller decorates what it
             # gets, and a concurrent refresh must never be seen half-applied.
             snap = _copy_usage_snapshot(state["snap"])
@@ -1542,7 +1688,8 @@ def _usage_alltime_snapshot(r, pricing_on=None):
             # what the full scan does on every call.
             log(f"usage snapshot read failed: {error}")
             snap = state["snap"]
-            state.update({"snap": None, "offset": 0, "tail": b""})
+            state.update({"snap": None, "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
     # 落盘决定在锁外做（见 checkpoint 一节）：写盘要逐把读三份状态，在状态
     # 锁里再取别的状态锁会构成锁序环。折叠失败的那次不写——它的 offset 已经
     # 归零，落盘函数也会跳过。
@@ -1575,6 +1722,52 @@ def _scan_usage_snapshot_window(r, since, until, pricing_on=None):
     return snap
 
 
+def _usage_snapshot_window_from_days(r, day_key, pricing_on):
+    """窗口半快照 = 窗口内的日桶之和；日桶不可用时返回 None。
+
+    先把 all-time 折叠推进到文件尾：日桶与它同一次扫描推进，窗口半与
+    all-time 半因此描述同一段字节。
+    """
+    with _usage_snap_state_lock:
+        state, offset, error = _usage_snap_state_ready(r, pricing_on)
+        if error is not None:
+            # 折叠失败时状态已经归零，日桶跟着清空：这一次退回整段扫描，
+            # 与「没有缓存」时的行为一致。
+            log(f"usage snapshot read failed: {error}")
+            state.update({"snap": None, "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+            return None
+        floor = state.get("days_floor")
+        if not _days_cover(state, day_key):
+            return None
+        snap = _empty_stats()
+        days = state["days"]
+        for key in sorted(days):
+            if key >= day_key:
+                _add_usage_snapshot(snap, days[key])
+    _usage_cache_maybe_save("snapshot", offset)
+    return snap
+
+
+def _usage_snapshot_window(r, since, until, pricing_on=None):
+    """窗口半快照：对齐窗口由日桶相加，其余保持整段扫描。
+
+    只有「until 开放 + 起点是本地午夜」的窗口拆得成整天的并集（today /
+    week / month 都是）。自定义区间与带 until 的区间一律走整段扫描：起点
+    不是午夜就拆不开，而 until 落在某天中间时，那一天的桶里还有窗口外的
+    行，加进去就是错的。
+    """
+    day_key = _window_day_key(since) if until is None else None
+    if day_key is not None and _usage_day_buckets_enabled():
+        snap = _usage_snapshot_window_from_days(r, day_key, pricing_on)
+        if snap is not None:
+            return snap
+        # 日桶没盖住窗口起点（还没折过/被剪枝/折叠出错）：冷路径现折一份
+        # 按日分组的窗口半，口径与日桶状态一致，两条路径的字节因此相同。
+        return _scan_usage_snapshot_window_days(r, since, pricing_on)
+    return _scan_usage_snapshot_window(r, since, until, pricing_on)
+
+
 def _usage_snapshot_uncached(realm=None, since=None, until=None):
     # None means every realm; usage_snapshot() has already mapped "all"
     # onto it, so the filter below is simply skipped.
@@ -1589,7 +1782,7 @@ def _usage_snapshot_uncached(realm=None, since=None, until=None):
         # last fold and only the rows appended since then are read.
         snap = _usage_alltime_snapshot(r, pricing_on)
     else:
-        snap = _scan_usage_snapshot_window(r, since, until, pricing_on)
+        snap = _usage_snapshot_window(r, since, until, pricing_on)
     snap["started"] = _usage.get("started", time.time())
     snap["since"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snap.get("started", time.time())))
     snap["log_file"] = USAGE_LOG
@@ -1657,22 +1850,12 @@ _series_cache = {}
 _series_lock = threading.Lock()
 
 
-def usage_timeseries(realm=None, range=None, since=None, until=None,
-                     bucket_seconds=None, ttl=None):
-    """Bucketed token/credit series for the analytics chart.
+def _usage_timeseries_scope(realm, range, since, until, bucket_seconds):
+    """(realm, lo, hi, step, 缓存键) —— usage_timeseries() 与它的 ETag 共用。
 
-    Bucket size auto-scales with the window: minute (<=6h), hour (<=14d),
-    day otherwise; an explicit bucket_seconds overrides it. Completed
-    requests contribute tokens; every non-client-aborted row contributes
-    credit (money already spent). The most recent credited requests ride
-    along so the panel can show a credit history without another endpoint.
-
-    Cached wrapper: the Token chart polls this endpoint whenever the metrics
-    tab is open, and one uncached call re-reads and re-parses the whole log.
-    Same shared TTL as its siblings, and the rebuild runs under the lock so a
-    burst of pollers cannot each start their own scan.
+    lo/hi 是这次真正要扫的窗口（未钉住的边界在这里补成"现在/往前 24 小时"），
+    键只收**钉住的**边界，理由见下面 wrapper 里的注释。
     """
-    ttl = _STATS_TTL if ttl is None else ttl
     r = realm_scope(realm, CURRENT_REALM)
     lo, hi = range_window(range, since, until)
     # Which bounds the caller pinned, captured before the fallbacks below fill
@@ -1696,23 +1879,61 @@ def usage_timeseries(realm=None, range=None, since=None, until=None,
         step = 3600
     else:
         step = 86400
+    # Bounds, not a range flag: this week and this month overlap, so a flag
+    # would let one window serve the other's series from the cache. The
+    # bucket step joins the key for the same reason: an explicit bucket
+    # changes every bucket's width, and the auto-scaled one flips with the
+    # span, so two different steps are two different payloads.
+    key = (r or "all",
+           pinned_lo if pinned_lo is not None else "auto",
+           pinned_hi if pinned_hi is not None else "auto",
+           step)
+    return r, lo, hi, step, key
+
+
+def usage_timeseries(realm=None, range=None, since=None, until=None,
+                     bucket_seconds=None, ttl=None):
+    """Bucketed token/credit series for the analytics chart.
+
+    Bucket size auto-scales with the window: minute (<=6h), hour (<=14d),
+    day otherwise; an explicit bucket_seconds overrides it. Completed
+    requests contribute tokens; every non-client-aborted row contributes
+    credit (money already spent). The most recent credited requests ride
+    along so the panel can show a credit history without another endpoint.
+
+    Cached wrapper: the Token chart polls this endpoint whenever the metrics
+    tab is open, and one uncached call re-reads and re-parses the whole log.
+    Same shared TTL as its siblings, and the rebuild runs under the lock so a
+    burst of pollers cannot each start their own scan.
+    """
+    ttl = _STATS_TTL if ttl is None else ttl
+    r, lo, hi, step, key = _usage_timeseries_scope(realm, range, since, until,
+                                                   bucket_seconds)
     now = time.time()
     with _series_lock:
-        # Bounds, not a range flag: this week and this month overlap, so a flag
-        # would let one window serve the other's series from the cache. The
-        # bucket step joins the key for the same reason: an explicit bucket
-        # changes every bucket's width, and the auto-scaled one flips with the
-        # span, so two different steps are two different payloads.
-        key = (r or "all",
-               pinned_lo if pinned_lo is not None else "auto",
-               pinned_hi if pinned_hi is not None else "auto",
-               step)
         hit = _series_cache.get(key)
         if hit is not None and (now - hit[0]) < ttl:
             return hit[1]
         data = _usage_timeseries_uncached(r, lo, hi, step)
         _series_cache[key] = (time.time(), data)
     return data
+
+
+def usage_timeseries_etag(realm=None, range=None, since=None, until=None,
+                          bucket_seconds=None):
+    """usage_timeseries() 当前缓存条目的 ETag；没有条目时返回 None。
+
+    配对调用由 _json_cached() 负责。注意键里只有钉住的边界，所以"滚动窗口"这一类
+    请求始终落在同一条目上：条目没重建，响应体（含它自己的 until / 桶边界）就逐
+    字节不变，这正是可以放心回 304 的原因。
+    """
+    _r, _lo, _hi, _step, key = _usage_timeseries_scope(realm, range, since, until,
+                                                       bucket_seconds)
+    with _series_lock:
+        hit = _series_cache.get(key)
+    if hit is None:
+        return None
+    return _cache_etag("series", repr(key), hit[0])
 
 
 # Every row this process writes starts with `{"at": <float>,` - record_usage
@@ -1762,8 +1983,12 @@ def _line_outside_window(line, lo, hi):
     return line.find('"at"', end) < 0
 
 
-def _usage_timeseries_uncached(realm, lo, hi, step):
-    """One uncached pass over the log, folding rows into fixed-width buckets."""
+def _usage_timeseries_scan(realm, lo, hi, step):
+    """One uncached pass over the log, folding rows into fixed-width buckets.
+
+    这是窗口序列的兜底路径：日/小时桶切片不成立（见 _series_slice）时用它，
+    口径一字未改。
+    """
     buckets = {}
     credits = []
     try:
@@ -1827,6 +2052,32 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
         "series": [buckets[key] for key in sorted(buckets)],
         "credits": credits[:50],
     }
+
+
+def _usage_timeseries_uncached(realm, lo, hi, step):
+    """窗口序列：优先由日/小时桶切片，不成立时整段扫描。
+
+    切片只在「窗口起点是本地午夜 + 桶宽 3600/86400」时才是同一件事，所以
+    先按这两条判断要不要惊动状态：自定义区间与分钟桶根本不折状态，也就
+    不会为它们白扫一遍。
+    """
+    day_key = _window_day_key(lo) if step in (3600, 86400) else None
+    if day_key is not None and _usage_day_buckets_enabled():
+        with _series_state_lock:
+            state, offset, error = _usage_series_state_ready(realm)
+            out = None
+            if error is not None:
+                # 折叠失败：状态归零（下一次从零折起），这次退回整段扫描。
+                log("usage timeseries fold failed: %s" % error)
+                state.update({"days": {}, "days_floor": None, "max_at": 0,
+                              "credits": [], "offset": 0, "tail": b""})
+            else:
+                out = _series_slice(state, realm, lo, hi, step, day_key)
+        if error is None:
+            _usage_cache_maybe_save("series", offset)
+        if out is not None:
+            return out
+    return _usage_timeseries_scan(realm, lo, hi, step)
 
 
 def count_usage_rows(realm=None):
@@ -2216,6 +2467,19 @@ def usage_by_account(ttl=None):
     return data
 
 
+def usage_by_account_etag():
+    """usage_by_account() 当前缓存条目的 ETag；没有条目时返回 None。
+
+    这个视图只有一条缓存（没有窗口/区域参数），所以键是常量。配对调用由
+    _json_cached() 负责。
+    """
+    with _byacct_lock:
+        if _byacct_cache["data"] is None:
+            return None
+        built_at = _byacct_cache["at"]
+    return _cache_etag("by-account", "all", built_at)
+
+
 _byacct_state = {"buckets": None, "offset": 0, "key": None, "tail": b""}
 # The wrapper above holds _byacct_lock while it rebuilds and then calls in
 # here, and _usage_by_account_uncached() is also called straight from the
@@ -2303,6 +2567,19 @@ _analytics_cache = {}
 _analytics_lock = threading.Lock()
 
 
+def _analytics_scope(realm, range, since, until):
+    """(since, until, 缓存键) —— compute_usage_analytics() 与它的 ETag 共用。
+
+    注意键里用的是**原始** realm（`realm or "all"`），与这个接口一直以来的键
+    一致；折叠时用 realm_scope(realm) 另有其义。两者都不能顺手"统一"，否则就是
+    换了一条缓存键。
+    """
+    lo, hi = range_window(range, since, until)
+    cache_key = "%s|%s|%s" % (realm or "all",
+                              lo if lo is not None else "", hi if hi is not None else "")
+    return lo, hi, cache_key
+
+
 def compute_usage_analytics(ttl=None, realm=None, range=None, since=None, until=None):
     """Cached analytics payload.
 
@@ -2317,9 +2594,7 @@ def compute_usage_analytics(ttl=None, realm=None, range=None, since=None, until=
     """
     ttl = _STATS_TTL if ttl is None else ttl
     now = time.time()
-    lo, hi = range_window(range, since, until)
-    cache_key = "%s|%s|%s" % (realm or "all",
-                              lo if lo is not None else "", hi if hi is not None else "")
+    lo, hi, cache_key = _analytics_scope(realm, range, since, until)
     with _analytics_lock:
         entry = _analytics_cache.get(cache_key)
         if entry is not None and (now - entry["at"]) < ttl:
@@ -2327,6 +2602,19 @@ def compute_usage_analytics(ttl=None, realm=None, range=None, since=None, until=
         data = _compute_usage_analytics_uncached(realm=realm_scope(realm), since=lo, until=hi)
         _analytics_cache[cache_key] = {"at": time.time(), "data": data}
     return data
+
+
+def usage_analytics_etag(realm=None, range=None, since=None, until=None):
+    """compute_usage_analytics() 当前缓存条目的 ETag；无条目返回 None。
+
+    配对调用由 _json_cached() 负责，理由见那里。
+    """
+    _lo, _hi, cache_key = _analytics_scope(realm, range, since, until)
+    with _analytics_lock:
+        entry = _analytics_cache.get(cache_key)
+    if entry is None:
+        return None
+    return _cache_etag("analytics", cache_key, entry["at"])
 
 
 def _new_analytics_stat():
@@ -2439,7 +2727,7 @@ def _bump_analytics_models(tgt, m_id, vals, is_err, cost_cny):
     tm["cost_cny"] += cost_cny
 
 
-def _fold_usage_analytics(row, realm, maps, half, pricing_on=None):
+def _fold_usage_analytics(row, realm, maps, half, pricing_on=None, also=None):
     """Fold one parsed row into one half of the analytics payload.
 
     `maps` holds the four maps that half folds into and `half` names the stat
@@ -2450,6 +2738,10 @@ def _fold_usage_analytics(row, realm, maps, half, pricing_on=None):
     The key axis is separate from the account axis on purpose: one key can be
     served by many upstream accounts, and one account can serve many keys, so
     the two tables are views of the same spend, not a decomposition of it.
+
+    `also` 是同一行还要折进的第二份 (maps, half)（按日分桶的窗口半）。过滤、
+    算价与字段提取只做一次，两份各自累加：折叠本来就要求两侧各记一笔，而
+    cost_for_row 与 realm 判定是每行最贵的那部分，只该付一次。
     """
     if realm and not row_matches_realm(row, realm):
         return
@@ -2464,30 +2756,8 @@ def _fold_usage_analytics(row, realm, maps, half, pricing_on=None):
     cost = wb_pricing.cost_for_row(row, details=False, enabled=pricing_on)
     cost_cny = cost["cny"] if cost["known"] else 0.0
     vals = _analytics_row_values(row)
-    stat_key, models_key = half
     acct_uid = row.get("account") or "(unattributed)"
     m_id = row.get("model") or "(unknown)"
-
-    _feed_analytics(maps["summary"], vals, is_err, cost_cny)
-
-    entry = maps["accts"].get(acct_uid)
-    if entry is None:
-        entry = maps["accts"][acct_uid] = {
-            "uid": acct_uid,
-            "nickname": acct_uid,
-            "realm": row.get("realm", ""),
-            "domain": "",
-            stat_key: _new_analytics_stat(),
-            models_key: {},
-        }
-    _feed_analytics(entry[stat_key], vals, is_err, cost_cny)
-    _bump_analytics_models(entry[models_key], m_id, vals, is_err, cost_cny)
-
-    model = maps["models"].get(m_id)
-    if model is None:
-        model = maps["models"][m_id] = {"model": m_id, stat_key: _new_analytics_stat()}
-    _feed_analytics(model[stat_key], vals, is_err, cost_cny)
-
     # A row written before this feature existed has no `key` field at all; a
     # row from a deployment that never configured a key has one, and it is
     # empty.
@@ -2495,26 +2765,49 @@ def _fold_usage_analytics(row, realm, maps, half, pricing_on=None):
         k_id = row.get("key") or KEY_BUCKET_ANON
     else:
         k_id = KEY_BUCKET_BEFORE
-    km = maps["keys"].get(k_id)
-    if km is None:
-        km = maps["keys"][k_id] = {
-            "key": k_id,
-            stat_key: _new_analytics_stat(),
-            models_key: {},
-            # realm -> row count. A key bound to one exit only ever sees that
-            # exit; a key with no binding follows the model, and its credit
-            # column then adds up two different products. Kept as a dict
-            # because this ends up in JSON.
-            "realms": {},
-            "last_at": 0,
-        }
     k_realm = row_realm(row) or ""
-    km["realms"][k_realm] = km["realms"].get(k_realm, 0) + 1
     at = row.get("at") or 0
-    if at and at > km["last_at"]:
-        km["last_at"] = at
-    _feed_analytics(km[stat_key], vals, is_err, cost_cny)
-    _bump_analytics_models(km[models_key], m_id, vals, is_err, cost_cny)
+    targets = ((maps, half),) if also is None else ((maps, half), also)
+    for tgt, (stat_key, models_key) in targets:
+        _feed_analytics(tgt["summary"], vals, is_err, cost_cny)
+
+        entry = tgt["accts"].get(acct_uid)
+        if entry is None:
+            entry = tgt["accts"][acct_uid] = {
+                "uid": acct_uid,
+                "nickname": acct_uid,
+                "realm": row.get("realm", ""),
+                "domain": "",
+                stat_key: _new_analytics_stat(),
+                models_key: {},
+            }
+        _feed_analytics(entry[stat_key], vals, is_err, cost_cny)
+        _bump_analytics_models(entry[models_key], m_id, vals, is_err, cost_cny)
+
+        model = tgt["models"].get(m_id)
+        if model is None:
+            model = tgt["models"][m_id] = {"model": m_id,
+                                           stat_key: _new_analytics_stat()}
+        _feed_analytics(model[stat_key], vals, is_err, cost_cny)
+
+        km = tgt["keys"].get(k_id)
+        if km is None:
+            km = tgt["keys"][k_id] = {
+                "key": k_id,
+                stat_key: _new_analytics_stat(),
+                models_key: {},
+                # realm -> row count. A key bound to one exit only ever sees
+                # that exit; a key with no binding follows the model, and its
+                # credit column then adds up two different products. Kept as a
+                # dict because this ends up in JSON.
+                "realms": {},
+                "last_at": 0,
+            }
+        km["realms"][k_realm] = km["realms"].get(k_realm, 0) + 1
+        if at and at > km["last_at"]:
+            km["last_at"] = at
+        _feed_analytics(km[stat_key], vals, is_err, cost_cny)
+        _bump_analytics_models(km[models_key], m_id, vals, is_err, cost_cny)
 
 
 _analytics_state = {}
@@ -2531,31 +2824,8 @@ def _analytics_all_time(realm, pricing_on=None):
     stopped.
     """
     with _analytics_state_lock:
-        state = _analytics_state.get(realm)
-        if state is None:
-            state = _analytics_state[realm] = {"maps": _new_analytics_maps(),
-                                               "offset": 0, "key": None,
-                                               "pricing": None, "realm": None,
-                                               "tail": b""}
-        pricing = _pricing_inputs(pricing_on)
-        realm_inputs = _realm_inputs()
-        log_key = _usage_log_key()
-        if state["key"] is None:
-            # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
-            if not _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
-                state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b""})
-        elif (not _pricing_unchanged(state["pricing"], pricing)
-                or state["realm"] != realm_inputs
-                or not _log_resume_ok(state, log_key)):
-            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b""})
-        state.update({"pricing": pricing, "realm": realm_inputs, "key": log_key})
-        offset, error = _scan_usage_from(
-            state["offset"],
-            lambda row: _fold_usage_analytics(row, realm, state["maps"],
-                                              _ANALYTICS_ALL, pricing_on))
+        state, offset, error = _analytics_state_ready(realm, pricing_on)
         if error is None:
-            state["offset"] = offset
-            state["tail"] = _log_tail_signature(offset)
             # Copied under the lock, same rule as the snapshot state: what
             # the caller decorates must not be the live fold.
             maps = _copy_analytics_all_time(state["maps"])
@@ -2568,10 +2838,97 @@ def _analytics_all_time(realm, pricing_on=None):
             # all-time half already folded.
             log("compute_usage_analytics failed: %s" % error)
             maps = state["maps"]
-            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b""})
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
     if error is None:
         _usage_cache_maybe_save("analytics", offset)
     return maps, offset
+
+
+def _analytics_state_ready(realm, pricing_on=None):
+    """把 `realm` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
+
+    调用方必须已持有 _analytics_state_lock。日桶与 all-time 折叠共用这一次
+    扫描（见 _fold_usage_analytics 的 also），窗口半与 all-time 半因此描述
+    同一段字节。
+    """
+    state = _analytics_state.get(realm)
+    if state is None:
+        state = _analytics_state[realm] = {"maps": _new_analytics_maps(),
+                                           "offset": 0, "key": None,
+                                           "pricing": None, "realm": None,
+                                           "tail": b"", "days": {},
+                                           "days_floor": None}
+    pricing = _pricing_inputs(pricing_on)
+    realm_inputs = _realm_inputs()
+    log_key = _usage_log_key()
+    if state["key"] is None:
+        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        if not _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+    elif (not _pricing_unchanged(state["pricing"], pricing)
+            or state["realm"] != realm_inputs
+            or not _log_resume_ok(state, log_key)):
+        state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                      "days": {}, "days_floor": None})
+    state.update({"pricing": pricing, "realm": realm_inputs, "key": log_key})
+
+    def fold(row):
+        # 一行折两处：all-time 半 + 它所属那天的窗口半（过滤与算价只做一次）。
+        day = _usage_day_bucket(state, row, realm, _day_analytics_bucket)
+        _fold_usage_analytics(
+            row, realm, state["maps"], _ANALYTICS_ALL, pricing_on,
+            also=None if day is None else (day, _ANALYTICS_WINDOW))
+
+    offset, error = _scan_usage_from(state["offset"], fold)
+    if error is None:
+        state["offset"] = offset
+        state["tail"] = _log_tail_signature(offset)
+    return state, offset, error
+
+
+def _analytics_window_from_days(realm, day_key, pricing_on):
+    """窗口半 maps = 窗口内的日桶之和；日桶不可用时返回 None。
+
+    先确保 all-time 折叠推进到文件尾：日桶与它同一次扫描推进，窗口半与
+    all-time 半因此描述同一段字节（旧实现用 stop_at 保证的同一件事）。
+    """
+    with _analytics_state_lock:
+        state, offset, error = _analytics_state_ready(realm, pricing_on)
+        if error is not None:
+            log("compute_usage_analytics failed: %s" % error)
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None})
+            return None
+        floor = state.get("days_floor")
+        if not _days_cover(state, day_key):
+            return None
+        maps = _new_analytics_maps()
+        days = state["days"]
+        for key in sorted(days):
+            if key >= day_key:
+                _add_analytics_window_maps(maps, days[key])
+    _usage_cache_maybe_save("analytics", offset)
+    return maps
+
+
+def _analytics_window(realm, since, until, stop_at, pricing_on):
+    """窗口半 analytics：对齐窗口由日桶相加，其余保持整段扫描。
+
+    与 _usage_snapshot_window 同一条规矩：只有「until 开放 + 起点是本地
+    午夜」的窗口拆得成整天的并集。
+    """
+    day_key = _window_day_key(since) if until is None else None
+    if day_key is not None and _usage_day_buckets_enabled():
+        maps = _analytics_window_from_days(realm, day_key, pricing_on)
+        if maps is not None:
+            return maps
+        # 日桶没盖住窗口起点：冷路径现折一份按日分组的窗口半，口径一致。
+        return _scan_usage_analytics_window_days(realm, since, stop_at,
+                                                 pricing_on)
+    return _scan_usage_analytics_window(realm, since, until, stop_at=stop_at,
+                                        pricing_on=pricing_on)
 
 
 def _scan_usage_analytics_window(realm, since, until, stop_at=None, pricing_on=None):
@@ -2710,6 +3067,516 @@ def _add_analytics_stat(dst, src):
     for field, value in src.items():
         if isinstance(value, (int, float)):
             dst[field] += value
+
+
+# ---------------------------------------------------------------------------
+# 按日分桶：窗口半的增量
+#
+# all-time 半已经是增量（按字节偏移折叠 + 落盘 checkpoint），但窗口半
+# （range=today / week / month）仍然是「从头扫到窗口」：窗口越宽扫得越多，
+# 路由器上一次 range=week 要 5 秒。窗口的边界全是本地午夜（range_window()），
+# 而每行只属于一天，所以只要在折叠时顺手把每一行折进「它所属那天的桶」，
+# 任何窗口就退化成「把窗口内的日桶相加」——O(天数)，checkpoint 带着日桶
+# 时冷缓存也是瞬间。
+#
+# 时间边界只认一个规则：行的本地日由行自己的 at 决定（_local_day_key），
+# 与 range_window() 的 today/week/month 用的是同一套本地午夜。折叠时刻不
+# 参与切天——迟写/补写的行必须落进它时间戳所属的那天，按折叠时刻切会让
+# 窗口相加错位。跨夏令时同理：日桶的键是本地日历日，只要窗口起点是本地
+# 午夜，「日键 >= 窗口日键」就是「at >= since」的等价写法（见 _window_day_key）。
+#
+# 已封口的日桶不会再变（新行只落进今天那一桶），窗口相加时旧桶原样复用；
+# 状态只在新建桶时剪枝（_prune_day_buckets），剪掉的只是任何窗口都够不到
+# 的天。剪枝会抬高 days_floor，任何够不到的天都因此退回整段扫描——宁可多
+# 扫一次，不能少算一天。
+#
+# 浮点求和的口径：窗口 = 日桶逐日相加，与旧实现「整段扫描逐行累加」的区别
+# 只是浮点的结合顺序（credit / cost_cny / speed_sum 可能差最后一两个 ulp，
+# 整数字段逐位相同）。逐行顺序无法从日聚合还原，这是日桶推导的固有代价；
+# 本文件里所有对齐窗口的路径统一用「按日分组」的口径（冷扫描、日桶、加载
+# checkpoint 三条路径给出的字节完全一致），把「像没有缓存一样正确」保成
+# 路径之间的一致性。WB_USAGE_DAY_BUCKETS=0 可整体退回旧的逐行口径。
+# ---------------------------------------------------------------------------
+
+# 日桶保留天数：月窗口最多回溯 30 天（当月 1 号），32 天留两天余量。更早的
+# 天没有任何窗口够得到，留着只让 checkpoint 白白变大——路由器上每次写盘都
+# 要重写整份文件。调小它（WB_USAGE_DAY_KEEP_DAYS）会让更宽的窗口退回整段
+# 扫描（结果仍然正确，只是慢）：对 flash 写入敏感的部署可以调到 8，只保周。
+_USAGE_DAY_KEEP_DAYS = 32
+
+# 日桶求和要跳过的字段：started 是每份快照各自的创建时刻，不是累计量。
+# 与 _USAGE_CACHE_SNAPSHOT_NUMBERS 同源（同一份构造函数的数字字段），只是
+# 在模块加载顺序上不能引用它（那段常量在文件更靠后），所以这里自己推导。
+_USAGE_DAY_SNAPSHOT_FIELDS = tuple(
+    k for k, v in _empty_stats().items()
+    if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "started")
+
+
+def _usage_day_keep_days():
+    """日桶保留天数，默认 32；WB_USAGE_DAY_KEEP_DAYS 可调。
+
+    每次调用都读环境变量，理由与 WB_USAGE_CACHE 相同（现场调、测试里来回切）。
+    """
+    try:
+        return max(1, int(os.environ.get("WB_USAGE_DAY_KEEP_DAYS",
+                                         _USAGE_DAY_KEEP_DAYS)))
+    except (TypeError, ValueError):
+        return _USAGE_DAY_KEEP_DAYS
+
+
+def _usage_day_buckets_enabled():
+    """日桶总开关，默认开；WB_USAGE_DAY_BUCKETS=0 退回逐行扫描口径。
+
+    与 WB_USAGE_CACHE 同样的用法：现场紧急关掉、测试在一个进程里来回切。
+    关掉时既不折日桶也不用它们，窗口路径与改动前逐字节一致。
+    """
+    return os.environ.get("WB_USAGE_DAY_BUCKETS", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def _local_day_key(ts):
+    """ts 所属的本地日历日，"YYYY-MM-DD"。
+
+    用字符串而不是午夜 epoch 当日桶的键：窗口与日桶的比较就是一次字符串
+    比较（ISO 日期天然有序），查询不必再算一遍本地午夜，也不会被夏令时的
+    日长变化影响——同一套本地日历日规则在折叠与查询两侧都成立。
+    """
+    return time.strftime("%Y-%m-%d", time.localtime(ts))
+
+
+def _day_key_start(key):
+    """日键 -> 该日的本地午夜 epoch。"""
+    lt = time.strptime(key, "%Y-%m-%d")
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def _window_day_key(since):
+    """窗口起点能由日桶推导时返回它的日键，否则 None。
+
+    只有「起点正好是本地午夜」的窗口才拆得成整天的并集：at >= 本地午夜
+    等价于「日键 >= 那天的键」。自定义区间的起点是任意时刻，拆不开——那条
+    路径保持整段扫描（正确性优先）。
+    """
+    if since is None:
+        return None
+    if _local_midnight(since) != since:
+        return None
+    return _local_day_key(since)
+
+
+def _day_snapshot_bucket(key, day_start):
+    """一天一份的窗口半快照桶；形状与 _empty_stats() 一致。
+
+    started 不参与求和（见 _add_usage_snapshot），形状保留只是让校验与
+    all-time 半共用同一套 _usage_cache_snapshot_ok。
+    """
+    return _empty_stats()
+
+
+def _day_analytics_bucket(key, day_start):
+    """一天一份的窗口形状 analytics maps。"""
+    return _new_analytics_maps()
+
+
+def _day_series_bucket(key, day_start):
+    """一天一份的时间序列桶（带小时子表，见 _fold_usage_series）。"""
+    bucket = _new_series_bucket(day_start)
+    bucket["hours"] = {}
+    return bucket
+
+
+def _usage_day_bucket(state, row, r, factory):
+    """这一行该折进哪个日桶；必要时新建（顺带剪枝），不该折时返回 None。
+
+    行的归属只看它自己的 at：补写/迟到的行必须落进它时间戳所属的那天。
+    realm 不匹配的行折叠本来就会跳过，这里也不为它建桶；总开关关掉时连
+    日桶都不折（窗口路径也不会用它们，见 _usage_day_buckets_enabled）。
+    """
+    if not _usage_day_buckets_enabled():
+        return None
+    if r and not row_matches_realm(row, r):
+        return None
+    at = row.get("at") or 0
+    key = _local_day_key(at)
+    floor = state.get("days_floor")
+    if floor is not None and key < floor:
+        # 剪枝线以下的天：那些桶已经被丢掉，而且任何可服务的窗口都从
+        # days_floor 那天起，这一行不在其中——跳过不影响窗口。
+        return None
+    days = state["days"]
+    bucket = days.get(key)
+    if bucket is None:
+        bucket = days[key] = factory(key, _day_key_start(key))
+        _prune_day_buckets(state, days, key)
+    return bucket
+
+
+def _prune_day_buckets(state, days, newest_key):
+    """丢掉任何窗口都够不到的旧日桶，并把 days_floor 抬到剪枝线。
+
+    days_floor 的语义是「这份状态从哪天起是完整的」：它就是剪枝线（最新那天
+    往前 _usage_day_keep_days() 天），没剪过时第一次折到新的一天也会把它记
+    下来——比这条线更早的窗口一律退回整段扫描（时钟大幅回拨、日志里有远古
+    补写行这类情况），宁可多扫一次，不能少算一天。
+    """
+    horizon = _local_day_key(_day_key_start(newest_key)
+                             - _usage_day_keep_days() * 86400)
+    for old in [k for k in days if k < horizon]:
+        del days[old]
+    floor = state.get("days_floor")
+    if floor is None or floor < horizon:
+        state["days_floor"] = horizon
+
+
+def _days_cover(state, day_key):
+    """这份状态的日桶能否服务以 day_key 为起点的窗口。
+
+    days_floor 是剪枝线：比它早的窗口可能少了被剪掉的天，只能退回扫描。
+    它最早也要折到第一个新的一天才会记下（没折过就是 None，此时谁都不服务
+    ——调用方总是先折到文件尾，所以实际不会遇到）。
+    """
+    floor = state.get("days_floor")
+    return floor is not None and day_key >= floor
+
+
+def _add_usage_bucket(dst_map, key, src):
+    """把一个 by_model* 桶并入同键的桶（不存在就整只拷进来）。"""
+    dst = dst_map.get(key)
+    if dst is None:
+        dst_map[key] = _copy_usage_bucket(src)
+        return
+    for field in _USAGE_CACHE_BUCKET_NUMBERS:
+        dst[field] += src.get(field) or 0
+    for acct, count in src["accounts"].items():
+        dst["accounts"][acct] = dst["accounts"].get(acct, 0) + count
+
+
+def _add_usage_snapshot(dst, src):
+    """把一份窗口半快照按字段并入另一份（日桶求和用）。
+
+    逐字段相加，不是重折：日桶是不可变的聚合，窗口只是它们的和。started
+    是每份快照各自的创建时刻，不是累计量，跳过。
+    """
+    for field in _USAGE_DAY_SNAPSHOT_FIELDS:
+        dst[field] += src.get(field) or 0
+    for mid, count in src["cost_missing"].items():
+        dst["cost_missing"][mid] = dst["cost_missing"].get(mid, 0) + count
+    for mid, bucket in src["by_model"].items():
+        _add_usage_bucket(dst["by_model"], mid, bucket)
+    for mid, realms in src["by_model_realm"].items():
+        for rr, bucket in realms.items():
+            _add_usage_bucket(dst["by_model_realm"].setdefault(mid, {}), rr, bucket)
+    for mid, realms in src["by_model_acct"].items():
+        for rr, accts in realms.items():
+            tgt = dst["by_model_acct"].setdefault(mid, {}).setdefault(rr, {})
+            for acct, bucket in accts.items():
+                _add_usage_bucket(tgt, acct, bucket)
+
+
+def _add_analytics_models(dst, src):
+    """把一份 {model: {requests, tokens, reasoning, cost_cny}} 并入另一份。"""
+    for mid, stat in src.items():
+        tgt = dst.get(mid)
+        if tgt is None:
+            dst[mid] = dict(stat)
+            continue
+        for field in ("requests", "tokens", "reasoning", "cost_cny"):
+            tgt[field] += stat.get(field) or 0
+
+
+def _add_analytics_window_maps(dst, src):
+    """把一份窗口形状的 analytics maps 并入另一份（日桶求和用）。
+
+    日桶本身就是 _ANALYTICS_WINDOW 那一半的形状（window / window_models），
+    所以这里只动这两个键；realms / last_at 照并，虽然 _merge_analytics_halves
+    最终取的是 all-time 侧的值。
+    """
+    _add_analytics_stat(dst["summary"], src["summary"])
+    for uid, entry in src["accts"].items():
+        tgt = dst["accts"].get(uid)
+        if tgt is None:
+            tgt = dst["accts"][uid] = {
+                "uid": uid, "nickname": uid, "realm": entry["realm"],
+                "domain": "", "window": _new_analytics_stat(),
+                "window_models": {}}
+        _add_analytics_stat(tgt["window"], entry["window"])
+        _add_analytics_models(tgt["window_models"], entry["window_models"])
+    for mid, entry in src["models"].items():
+        tgt = dst["models"].get(mid)
+        if tgt is None:
+            tgt = dst["models"][mid] = {"model": mid,
+                                        "window": _new_analytics_stat()}
+        _add_analytics_stat(tgt["window"], entry["window"])
+    for kid, entry in src["keys"].items():
+        tgt = dst["keys"].get(kid)
+        if tgt is None:
+            tgt = dst["keys"][kid] = {
+                "key": kid, "window": _new_analytics_stat(),
+                "window_models": {}, "realms": {}, "last_at": 0}
+        _add_analytics_stat(tgt["window"], entry["window"])
+        _add_analytics_models(tgt["window_models"], entry["window_models"])
+        for rr, count in entry["realms"].items():
+            tgt["realms"][rr] = tgt["realms"].get(rr, 0) + count
+        if entry["last_at"] > tgt["last_at"]:
+            tgt["last_at"] = entry["last_at"]
+
+
+def _copy_analytics_window_maps(maps):
+    """一份窗口形状 maps 的深拷贝（落盘用，形状同 _new_analytics_maps()）。"""
+    out = {"summary": dict(maps["summary"]), "accts": {}, "models": {}, "keys": {}}
+    for uid, entry in maps["accts"].items():
+        copy = dict(entry)
+        copy["window"] = dict(entry["window"])
+        copy["window_models"] = _copy_analytics_models(entry["window_models"])
+        out["accts"][uid] = copy
+    for mid, entry in maps["models"].items():
+        out["models"][mid] = {"model": mid, "window": dict(entry["window"])}
+    for kid, km in maps["keys"].items():
+        copy = dict(km)
+        copy["window"] = dict(km["window"])
+        copy["window_models"] = _copy_analytics_models(km["window_models"])
+        copy["realms"] = dict(km["realms"])
+        out["keys"][kid] = copy
+    return out
+
+
+def _scan_usage_snapshot_window_days(r, since, pricing_on=None):
+    """窗口半的冷路径：整段扫一遍，先按日分桶再相加。
+
+    日桶状态不可用（还没折过、被剪枝、折叠出错）时走这里。结果必须与日桶
+    状态给出的窗口半逐字节一致：窗口起点是本地午夜，两边装的是同一批行、
+    同一个「按日分组」的求和口径，只是桶一个现折、一个存量。
+    """
+    days = {}
+
+    def fold(row):
+        at = row.get("at") or 0
+        if since and at < since:
+            return
+        key = _local_day_key(at)
+        bucket = days.get(key)
+        if bucket is None:
+            bucket = days[key] = _empty_stats()
+        _fold_usage_snapshot(row, bucket, r, None, None, pricing_on)
+
+    _, error = _scan_usage_from(
+        0, fold,
+        skip=lambda line: _line_outside_window(line, since or None, None))
+    if error is not None:
+        log(f"usage snapshot read failed: {error}")
+    snap = _empty_stats()
+    for key in sorted(days):
+        _add_usage_snapshot(snap, days[key])
+    return snap
+
+
+def _scan_usage_analytics_window_days(realm, since, stop_at=None, pricing_on=None):
+    """窗口半 analytics 的冷路径：按日分桶再相加（见 snapshot 版）。"""
+    days = {}
+
+    def fold(row):
+        at = row.get("at") or 0
+        if since is not None and at < since:
+            return
+        key = _local_day_key(at)
+        maps = days.get(key)
+        if maps is None:
+            maps = days[key] = _new_analytics_maps()
+        _fold_usage_analytics(row, realm, maps, _ANALYTICS_WINDOW, pricing_on)
+
+    _, error = _scan_usage_from(
+        0, fold, stop_at=stop_at,
+        skip=lambda line: _line_outside_window(line, since, None))
+    if error is not None:
+        log("compute_usage_analytics failed: %s" % error)
+    out = _new_analytics_maps()
+    for key in sorted(days):
+        _add_analytics_window_maps(out, days[key])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 时间序列的日/小时桶
+#
+# usage_timeseries() 本来就把行按时间装桶，但每次缓存未命中都要整段扫描
+# （路由器上 range=week 约 2 秒）。窗口边界同样是本地午夜，而它的桶宽只有
+# 3600 与 86400 两种能与窗口对齐（span<=6h 的分钟桶只出现在自定义区间，
+# 那条路保持整段扫描）。折叠时顺手维护日桶与小时桶，窗口就是它们的切片：
+# 每个输出桶恰好等于一个存量桶（不做跨桶相加），所以连浮点求和都是逐位
+# 一致的——不像 snapshot/analytics 的窗口半需要把日桶相加。
+# ---------------------------------------------------------------------------
+_series_state = {}
+_series_state_lock = threading.Lock()
+# credit 历史只保留最近这么多条（整段扫描返回的也是窗口内的前 50 条）。
+_SERIES_CREDITS_KEEP = 50
+
+
+def _new_series_bucket(at):
+    """一个时间序列桶；键序与 _usage_timeseries_uncached 的输出逐字一致。"""
+    return {"at": at, "requests": 0, "errors": 0, "prompt_tokens": 0,
+            "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
+            "total_tokens": 0, "credit": 0.0}
+
+
+def _feed_series_bucket(bucket, row):
+    """一行折进一个序列桶（日桶或小时桶）。
+
+    口径与 _usage_timeseries_uncached 的折叠逐条一致：completed 计 requests
+    与令牌，其它结果（含客户端中止）计 errors；credit 只要不是客户端中止就
+    累加。
+    """
+    outcome = row_outcome(row)
+    if outcome == "completed":
+        bucket["requests"] += 1
+        for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                      "cached_tokens", "total_tokens"):
+            bucket[field] += (row.get(field) or 0)
+    else:
+        bucket["errors"] += 1
+    if outcome != "client_aborted":
+        bucket["credit"] += (row.get("credit") or 0)
+
+
+def _series_credit_push(credits, row, at):
+    """把一条带 credit 的行放进「最近 50 条」缓冲。
+
+    整段扫描返回的 credits 是窗口内按 at 倒序的前 50 条；缓冲里始终留着
+    最新的一批（至少 50 条，涨到 100 条时裁回 50），于是任何后缀窗口
+    （today/week/month 都是）的前 50 条都在这批里——比缓冲最旧一条还旧的
+    行不可能是窗口的前 50 条。at 相同时两边都是稳定排序，顺序（日志顺序）
+    一致。
+    """
+    credits.append({"at": at, "iso": row.get("iso") or "",
+                    "model": row.get("model") or "",
+                    "account": row.get("account") or "",
+                    "credit": row.get("credit") or 0,
+                    "total_tokens": row.get("total_tokens") or 0})
+    if len(credits) > _SERIES_CREDITS_KEEP * 2:
+        credits.sort(key=lambda item: item.get("at") or 0, reverse=True)
+        del credits[_SERIES_CREDITS_KEEP:]
+
+
+def _fold_usage_series(row, r, state):
+    """一行折进时间序列状态：日桶 + 小时桶 + credit 缓冲。"""
+    at = row.get("at") or 0
+    if at > state["max_at"]:
+        # 折过的最大 at：窗口上界（hi=now）只要不低于它，存量桶就都在窗口内。
+        # 越界的行（时钟回拨/补写）会让它偏大，那只是更保守，方向安全。
+        state["max_at"] = at
+    bucket = _usage_day_bucket(state, row, r, _day_series_bucket)
+    if bucket is None:
+        return
+    _feed_series_bucket(bucket, row)
+    if at < bucket["at"]:
+        # 本地午夜落在不存在的小时里（极少数时区的夏令时正好在午夜切换）：
+        # 这一天的行放不进小时格点，把 hours 摘掉让切片对这一天整体退回扫描
+        # （日桶本身照常，step=86400 的切片不受影响）。
+        bucket.pop("hours", None)
+        return
+    # 小时子桶按「离那天的本地午夜多少秒」切：窗口起点是本地午夜时，窗口
+    # 序列的桶序号 k = 天序号*24 + 小时序号（夏令时不在日边界上时也一样，
+    # 因为两边都是纯 epoch 算术；日边界被夏令时挪动的情形由 _series_slice
+    # 的格点校验挡住）。键写成字符串，与 JSON 往返后的形状一致。
+    hour = str(int((at - bucket["at"]) // 3600))
+    sub = bucket["hours"].get(hour)
+    if sub is None:
+        sub = bucket["hours"][hour] = _new_series_bucket(
+            bucket["at"] + int(hour) * 3600)
+    _feed_series_bucket(sub, row)
+    if (row.get("credit") or 0) > 0:
+        _series_credit_push(state["credits"], row, at)
+
+
+def _usage_series_state_ready(r):
+    """把 `r` 的时间序列状态推进到文件尾；返回 (state, offset, error)。
+
+    调用方必须已持有 _series_state_lock。时间序列折叠不算价，所以状态只带
+    realm 指纹（行没有 realm 字段时 row_realm() 会读它）。
+    """
+    state = _series_state.get(r)
+    if state is None:
+        state = _series_state[r] = {
+            "days": {}, "days_floor": None, "max_at": 0, "credits": [],
+            "offset": 0, "key": None, "realm": None, "tail": b""}
+    realm = _realm_inputs()
+    log_key = _usage_log_key()
+    if state["key"] is None:
+        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        if not _usage_cache_adopt_series(r, state, log_key, realm):
+            state.update({"days": {}, "days_floor": None, "max_at": 0,
+                          "credits": [], "offset": 0, "tail": b""})
+    elif state["realm"] != realm or not _log_resume_ok(state, log_key):
+        state.update({"days": {}, "days_floor": None, "max_at": 0,
+                      "credits": [], "offset": 0, "tail": b""})
+    state.update({"realm": realm, "key": log_key})
+    offset, error = _scan_usage_from(
+        state["offset"], lambda row: _fold_usage_series(row, r, state))
+    if error is None:
+        state["offset"] = offset
+        state["tail"] = _log_tail_signature(offset)
+    return state, offset, error
+
+
+def _series_output_bucket(bucket):
+    """存量桶 -> 输出桶（键序固定；日桶的 hours 子表不进输出）。"""
+    return {"at": bucket["at"], "requests": bucket["requests"],
+            "errors": bucket["errors"], "prompt_tokens": bucket["prompt_tokens"],
+            "completion_tokens": bucket["completion_tokens"],
+            "reasoning_tokens": bucket["reasoning_tokens"],
+            "cached_tokens": bucket["cached_tokens"],
+            "total_tokens": bucket["total_tokens"], "credit": bucket["credit"]}
+
+
+def _series_slice(state, realm, lo, hi, step, day_key):
+    """窗口序列 = 日桶/小时桶的切片；不满足对齐条件时返回 None。
+
+    成立条件（缺一不可，任何一条不成立就退回整段扫描——正确性优先）：
+      * 窗口起点是本地午夜（day_key 由 _window_day_key 给出）；
+      * 桶宽是 3600 或 86400（与窗口对齐的两种）；
+      * days_floor 覆盖窗口起点（剪枝/更早的天没折过就只能整段扫）；
+      * hi 不低于折过的最大 at，否则窗口上界会切掉桶里的行；
+      * 每个桶的 at 落在 lo + k*step 的格点上。这一条同时挡住夏令时：日长
+        不是 86400 秒的那天之后，每一天的本地午夜都不再落在 86400 的格点上，
+        于是自动退回整段扫描。时区没有夏令时（cn/路由器）时恒真。
+    """
+    if step not in (3600, 86400):
+        return None
+    if hi < state["max_at"]:
+        return None
+    if not _days_cover(state, day_key):
+        return None
+    lo_i = int(lo)
+    series = []
+    for key in sorted(state["days"]):
+        if key < day_key:
+            continue
+        bucket = state["days"][key]
+        day_at = int(bucket["at"])
+        if (day_at - lo_i) % 86400:
+            return None
+        if step == 86400:
+            series.append(_series_output_bucket(bucket))
+            continue
+        hours = bucket.get("hours")
+        if hours is None:
+            # 这一天的小时格点不成立（见 _fold_usage_series 的午夜兜底）：
+            # 整个窗口退回整段扫描，不能只跳过这一天。
+            return None
+        for hour in sorted(hours, key=int):
+            sub = hours[hour]
+            if int(sub["at"]) != day_at + int(hour) * 3600:
+                return None
+            if (int(sub["at"]) - lo_i) % 3600:
+                return None
+            series.append(_series_output_bucket(sub))
+    # credit 历史：缓冲按 at 倒序稳定排序后取窗口内的前 50 条——与整段扫描
+    # 的选择逐条相同（见 _series_credit_push 的论证）。
+    credits = sorted(state["credits"], key=lambda item: item.get("at") or 0,
+                     reverse=True)
+    credits = [c for c in credits if (c.get("at") or 0) >= lo][:_SERIES_CREDITS_KEEP]
+    return {"ok": True, "realm": realm or "all",
+            "bucket_seconds": step, "since": lo, "until": hi,
+            "series": series, "credits": credits}
 
 
 def _top_models(bucket, top_n=KEY_MODEL_TOP_N):
@@ -2882,10 +3749,11 @@ def _compute_usage_analytics_uncached(realm=None, since=None, until=None):
         # all-time fold over again; the merge copies the two apart.
         win_maps = all_maps
     else:
-        # The all-time half is not re-folded: the windowed pass stops where
-        # the incremental fold stopped, so one page never mixes two reads.
-        win_maps = _scan_usage_analytics_window(realm, since, until, stop_at=offset,
-                                                pricing_on=pricing_on)
+        # The all-time half is not re-folded: the windowed half comes from
+        # the day buckets that fold advanced (or, failing that, from a pass
+        # that stops where that fold stopped), so one page never mixes two
+        # reads.
+        win_maps = _analytics_window(realm, since, until, offset, pricing_on)
     parts = _merge_analytics_halves(all_maps, win_maps)
     acct_map = parts["accts"]
     model_map = parts["models"]
@@ -2950,7 +3818,10 @@ _USAGE_CACHE_NAME = "usage-aggregate-cache.json"
 # v2：写盘不再排序（v1 用 sort_keys 写，加载回来所有 dict 变字母序，响应
 # 与冷启动逐字节不同）。键顺序算状态结构的一部分，所以旧文件必须整体作废
 # ——否则那份字母序会一直粘在内存里，直到日志尾部被重写才会被清掉。
-_USAGE_CACHE_SCHEMA = 2
+# v3：状态多了按日分桶（窗口半的增量）与时间序列的日/小时桶。载荷形状变了，
+# 旧文件同样整体作废：升级后第一次刷新做一次全量折叠（一次性代价，之后
+# checkpoint 照旧）——这正是把窗口半也变成增量的入场费。
+_USAGE_CACHE_SCHEMA = 3
 
 
 def _usage_cache_enabled():
@@ -3128,6 +3999,9 @@ _USAGE_CACHE_SNAPSHOT_NUMBERS = tuple(
 _USAGE_CACHE_SNAPSHOT_MAPS = ("cost_missing", "by_model", "by_model_realm", "by_model_acct")
 _USAGE_CACHE_ANALYTICS_NUMBERS = tuple(_new_analytics_stat().keys())
 _USAGE_CACHE_BUCKET_NUMBERS = ("requests", "cost_cny") + USAGE_FIELDS
+# 时间序列桶的数字字段（_new_series_bucket 的键，含 at）。从构造函数推导，
+# 与上面两条同一个道理：上游加字段时校验自动跟着收。
+_USAGE_CACHE_SERIES_NUMBERS = tuple(_new_series_bucket(0).keys())
 
 
 def _usage_cache_number(value):
@@ -3220,6 +4094,53 @@ def _usage_cache_models_ok(models):
     return True
 
 
+def _usage_cache_analytics_window_ok(maps):
+    """窗口形状的 analytics maps（日桶）：同一批表，装的是 window 那一半。
+
+    与 _usage_cache_analytics_ok 是两份形状，不能互相顶替：日桶只折窗口半，
+    少 all_time/all_models 两个键，用 all-time 的校验器会把整份 analytics
+    entry 拒掉（连它自己那份 all-time 也一起丢），窗口就退回整段扫描。
+    """
+    if not isinstance(maps, dict):
+        return False
+    if not _usage_cache_stat_ok(maps.get("summary")):
+        return False
+    accts, models, keys = maps.get("accts"), maps.get("models"), maps.get("keys")
+    if not isinstance(accts, dict) or not isinstance(models, dict) or not isinstance(keys, dict):
+        return False
+    for uid, entry in accts.items():
+        if not isinstance(uid, str) or not isinstance(entry, dict):
+            return False
+        for field in ("nickname", "realm", "domain"):
+            if not isinstance(entry.get(field), str):
+                return False
+        if not _usage_cache_stat_ok(entry.get("window")):
+            return False
+        if not _usage_cache_models_ok(entry.get("window_models")):
+            return False
+    for mid, entry in models.items():
+        if not isinstance(mid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("model"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("window")):
+            return False
+    for kid, entry in keys.items():
+        if not isinstance(kid, str) or not isinstance(entry, dict):
+            return False
+        if not isinstance(entry.get("key"), str):
+            return False
+        if not _usage_cache_stat_ok(entry.get("window")):
+            return False
+        if not _usage_cache_models_ok(entry.get("window_models")):
+            return False
+        if not _usage_cache_counts_ok(entry.get("realms")):
+            return False
+        if not _usage_cache_number(entry.get("last_at")):
+            return False
+    return True
+
+
 def _usage_cache_analytics_ok(maps):
     """analytics all-time maps：summary/accts/models/keys 四张表。"""
     if not isinstance(maps, dict):
@@ -3277,6 +4198,72 @@ def _usage_cache_buckets_ok(buckets):
                 return False
         if not _usage_cache_counts_ok(bucket.get("models")):
             return False
+    return True
+
+
+def _usage_cache_day_key_ok(key):
+    """日键必须是 "YYYY-MM-DD"：窗口与日桶的比较靠的就是这个形状。"""
+    return (isinstance(key, str) and len(key) == 10 and key[4] == "-"
+            and key[7] == "-")
+
+
+def _usage_cache_days_ok(days, floor, bucket_ok):
+    """按日分桶的表：{日键: 桶}，floor 是「对哪些天完整」的下界（日键或 None）。
+
+    桶的形状由调用方给（snapshot / analytics / 时间序列各一套），日键与
+    floor 的形状在这里统一校验：键不是日期的桶永远不会被窗口选中，但也说明
+    这份状态不是我们写出来的，直接拒绝更干净。
+    """
+    if not isinstance(days, dict):
+        return False
+    if floor is not None and not _usage_cache_day_key_ok(floor):
+        return False
+    for key, bucket in days.items():
+        if not _usage_cache_day_key_ok(key) or not bucket_ok(bucket):
+            return False
+    return True
+
+
+def _usage_cache_series_bucket_ok(bucket):
+    """时间序列桶：9 个数字；日桶还带 hours 子表（小时键是数字字符串）。
+
+    小时键写成字符串是 JSON 往返决定的（JSON 的对象键只能是字符串），折叠
+    侧因此从一开始就用 str(小时序号)，加载回来的状态与现折的状态形状一致。
+    """
+    if not isinstance(bucket, dict):
+        return False
+    for field in _USAGE_CACHE_SERIES_NUMBERS:
+        if not _usage_cache_number(bucket.get(field)):
+            return False
+    hours = bucket.get("hours")
+    if hours is None:
+        return True
+    if not isinstance(hours, dict):
+        return False
+    for hour, sub in hours.items():
+        if not (isinstance(hour, str) and hour.isdigit()):
+            return False
+        if not isinstance(sub, dict) or "hours" in sub:
+            return False
+        for field in _USAGE_CACHE_SERIES_NUMBERS:
+            if not _usage_cache_number(sub.get(field)):
+                return False
+    return True
+
+
+def _usage_cache_credits_ok(credits):
+    """credit 缓冲：{at, iso, model, account, credit, total_tokens} 的列表。"""
+    if not isinstance(credits, list):
+        return False
+    for item in credits:
+        if not isinstance(item, dict):
+            return False
+        for field in ("at", "credit", "total_tokens"):
+            if not _usage_cache_number(item.get(field)):
+                return False
+        for field in ("iso", "model", "account"):
+            if not isinstance(item.get(field), str):
+                return False
     return True
 
 
@@ -3388,8 +4375,13 @@ def _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
     snap = entry.get("snap")
     if not _usage_cache_snapshot_ok(snap):
         return False
+    days = entry.get("days")
+    floor = entry.get("days_floor")
+    if not _usage_cache_days_ok(days, floor, _usage_cache_snapshot_ok):
+        return False
     offset, tail = position
-    state.update({"snap": snap, "offset": offset, "tail": tail})
+    state.update({"snap": snap, "offset": offset, "tail": tail,
+                  "days": days, "days_floor": floor})
     _usage_cache_note_adopted("snapshot", offset)
     return True
 
@@ -3425,10 +4417,55 @@ def _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
     maps = entry.get("maps")
     if not _usage_cache_analytics_ok(maps):
         return False
+    days = entry.get("days")
+    floor = entry.get("days_floor")
+    if not _usage_cache_days_ok(days, floor, _usage_cache_analytics_window_ok):
+        return False
     offset, tail = position
-    state.update({"maps": maps, "offset": offset, "tail": tail})
+    state.update({"maps": maps, "offset": offset, "tail": tail,
+                  "days": days, "days_floor": floor})
     _usage_cache_note_adopted("analytics", offset)
     return True
+
+
+def _usage_cache_adopt_series(r, state, log_key, realm_inputs):
+    """时间序列状态的采用；这一份只有 realm 指纹（折叠不算价）。"""
+    entry = _usage_cache_take("series", r)
+    if entry is None:
+        return False
+    position = _usage_cache_position_ok(entry, log_key)
+    if position is None:
+        return False
+    realm_key = _realm_inputs_key(realm_inputs)
+    if realm_key is None or entry.get("realm_inputs") != realm_key:
+        return False
+    days = entry.get("days")
+    floor = entry.get("days_floor")
+    if not _usage_cache_days_ok(days, floor, _usage_cache_series_bucket_ok):
+        return False
+    max_at = entry.get("max_at")
+    if not _usage_cache_number(max_at):
+        return False
+    credits = entry.get("credits")
+    if not _usage_cache_credits_ok(credits):
+        return False
+    offset, tail = position
+    state.update({"days": days, "days_floor": floor, "max_at": max_at,
+                  "credits": credits, "offset": offset, "tail": tail})
+    _usage_cache_note_adopted("series", offset)
+    return True
+
+
+def _usage_cache_days_copy(days, copy_bucket):
+    """日桶表的深拷贝（序列化在锁外做，桶必须和活状态脱钩）。"""
+    return {key: copy_bucket(bucket) for key, bucket in (days or {}).items()}
+
+
+def _copy_series_day(bucket):
+    """一个时间序列日桶的深拷贝（含 hours 子表）。"""
+    copy = dict(bucket)
+    copy["hours"] = {h: dict(sub) for h, sub in (bucket.get("hours") or {}).items()}
+    return copy
 
 
 def _usage_cache_snapshot_entry(realm, state):
@@ -3442,14 +4479,24 @@ def _usage_cache_snapshot_entry(realm, state):
     if offset <= 0 or not isinstance(tail, bytes) or state.get("snap") is None:
         return None
     pricing_key = _pricing_inputs_key(state.get("pricing"))
-    realm_key = _realm_inputs_key(state.get("realm"))
+    realm_inputs = state.get("realm")
+    realm_key = _realm_inputs_key(realm_inputs)
     if pricing_key is None or realm_key is None:
+        return None
+    if not _realm_fold_reproducible(realm_inputs[1]):
+        # 这次折叠的归属冷进程复现不了（见 _realm_fold_reproducible）：写下去
+        # 会被按新归属当成有效。宁可这次不写，等池就绪/重载后再写。
         return None
     return {"realm": realm, "offset": offset,
             "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
             "pricing": pricing_key, "realm_inputs": realm_key,
             # 深拷贝在锁内做，序列化在锁外做（见 _usage_cache_collect）。
-            "snap": _copy_usage_snapshot(state["snap"])}
+            "snap": _copy_usage_snapshot(state["snap"]),
+            # 按日分桶的窗口半：与 all-time 半同一次扫描折出来的，位置也
+            # 跟着同一条 offset/tail 校验，不另设一套。
+            "days": _usage_cache_days_copy(state.get("days"),
+                                           _copy_usage_snapshot),
+            "days_floor": state.get("days_floor")}
 
 
 def _usage_cache_by_account_entry(state):
@@ -3473,25 +4520,54 @@ def _usage_cache_analytics_entry(realm, state):
     if offset <= 0 or not isinstance(tail, bytes):
         return None
     pricing_key = _pricing_inputs_key(state.get("pricing"))
-    realm_key = _realm_inputs_key(state.get("realm"))
+    realm_inputs = state.get("realm")
+    realm_key = _realm_inputs_key(realm_inputs)
     if pricing_key is None or realm_key is None:
         return None
+    if not _realm_fold_reproducible(realm_inputs[1]):
+        return None          # 同 snapshot：这次折叠的归属冷进程复现不了
     return {"realm": realm, "offset": offset,
             "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
             "pricing": pricing_key, "realm_inputs": realm_key,
-            "maps": _copy_analytics_all_time(state["maps"])}
+            "maps": _copy_analytics_all_time(state["maps"]),
+            "days": _usage_cache_days_copy(state.get("days"),
+                                           _copy_analytics_window_maps),
+            "days_floor": state.get("days_floor")}
+
+
+def _usage_cache_series_entry(realm, state):
+    """时间序列状态的 JSON 形态；同上，只写折叠成功过的。
+
+    这一份最大（日桶 + 24 小时子桶 × 保留天数），所以深拷贝只拷桶本身，
+    credit 缓冲是 dict 列表、直接浅拷外层。
+    """
+    offset = state.get("offset") or 0
+    tail = state.get("tail")
+    if offset <= 0 or not isinstance(tail, bytes):
+        return None
+    realm_key = _realm_inputs_key(state.get("realm"))
+    if realm_key is None:
+        return None
+    return {"realm": realm, "offset": offset,
+            "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
+            "realm_inputs": realm_key,
+            "days": _usage_cache_days_copy(state.get("days"), _copy_series_day),
+            "days_floor": state.get("days_floor"),
+            "max_at": state.get("max_at") or 0,
+            "credits": [dict(item) for item in (state.get("credits") or [])]}
 
 
 def _usage_cache_collect():
-    """逐把取三份状态，做锁外可序列化的深拷贝；返回 (payload, offsets) 或 None。
+    """逐把取四份状态，做锁外可序列化的深拷贝；返回 (payload, offsets) 或 None。
 
-    每份状态单独加锁、单独拷贝，三份之间不强求同一个瞬间：加载端对每份分别
+    每份状态单独加锁、单独拷贝，几份之间不强求同一个瞬间：加载端对每份分别
     校验 offset/tail/指纹，一份新一份旧也各自成立。锁是逐把拿、随即放开的，
     不存在嵌套——写盘路径不能制造「snapshot -> analytics」这样的锁序边。
     """
     snapshot_entries = []
     by_account_entries = []
     analytics_entries = []
+    series_entries = []
     offsets = {}
     with _usage_snap_state_lock:
         for realm, state in _usage_snap_state.items():
@@ -3510,11 +4586,18 @@ def _usage_cache_collect():
             if entry is not None:
                 analytics_entries.append(entry)
                 offsets["analytics"] = max(offsets.get("analytics", 0), state["offset"])
-    if not (snapshot_entries or by_account_entries or analytics_entries):
+    with _series_state_lock:
+        for realm, state in _series_state.items():
+            entry = _usage_cache_series_entry(realm, state)
+            if entry is not None:
+                series_entries.append(entry)
+                offsets["series"] = max(offsets.get("series", 0), state["offset"])
+    if not (snapshot_entries or by_account_entries or analytics_entries
+            or series_entries):
         return None
     payload = {"schema": _USAGE_CACHE_SCHEMA, "written_at": time.time(),
                "snapshot": snapshot_entries, "by_account": by_account_entries,
-               "analytics": analytics_entries}
+               "analytics": analytics_entries, "series": series_entries}
     return payload, offsets
 
 
@@ -3649,7 +4732,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.6.17",
+        "version": "1.6.19",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -5763,15 +6846,94 @@ def is_transient(exc):
     return any(m in t for m in markers)
 
 
-def rate_limit_is_account_level(detail, reset_at):
-    """True when a 429 is a soft account limit rather than a model park.
+# The shapes the upstream uses for a rate limit. A body naming one is a soft
+# limit; it still says nothing about scope, so the caller decides that from the
+# reset clock (one model), from credential wording (the account), or - when
+# neither is present - from repetition, and then only on one model.
+SOFT_LIMIT_MARKERS = ("usage exceeds frequency limit", "too many requests",
+                      "请求过于频繁")
+SOFT_LIMIT_CODES = (14003,)     # intl, observed on a real 429
 
-    The upstream names a reset wall clock for the model-scoped form (code
-    6004, "usage exceeds frequency limit"). A 429 without one is a soft
-    limit on the credential, which gets an exponential account cooldown
-    instead of parking just one model.
+# Wording that scopes a 429 to the credential itself. These are matched as whole
+# words or explicit phrases, never as bare substrings: a 429 body carries
+# metadata such as "accountId", "account_id" or "credentialId", and a substring
+# test reads those field names as a scope statement and hands the credential the
+# 10m -> 2h ladder. Provisional: no captured body has shown yet what a genuine
+# account-level 429 says, so the list stays short and fails towards the narrow
+# model window.
+ACCOUNT_SCOPE_PHRASES = (
+    "account-level", "account level", "account-wide", "account scope",
+    "account quota", "account rate limit", "account limit",
+    "per account", "per-account", "this account", "your account",
+    "the account", "an account",
+    "credential-level", "credential level", "credential scope",
+    "credential limit", "per credential", "this credential",
+    "the credential", "your credential",
+    "账号级", "账户级", "该账号", "此账号", "该账户", "此账户",
+    "账号限流", "账户限流", "凭证级", "该凭证",
+)
+
+
+def credential_scope_phrase(detail):
+    """The scope phrase the body uses, or None when it names no scope.
+
+    ASCII phrases are anchored on word boundaries, so an identifier like
+    `accountId` cannot satisfy one. The Chinese phrases are plain substrings:
+    they have no word boundary to anchor to and cannot occur inside an
+    identifier.
     """
-    return reset_at is None
+    lowered = (detail or "").lower()
+    for phrase in ACCOUNT_SCOPE_PHRASES:
+        if phrase.isascii():
+            if re.search(r"\b%s\b" % re.escape(phrase), lowered):
+                return phrase
+        elif phrase in lowered:
+            return phrase
+    return None
+
+
+def rate_limit_code(detail):
+    """The `code` field of a JSON 429 body, or None when it is not JSON."""
+    try:
+        obj = json.loads(detail)
+    except Exception:
+        return None
+    return obj.get("code") if isinstance(obj, dict) else None
+
+
+def rate_limit_is_soft_shape(detail):
+    """True when a 429 body names a rate limit, whatever its scope.
+
+    Both shapes the incident environment produced are covered: the bare "usage
+    exceeds frequency limit" body (229 of the 263 recorded 429s) and the intl
+    code 14003 body ("too many requests"). Recognising them is what lets the
+    caller answer with a window on one model rather than on the credential.
+    """
+    text = (detail or "").lower()
+    if any(marker in text for marker in SOFT_LIMIT_MARKERS):
+        return True
+    return rate_limit_code(detail) in SOFT_LIMIT_CODES
+
+
+def rate_limit_is_account_level(detail, reset_at):
+    """True only with positive evidence that the 429 is credential-scoped.
+
+    The model-scoped form names a reset wall clock (code 6004). Treating the
+    *absence* of one as account scope made every 429 without a timestamp - which
+    includes the most common body the upstream sends - buy the whole credential
+    a 600s cooldown doubling to 7200s, so a handful of them left every account of
+    a realm cooling at once while a panel test kept reporting the credential
+    healthy. Absence is evidence of nothing: the credential is parked only when
+    the body itself says the limit is on the credential; everything else gets a
+    window on one model, decided by the caller.
+
+    Provisional: the phrase list is short because no captured body has shown yet
+    what a genuine account-level 429 looks like, so it is meant to be re-checked
+    against one rather than grown speculatively.
+    """
+    if reset_at is not None:
+        return False
+    return credential_scope_phrase(detail) is not None
 
 
 def parse_rate_limit_reset(detail):
@@ -5940,15 +7102,27 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 reset_at = parse_rate_limit_reset(detail)
                 if rate_limit_is_account_level(detail, reset_at):
                     wait = account.note_soft_rate("HTTP 429 (account soft rate)")
-                    log("account %s soft-rate limited, cooling %.0fs (streak %d)"
-                        % (account.uid[:8], wait, account.soft_streak))
+                    log("account %s soft-rate limited (%r), cooling %.0fs (streak %d)"
+                        % (account.uid[:8], credential_scope_phrase(detail), wait,
+                           account.soft_streak))
                     if session_key and POOL:
                         POOL.affinity.unbind(session_key)
                     last_error = exc
                     last_429 = exc
                     last_429_detail = detail
                     continue
+                # No reset clock, so nothing here says whether the limit is on
+                # the credential or on one model. For a recognised soft-limit
+                # shape the repetition is the evidence: the window goes on this
+                # model and grows on the short ladder (60s up to 10m) instead of
+                # the credential's 600s -> 2h one. An unrecognised body gets the
+                # same 60s on one model, with no streak at all.
                 wait = max(1.0, reset_at - time.time()) if reset_at else 60.0
+                if reset_at is None and rate_limit_is_soft_shape(detail):
+                    wait = account.note_unscoped_rate(model)
+                    log("account %s: unscoped 429, parking '%s' for %.0fs "
+                        "(unscoped streak %d)"
+                        % (account.uid[:8], model, wait, account.unscoped_streak))
                 # Model-scoped: only this model is throttled for this account,
                 # so sibling models stay serviceable on the same credential.
                 account.note_error("HTTP 429 (model throttled)", model=model, until=reset_at,
@@ -6032,8 +7206,12 @@ def open_upstream(payload, session_key=None, target_realm=None):
             if is_transient(exc):
                 transient_hits += 1
                 account.note_unknown_failure("connection: %s" % type(exc).__name__)
-                log("upstream connection hiccup for '%s' (%s), retrying (degrade=%d)"
-                    % (model, type(exc).__name__, account.degrade_count))
+                # 带上 UID：这一行同时是一次扣分（连续 3 次就把账号熔断 30
+                # 分钟），不写清楚是谁挨的这一下，事后只能看着一串 hiccup 猜
+                # 是哪几个账号被关掉、池子为什么突然空了。
+                log("account %s: upstream connection hiccup for '%s' (%s), "
+                    "retrying (degrade=%d)"
+                    % (account.uid[:8], model, type(exc).__name__, account.degrade_count))
                 last_error = exc
                 time.sleep(min(0.6 * transient_hits, 2.0))
                 continue
@@ -6083,8 +7261,38 @@ def open_upstream(payload, session_key=None, target_realm=None):
                   % (model, wb_settings.model_daily_token_limit(ACCOUNTS_DIR, realm)))
         raise RateLimited(None, reason,
                           wait=seconds_until_local_midnight(), message=reason)
-    raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, "
-                       f"cooling down, expired or parked by the daily token limit")
+    raise RuntimeError("no usable account for realm '%s': all are disabled, cooling down, "
+                       "expired or parked by the daily token limit%s"
+                       % (realm, pool_unavailable_detail(realm, model)))
+
+def pool_unavailable_detail(realm, model=None):
+    """把该区域每个账号不可用的原因拼成一句，附在「没有可用账号」后面。
+
+    这句话以前只列了四种可能（停用 / 冷却 / 过期 / 日限额），而 v1.6.16 之后
+    账号还会被熔断与降权窗口挡住——恰好这两种一个字都没提。于是生产上出现过
+    一场很难解释的报错：上游成片丢连接，几个账号各连踩 3 次触发 30 分钟熔断，
+    池子瞬间空掉、请求 11ms 就回 503，而看板上那些账号仍然显示「可用」，
+    排查的人只能对着「明明有 9 个账号」的池子猜。
+
+    这里不改变判定，只把判定结果说出来：每个不可用账号「八位 UID + 原因」。
+    """
+    if POOL is None:
+        return ""
+    accounts = [a for a in POOL.accounts if a.realm == realm]
+    if not accounts:
+        return "；该区域没有任何账号"
+    reasons = []
+    for account in accounts:
+        try:
+            reason = account.unavailable_reason(model=model)
+        except Exception:
+            reason = ""
+        if reason:
+            reasons.append("%s %s" % ((account.uid or "?")[:8], reason))
+    if not reasons:
+        return ""
+    return "；各账号：%s" % "，".join(reasons)
+
 def extract_session_key(headers, payload):
     key = (
         headers.get("X-Conversation-Id") or
@@ -8311,11 +9519,38 @@ def _if_none_match_hit(header_value, etag):
     return False
 
 
+def _cache_etag(kind, key, built_at):
+    """给带 TTL 缓存的只读接口派生一个强校验符（ETag）。
+
+    由 (接口名, 缓存键, 缓存条目的构建时刻) 三者派生，**不是**对响应字节做哈希：
+
+      - 构建时刻在两次重建之间是恒定的，所以"数字没变"的轮询回 304；缓存一重建
+        它必然变化，客户端立刻拿到新数据。哈希响应字节恰好相反——payload 里有
+        time.time() 派生的字段（/usage 的 started/since、/usage/timeseries 的
+        桶边界与 until），同一份缓存被序列化两次都不逐字节相同，tag 会永远不命中，
+        每次轮询照样重传 10~100KB，还白搭一次全量序列化 + 哈希的 CPU。
+      - (键, 时刻) 都是现成的，一次 sha1 只哈希几十字节的键文本；哈希整个响应体
+        则要先把 JSON 序列化出来，在 5 秒一轮的热路径上反而更贵。
+
+    键文本进摘要而不是直接拼进 tag：缓存键里含调用方给的 realm，它可能带引号 /
+    反斜杠（`?realm=a"b` 一路原样进键），拼出来会发出一个畸形的 ETag 头；摘要
+    则永远是合法的 etagc 字符。摘要只取 16 个十六进制位：它只需要在"同一实例的
+    少量缓存条目"之间区分，不是安全边界。
+    """
+    stamp = "%x" % int(built_at * 1_000_000)
+    digest = hashlib.sha1(("%s\x1f%s" % (kind, key)).encode("utf-8")).hexdigest()[:16]
+    return '"%s-%s"' % (stamp, digest)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # Which configured API key the caller used, set by _key_ok(). Its bound
     # realm decides the upstream exit for this request alone.
     key_entry = None
+    # 本次 _json() 响应要附带的校验符（由 _json_cached() 设置）。放成实例属性
+    # 而不是参数，是因为测试里大量 Handler 桩只覆写了 _json(code, obj) 这两个
+    # 位置参数——加参数会让它们全部报错，而属性默认 None 对它们完全无感。
+    _json_etag = None
     # The stdlib default caps the request line at 64KB and answers an opaque
     # bare "414 Request-URI Too Long" for anything longer. Raise it and reply in
     # the normal JSON error shape so an over-long URL is diagnosable.
@@ -8327,6 +9562,9 @@ class Handler(BaseHTTPRequestHandler):
         # it inherited the realm binding of whatever API key used the connection
         # before it - sending that request to the wrong upstream exit.
         self.key_entry = None
+        # 校验符同理：留着上一轮的 tag，下一次 _json() 就会把别的请求的 ETag
+        # 发出去（keep-alive 上同一个 Handler 实例服务一整条连接）。
+        self._json_etag = None
         # Body-tracking state must also start clean for every request, otherwise
         # a later drain would skip a body that has not been read yet.
         self._body_consumed = False
@@ -8378,7 +9616,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.6.17"
+    server_version = "wb-proxy/1.6.19"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -8400,6 +9638,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # 只有 _json_cached() 覆盖的只读接口才有校验符；其余调用点保持原样，
+        # 一个头都不多发。
+        etag = self._json_etag
+        if etag is not None:
+            # no-cache 而不是 no-store：允许浏览器存一份，但每次使用前必须回源
+            # 校验。配合 ETag，校验命中就是一次 304（无 body），而不是重传
+            # 10~100KB 的 JSON；no-store 会让浏览器连存都不存，条件请求无从谈起。
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("ETag", etag)
         # self.path is unset when parse_request() never ran (an over-long
         # request line is rejected before it), so fall back to "".
         if cors_origin_allowed(getattr(self, "path", "") or ""):
@@ -8414,6 +9661,57 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             self.close_connection = True
+    def _json_cached(self, code, data_fn, etag_fn):
+        """带 TTL 缓存的只读接口：_json() + 条件请求（命中 If-None-Match 回 304）。
+
+        data_fn() 取数、etag_fn() 取"当前缓存条目的校验符"，两者在这里配对调用，
+        而且是**取数前后各取一次戳**：只有两次相同，才敢把这个 tag 发出去。这个
+        相等就是"这份响应体确实出自该 tag 所描述的那条缓存条目"的证明——
+
+          - 两次读取之间若发生了一次重建，戳就会变，于是这一次不发校验符，走普通
+            200；客户端下一轮就重新同步（下一轮取数前取到的就是新条目的戳，前后
+            一致，tag 生效）。代价是每次重建后多一次全量响应，换来的是绝不会发出
+            一个不描述本次响应体的 tag。
+          - 反过来（先取数、后取戳）才有真问题：拿到的是新条目的戳配旧条目的数据，
+            客户端会带着这个 tag 回来，命中 304，于是把过期数字一直显示到下一次
+            重建为止。
+
+        两个可调用对象都无参，参数由调用方用闭包带上；顺序由这里保证，调用方不
+        必（也不该）自己拼这个顺序。任何解析/取值异常都退化成"没有校验符"的普通
+        200，绝不让响应路径崩掉。
+        """
+        try:
+            before = etag_fn()
+        except Exception:
+            before = None
+        data = data_fn()
+        try:
+            after = etag_fn()
+        except Exception:
+            after = None
+        etag = after if (after is not None and after == before) else None
+        if etag is not None:
+            try:
+                inm = self.headers.get("If-None-Match")
+            except Exception:
+                # 没有 headers 对象（测试桩 / 未走 parse_request）时按不匹配处理。
+                inm = None
+            if inm is not None and _if_none_match_hit(inm, etag):
+                # 304 不带 body，也不带 Content-Length：RFC 7230 §3.3.3 规定 304
+                # 在空行处结束，再报一个全量长度反而会诱使客户端 / 代理去等一个
+                # 永远不会来的 body。校验符和 Cache-Control 必须原样重发
+                # （RFC 7232 §4.1），否则缓存会丢掉状态、下次又整份重取。
+                self.send_response(304)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
+            self._json_etag = etag
+        try:
+            return self._json(code, data)
+        finally:
+            # 无论 _json() 是否抛异常，都不能把这次请求的 tag 留给下一次。
+            self._json_etag = None
     def _discard_body(self):
         """Drain the request body so the connection stays in sync.
 
@@ -8940,8 +10238,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
         req_range, req_since, req_until = range_query(query)
-        return self._json(200, usage_snapshot(realm=req_realm, range=req_range,
-                                              since=req_since, until=req_until))
+        # 取数与取校验符必须看到同一套参数（否则 tag 落到另一条缓存条目上），
+        # 但"先取戳、再取数、再取一次戳"的配对顺序由 _json_cached 保证。
+        return self._json_cached(
+            200,
+            lambda: usage_snapshot(realm=req_realm, range=req_range,
+                                   since=req_since, until=req_until),
+            lambda: usage_snapshot_etag(realm=req_realm, range=req_range,
+                                        since=req_since, until=req_until))
 
     def _get_usage_recent(self, query):
         if not self._authorized():
@@ -9085,13 +10389,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         req_realm = query.get("realm", [None])[0] or None
         req_range, req_since, req_until = range_query(query)
-        return self._json(200, compute_usage_analytics(realm=req_realm, range=req_range,
-                                                       since=req_since, until=req_until))
+        return self._json_cached(
+            200,
+            lambda: compute_usage_analytics(realm=req_realm, range=req_range,
+                                            since=req_since, until=req_until),
+            lambda: usage_analytics_etag(realm=req_realm, range=req_range,
+                                         since=req_since, until=req_until))
 
     def _get_usage_by_account(self):
         if not self._authorized():
             return
-        return self._json(200, {"accounts": usage_by_account()})
+        return self._json_cached(200,
+                                 lambda: {"accounts": usage_by_account()},
+                                 usage_by_account_etag)
 
     def _get_usage_timeseries(self, query):
         if not self._authorized():
@@ -9104,9 +10414,14 @@ class Handler(BaseHTTPRequestHandler):
             bucket_seconds = int(bucket) if bucket else None
         except (TypeError, ValueError):
             bucket_seconds = None
-        return self._json(200, usage_timeseries(
-            realm=req_realm, range=req_range, since=req_since,
-            until=req_until, bucket_seconds=bucket_seconds))
+        return self._json_cached(
+            200,
+            lambda: usage_timeseries(realm=req_realm, range=req_range,
+                                     since=req_since, until=req_until,
+                                     bucket_seconds=bucket_seconds),
+            lambda: usage_timeseries_etag(realm=req_realm, range=req_range,
+                                          since=req_since, until=req_until,
+                                          bucket_seconds=bucket_seconds))
 
     def _get_usage_perf(self, query):
         if not self._authorized():
@@ -9117,8 +10432,12 @@ class Handler(BaseHTTPRequestHandler):
             sample = 5000
         req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
         req_range, req_since, req_until = range_query(query)
-        return self._json(200, perf_stats(sample, realm=req_realm, range=req_range,
-                                          since=req_since, until=req_until))
+        return self._json_cached(
+            200,
+            lambda: perf_stats(sample, realm=req_realm, range=req_range,
+                               since=req_since, until=req_until),
+            lambda: perf_stats_etag(sample, realm=req_realm, range=req_range,
+                                    since=req_since, until=req_until))
 
     def _get_tasks(self, query):
         if not self._authorized():
@@ -10555,7 +11874,14 @@ class Handler(BaseHTTPRequestHandler):
                 reply_text = (msg.get("content") or msg.get("reasoning_content") or "OK").strip()
                 if len(reply_text) > 80:
                     reply_text = reply_text[:77] + "..."
-                account.clear_error()
+                # A served request, so it takes the semantic success path. That
+                # clears the account-level streak/breaker/degrade counters, which
+                # clear_error() never touched: a green panel test used to leave
+                # soft_streak standing, and the next 429 resumed the ladder from
+                # it. Only the tested model's cooldown is dropped here - sibling
+                # models keep theirs, and a 402 balance park keeps its own lift
+                # path (revive_balance_cooldown on a credits refresh).
+                account.note_success(model=test_model)
                 log(f"account test: uid={account.uid[:8]} model={test_model} wall={wall_ms}ms ok=True", tag="accounts")
                 return self._json(200, {
                     "ok": True,
@@ -11356,7 +12682,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, result)
 
 def running_version():
-    """The version this process reports, e.g. "1.6.17".
+    """The version this process reports, e.g. "1.6.19".
 
     tests/_test_release_engineering.py pins the two version literals and asserts
     they agree, so the update checker reads the running one from the handler

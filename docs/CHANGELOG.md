@@ -2,6 +2,56 @@
 
 已发布版本的完整记录；开发中的改动先记在 [README](../README.md) 的「版本更新记录」段，发版时整理成新版本号移到这里。
 
+## v1.6.19
+
+看板细节打磨与发布自动化：工具栏文案与顺序重排、页面头部与区块标题样式统一、用量卡片字号配色对齐、隐藏冗余按钮；发布侧改由 tag 触发自动打包并开 Draft Release，另修好猫猫旅行的 Buddy 误判：
+
+- **猫猫旅行不再误判「没有 Buddy」**（[PR #235](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/235)，感谢 [@ayeaaaa](https://github.com/ayeaaaa)）：`travel/status` 的 `buddy_id` 是**当前旅行实例**的 id，猫在家（idle）时恒为 0，之前拿它判断「有没有 Buddy」，于是所有 idle 账号（包括早就领过 Buddy 的）点旅行都会被挡下。现在以 `depart` 返回的 400 `no active buddy` 为准：先直接派，确实缺 Buddy 才完成并领取 `first_buddy`（其奖励就是 Buddy 实例）后重试一次，其余失败原样透出上游提示。
+
+- **页面头部结构统一**：「网关与账号」页补上标题 + 一行说明（原来直接从卡片开始），并给「网关设置」补上同款说明行（原来只有标题）——五个页面现在都是「16px 深色标题 + 12px 灰字说明」。新标题不在 `<section>` 里，所以不会变成侧栏「本页导航」项；英文与正體中文词条同步补上。
+
+- **顶部页签顺序调整**：改成「网关与账号 → 数据看板 → 智能体配置 → 设置 → 运行日志」，把运行日志放最后、设置放倒数第二；`MAIN_TABS` 与启动脚本里那份 `TABS` 同步按新顺序排列（两处注释本来就要求与导航顺序一致）。
+
+- **「账号列表」折叠开关的焦点态改柔和**：原来聚焦时是贴着文字画的 2px 蓝色实线描边（用 Tab 键盘走到它时特别扎眼），现在换成淡蓝底 + 1.5px 细描边的胶囊高亮，圆角也跟面板统一成 8px；按钮 padding 与负 margin 成对，聚焦与否标题文字都不位移。
+
+- **区块标题样式统一**：数据看板的「Token 时序」「积分扣减历史」两个**区块**标题原来写成了 16px 深色（那是页面标题那一档的样式），跟同页其他区块标题（13px、`--dim`、大写 + `.6px` 字距）不一致，现在拉回统一样式。页面标题（网关设置 / 智能体配置 / 网关运行日志 / Token 消耗与推理指标透视）仍保持 16px 深色这一档，两级层次不变。
+
+- **网关页三张用量卡片对齐字号与配色**：`估算价格` 的数值原来写死 18px，比旁边两张卡的 22px 小一号，现在统一到 22px；中间的 `/` 分隔符与「网关调用量」的 `次` 单位统一成 13px、`--dim` 色、左右 4px；价格的红绿改用主题变量（`--bad` / `--accent2`）而不是写死色值，深色主题下跟着变，而且与「请求成功率」的绿是同一个绿。`fmtCostBoth` 的分隔符字号改为随数值字号缩放（22px→13px，数据看板那张 14px 的卡仍是 10px，观感不变）。
+
+- **账号工具栏文案精简，账号行补「出站身份：」标签**：`+ 添加账号 (OAuth) → 添加`、`扫描桌面客户端账号 → 扫描桌面客户端`、`导入账号 → 导入`、`导出账号 → 导出`、`刷新积分 → 一键刷新积分`、`分配代理出口给未绑定账号 → 一键分配代理`（`一键刷新凭证` 不变）；账号行操作列里 WB / VSC / CLI 三个按钮前面加上「出站身份：」，不用再看表格下面那行图例才知道它们是什么。英文与正體中文词条同步补上。
+
+- **账号工具栏按钮按用途重排**：添加账号 → 扫描桌面客户端账号 → 导入账号 → 导出账号 → 刷新积分 → 一键刷新凭证 → 每日签到 / 每日活跃打卡 → 分配代理出口给未绑定账号 → 全部启用 / 全部停用（原来打卡按钮夹在添加账号与扫描之间、导出在导入之前）；四组之间用一条浅色竖线（`.toolbar-sep`）分开，换行时分隔线跟着它后面那组走。
+
+- **面板隐藏「网页通道打卡 (国际版)」按钮**：网页通道那一步已经由设置里的「国际版每日活跃打卡」自动带在「每日活跃打卡」里，单独那个按钮不再上屏（手动补跑走 `/accounts/daily-chat-web`）。按钮元素留在 DOM 里但始终 `display:none`，要放回面板时去掉它并恢复 `updateUI()` 里的按视图显隐即可。
+
+- **tag 触发的发布打包与 Draft Release（issue #28）**：`v*` tag 现在由 `.github/workflows/release.yml` 一条链路走完——校验 tag / `wb_proxy.py` / `wrt` 包 Makefile 三处版本一致，拿到**完整测试矩阵**（Ubuntu 3.9 + Ubuntu 3.12 + Windows 3.12，腿名从 `tests.yml` 读出来逐条核对）后，构建便携 ZIP、OpenWrt `.ipk` 与 `.apk`，按最终资产生成 `SHA256SUMS`，最后创建或更新 **Draft Release**。工作流永不 publish，最后一步还会断言它仍是 draft。便携 ZIP 是**绿色包**：在 `windows-latest` 上按「既有线上包那份运行时的文件集合」裁剪钉死并校验 sha256 的上游 CPython 3.12 运行时（527 个文件），打进 `wb-proxy/python/`，然后用包内解释器**真的启动一次网关并探通 `/health`**，所以资产不是被换了名字的源码包。包内 `release-manifest.json` 记录版本、`root`、`python/` 运行时子树与受保护目录 `accounts/`、`usage/`，作为自更新（#29）的消费契约；`release/portable.txt` 的显式清单同时补上了 `pricing/pricing.json` 这类运行时数据（`wb_pricing._candidate_file()` 优先读它）。OpenWrt 配方来自 #190 引用的 `aodianjun/workbuddy2api-hub/wrt/`，审计后并入：保留 `.ipk`/`.apk` 两个打包脚本、包 Makefile、init.d、uci 配置与面板缓存预热器；去掉 fork 专属的 GitHub 自更新器（`workbuddy2api-update` 及其 cron、`auto_update` 选项——OpenWrt 升级走包管理器）、fork 的工作流激活脚本与上游同步工作流，以及钉死上游 commit 的 `PIN_SHA`/`PIN_VER`（配方进了上游仓库后"从 GitHub 拉另一个 commit 的上游源码"没有意义，版本改为取自当前检出）。`-ci` 演练 tag 走完全相同的打包与 draft 流程，只是额外标成 prerelease。**只有 `v*` tag 推送能写 release**：`workflow_dispatch` 是 packaging-only，写入点单独放在一个 `if:` 为「事件是 push 且 ref 是 `refs/tags/v*`」的 job 里，手动运行的任何输入组合都够不到它（因此手动运行也不再有 `dry_run` 开关）。新增 `tests/_test_release_assets.py`（60 项）：清单覆盖每个 `wb_*.py` 与 `pricing/pricing.json`、清单路径都存在且不含受保护目录、运行时裁剪规则与启动契约（缺 `python.exe`／混进 `Lib/multiprocessing`／残留 `.pdb` 都必须被拒）、ZIP 结构（`wb-proxy/` + `python/` + 标记文件）与"不是源码包"、重建逐字节相同、`SHA256SUMS` 覆盖每个资产且随字节变化、正文重写幂等且保留维护者写在标记之上的说明、矩阵腿名确实来自 `tests.yml`（删一条腿就会少一条要求）、工作流必须 `--draft`、便携资产必须在 Windows 上打包并启动、任何写 release 的路径都必须拿到完整矩阵，以及**「只有 tag 推送能到写入点」这条不变量本身**。后者配了一张命令形态表：`gh release create/edit/upload/delete`、显式 `-X/--method POST|PATCH|PUT|DELETE`、以及**靠 `-f`/`-F`/`--field`/`--raw-field`/`--input` 触发隐式 POST 的 `gh api`** 都算写，显式 `-X GET`/`--method GET` 与 `echo` 出来的命令不算；扫描前先归一化 `\` 续行，并按 `&&`/`||`/`;` 切分，所以被拆开的命令也跑不掉。变异测试常驻：把写入点搬到 dispatch 路径、塞进别的 job、改成单行 `run:`、用隐式 POST 的 `gh api` 建 release、给 `workflow_dispatch` 加一个可能授权写入的输入、或抹掉全部写入点，检查器都必须判红。
+
+## v1.6.18
+
+看板体验与性能版本：侧栏区块导航回归、账号区可折叠、用量聚合全面提速，并新增智能体配置页、账号活跃历史与更新检查：
+
+- **侧栏区块导航回归**：每个主页面左侧恢复「本页导航」——导航项按页面内的 section 现场生成、滚动自动高亮、点击把锚点写进地址栏；新增「回到顶部」与可收起（收起状态存 localStorage，窄屏下自动变横向胶囊行），#169 把首行撑高的布局缺陷一并修掉（页面内容包一层 `.page-nav-body`，区块间距回到 20px）；
+- **账号区可折叠**（[PR #201](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/201)、[PR #226](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/226)，感谢 [@teddyli18000](https://github.com/teddyli18000)，issue #176）：「账号列表」标题旁的小三角把整块账号区收起，选择存在服务端（`accounts_collapsed`），换浏览器、重启服务都记得，账号轮询照常跑；
+- **数据看板 KPI 拆分与双币金额**：六张卡拆成八张——「平均首字延迟」从生成速度卡里独立出来（耗时留在速度卡），「请求数 & 成功率」拆成两张（成功率按有无失败染绿/琥珀）；「API 等价花费」不再挂货币切换按钮，改成与网关页一致的 `￥0.197 / $0.028`（人民币红、美元绿）；去掉「当前为『全部历史』视图，两张卡片口径相同」那句提示；
+- **页签与区块改名**：页签「网关与运维 → 网关与账号」「数据指标看板 → 数据看板」，标题「WorkBuddy 网关看板 → WorkBuddy 网关」；设置页区块「API Key 与出口绑定 → API Key」「代理槽 → 账号代理槽」「限额 → 账号限额」「OpenRouter 价估算 → 模型价格估算」「429 自动切换出站身分 → 自动切换出站身份」「本地网络工具 (web_search / web_fetch) → 本地网络工具」；网关页「账号 → 账号列表」「当前禁用账号与模型 → 当前禁用」「当前版本模型库与能力清单 → 网关模型清单」。导航项由区块 h2 现场生成，侧栏与页内小标题两处同步；
+- **网关页用量卡片标出区域**：`网关调用量` / `估算价格` / `请求成功率` 的数字本来就按当前视图区域取（`/usage` 等接口带 `realm`），标题补上「（国际版）/（国内版）」跟着区域卡片切换；
+- **正體中文（台灣）介面**（[PR #204](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/204)，感谢 [@Cekxri](https://github.com/Cekxri)）：看板語言從「简体中文 ⇄ English」擴充為三態循環「简 → 繁 → English」。正體中文以 OpenCC 台灣用語轉換（軟體、網路、記憶體、預設、登入、帳號…），切回簡中時還原原文。語言偏好採三層優先序：URL `?lang=` > 瀏覽器 `localStorage` 覆蓋 > 實例預設值；网关设置里可保存實例預設語言，右上角按钮只覆蓋当前浏览器。新增 `tests/_test_i18n_traditional.js`（39 项）与 `tests/_test_ui_language.py`（13 项）；
+- **智能体配置页**（[PR #219](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/219)，感谢 [@2xz7vmvpv4-art](https://github.com/2xz7vmvpv4-art)）：探测本机已装的 Claude Code / Codex CLI / OpenCode / DSH / Crush，一键把它们的配置指向本网关（改前自动备份、可字节级还原、外部改动可感知），只碰本机配置文件，不参与请求路径；
+- **账号签到与每日活跃历史**（[PR #206](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/206)，感谢 [@teddyli18000](https://github.com/teddyli18000)）：签到与活跃打卡结果落库，新增 `GET /activity/history` 读接口；
+- **新版本检查**（[PR #207](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/207)，感谢 [@teddyli18000](https://github.com/teddyli18000)）：面板可发现上游新版本，默认关闭，开启后每天最多查一次 GitHub；
+- **OAuth 授权链接一键复制**（[PR #222](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/222)，感谢 [@AstrosQ](https://github.com/AstrosQ)）：添加账号弹窗里的官方授权链接可直接复制；
+- **用量聚合全面提速**（[PR #223](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/223)、[PR #189](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/189)，感谢 [@aodianjun](https://github.com/aodianjun)）：折叠循环重构（一行只读一次字段、不再每行造默认字典）、聚合扫描不再构造悬停明细、总开关整扫只问一次；整表重建改为增量——只折日志尾部新增的行，并把聚合状态连同位置写进数据目录，重启后从 checkpoint 续读，不再冷扫全量日志；
+- **面板静态页 ETag + 304**（[PR #224](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/224)，感谢 [@aodianjun](https://github.com/aodianjun)）：首页从 `no-store` 改成 `no-cache` + `ETag`（文件 mtime/size 与注入语言一起算进校验符），命中条件请求回 304，不再每次重下 400KB；
+- **修复 cn 区 429 中文重置时间被当成账号级冷却**（[PR #221](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/221)，感谢 [@LeoK77S](https://github.com/LeoK77S)）：`reset at …` 之外补上「将在 … 重置」文案，解析不出 reset 时间的 429 不再退化成整账号 2 小时冷却；
+- **账号被熔断 / 降权时，看板与报错都会说清楚是谁、卡在哪一条**（[PR #228](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/228)，感谢 [@shuishuipingan](https://github.com/shuishuipingan)）：账号卡片新增「熔断 Xm」「降权 Xm」徽章（熔断优先于冷却展示），「当前禁用总览」把熔断与降权各列一行；新增 `Account.unavailable_reason()`，把「哪个账号、卡在哪一条」拼到那条 503 后面；上游连接抖动的日志行补上账号 UID。新增 `tests/_test_pool_diagnostics.py`（13 项）与 `tests/_test_account_penalty_badges.js`（18 项）；
+- **修复国内版成长任务全部接取失败与猫猫旅行 400**（[PR #217](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/217)，感谢 [@ayeaaaa](https://github.com/ayeaaaa)）：满足 `first_buddy` 前置链；
+- **修复 web 工具可被重定向到私网**（[PR #212](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/212)，感谢 [@AstrosQ](https://github.com/AstrosQ)）：跳转目标同样过 URL 白名单，环回 / 私网 / 链路本地地址直接拒绝；
+- **修复 `/pricing` 未要求面板会话**（[PR #210](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/210)，感谢 [@teddyli18000](https://github.com/teddyli18000)）：管理面接口的鉴权边界与其它管理路由对齐；
+- **修复「当前禁用」汇总跨区域串台**（[PR #215](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/215)，感谢 [@teddyli18000](https://github.com/teddyli18000)）；
+- **修复输出上限探针默认端口**（[PR #205](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/205)，感谢 [@Cekxri](https://github.com/Cekxri)）：改回 8788；
+- **测试基建与测试质量**（[PR #195](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/195)、[#196](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/196)、[#197](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/197)、[#198](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/198)、[#200](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/200)、[#202](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/202)、[#208](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/208)、[#209](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/209)、[#213](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/213)、[#214](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/214)、[#216](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/216)、[#218](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/218)、[#220](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/220)、[#225](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/225)、[#227](https://github.com/ardeyouxipianyi/workbuddy2api-hub/pull/227)，感谢 [@teddyli18000](https://github.com/teddyli18000)）：套件弄脏检出时 CI 直接失败、隔离数据目录与进程生命周期统一抽取、页面源码走同一个 helper、把脆弱的文案与列数断言换成行为断言；
+- **文档**：README 的版本历史拆到本文件，README 只留 Unreleased 段与入口（issue #193）。
+
 ## v1.6.17
 
 重磅生态兼容与架构演进版本：正式支持 Claude Code、修复 API Key 误覆盖、引入临期积分优先分派机制，并实现测试基础设施多进程并行加速：

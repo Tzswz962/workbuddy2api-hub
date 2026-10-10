@@ -379,8 +379,16 @@ def next_local_4am(now=None):
 # credential that keeps failing hard trips a breaker; unknown failures degrade
 # it for a while. The counters live on Account, these helpers only turn a
 # count into seconds (panel project's pool semantics).
-SOFT_RATE_BASE = 600.0          # first account-level 429: 10 minutes
+SOFT_RATE_BASE = 600.0          # first verified account-level 429: 10 minutes
 SOFT_RATE_MAX = 7200.0          # ... doubling up to 2 hours
+# An *unscoped* 429 - the body names no reset clock, so nothing in it says
+# whether the limit is on the credential or on one model - buys a window on that
+# one model instead, shorter and capped at the credential ladder's first tier.
+# The bare "usage exceeds frequency limit" body is the most common 429 the
+# upstream sends (229 of the 263 in the incident environment), so it must not be
+# able to park a credential for two hours.
+SOFT_RATE_UNVERIFIED_BASE = 60.0
+SOFT_RATE_UNVERIFIED_MAX = 600.0
 BREAKER_THRESHOLD = 3           # consecutive hard failures before the breaker
 BREAKER_COOLDOWN = 1800.0       # first breaker window: 30 minutes
 BREAKER_COOLDOWN_MAX = 21600.0  # ... doubling up to 6 hours
@@ -398,6 +406,16 @@ def _exponential_backoff(count, base, cap, offset):
 def soft_backoff(streak):
     """Cooldown seconds for `streak` consecutive account-level soft limits."""
     return _exponential_backoff(streak, SOFT_RATE_BASE, SOFT_RATE_MAX, 1)
+
+
+def unverified_soft_backoff(streak):
+    """Cooldown for `streak` consecutive *unscoped* soft limits, on one model.
+
+    Repetition still escalates, but from 60s and only up to the credential
+    ladder's first tier (600s) - see SOFT_RATE_UNVERIFIED_MAX.
+    """
+    return _exponential_backoff(streak, SOFT_RATE_UNVERIFIED_BASE,
+                                SOFT_RATE_UNVERIFIED_MAX, 1)
 
 
 def breaker_backoff(fails):
@@ -484,6 +502,9 @@ class Account(object):
         # All runtime-only, like the other throttle windows: a restart clears
         # them and the account gets a clean slate.
         self.soft_streak = 0
+        # Unscoped soft 429s keep their own counter: the two ladders must not
+        # feed each other (see note_unscoped_rate).
+        self.unscoped_streak = 0
         self.fails = 0
         self.degrade_count = 0
         self.breaker_until = 0.0
@@ -618,6 +639,7 @@ class Account(object):
             "cooldownFor": round(max(0.0, deadline - now)) or None,
             "modelCooldowns": models,
             "softStreak": int(self.soft_streak),
+            "unscopedStreak": int(self.unscoped_streak),
             "breakerFor": round(max(0.0, self.breaker_until - now)) or None,
             "degradeFor": round(max(0.0, self.degrade_until - now)) or None,
             "addedAt": self.added_at,
@@ -856,6 +878,43 @@ class Account(object):
             if self.model_token_limit_blocked(mid):
                 out.add(mid)
         return out
+
+    def unavailable_reason(self, model=None):
+        """这个账号此刻为什么接不了单；可用时返回空字符串。
+
+        `ready()` 是个布尔判断：池子被抽干的时候它只能说「不行」，说不清有几个
+        账号、各自卡在哪一条。生产上出现「明明有 9 个账号却报没有可用账号」时，
+        缺的就是这句话——判定顺序与 ready() 保持一致，所以报出来的原因就是它
+        拒绝的原因（唯一不覆盖的是临期凭证那条：它会真的发起刷新，诊断路径上
+        不该顺带打上游）。
+        """
+        if not self.enabled:
+            return "已停用"
+        if not self.access_token:
+            return "无凭证"
+        now = time.time()
+        # 四种惩罚的到期时间各走各的，谁把时间推得最远就报谁：只报「冷却」
+        # 会让人往 429 的方向查，而实际可能是上游连续断连触发的熔断（30 分钟
+        # 起，与账号本身无关），或者余额保护这类完全不同的原因。
+        penalties = [("熔断", self.breaker_until), ("降权", self.degrade_until),
+                     ("余额保护", self.balance_until), ("软限流冷却", self.cooldown_until)]
+        if model:
+            penalties.append(("模型 %s 冷却" % model, self.model_cooldowns.get(model, 0.0)))
+        label, until = max(penalties, key=lambda item: item[1])
+        if until > now:
+            return "%s 剩余 %s" % (label, _human_delta(until - now) or "?")
+        if self.reserve_blocked():
+            return "余额低于保留线"
+        if self.daily_limit_blocked():
+            return "今日 Token 额度用尽"
+        if self.credit_limit_blocked(model):
+            return "今日积分额度用尽"
+        if self.model_token_limit_blocked(model):
+            return "该模型今日额度用尽"
+        exp = self.expires_at or jwt_exp(self.access_token)
+        if exp and exp - now <= 120:
+            return "凭证已过期"
+        return ""
 
     def ready(self, model=None):
         if not self.enabled or not self.access_token:
@@ -1752,6 +1811,20 @@ class Account(object):
             self.cooldown_until = max(self.cooldown_until, time.time() + wait)
         return wait
 
+    def note_unscoped_rate(self, model):
+        """An unscoped soft 429: grow its own streak, return this model's window.
+
+        Counting is deliberately separate from soft_streak. Sharing one counter
+        let the ladders feed each other: four unscoped 429s pushed the first
+        genuinely credential-scoped one straight to the 7200s ceiling instead of
+        starting at 600s, and a credential streak made the next unscoped window
+        start high as well. Each scope now has its own count, and a served
+        request clears both through note_success().
+        """
+        with self._throttle_lock:
+            self.unscoped_streak += 1
+            return unverified_soft_backoff(self.unscoped_streak)
+
     def note_failure(self, message):
         """5xx / transport failure: feed the breaker counter."""
         with self._throttle_lock:
@@ -1783,6 +1856,7 @@ class Account(object):
             if model:
                 self.model_cooldowns.pop(model, None)
             self.soft_streak = 0
+            self.unscoped_streak = 0
             self.fails = 0
             self.degrade_count = 0
             self.breaker_until = 0.0

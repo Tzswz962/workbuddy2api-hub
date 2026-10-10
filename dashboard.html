@@ -118,8 +118,10 @@ tbody tr:hover{background:var(--panel2)}
    列表猜一个 max-height（账号一多就会被截断）。hoverTip 是挂在 body 上的
    全局单例，不受这里的 overflow 影响。 */
 .disclosure{display:inline-flex;align-items:center;gap:7px;background:transparent;
-  border:none;padding:0;margin:0;font:inherit;color:inherit;cursor:pointer;border-radius:6px}
-.disclosure:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  border:none;padding:3px 7px;margin:-3px -7px;font:inherit;color:inherit;cursor:pointer;border-radius:8px}
+/* 焦点态给一个柔和的胶囊高亮（淡蓝底 + 细描边），而不是贴着字画一圈硬描边。
+   padding 与 margin 成对出现，聚焦时标题文字的位置不会动。 */
+.disclosure:focus-visible{outline:none;background:var(--accent-soft);box-shadow:0 0 0 1.5px var(--accent)}
 .disclosure-chevron{width:0;height:0;border-left:5px solid currentColor;
   border-top:4px solid transparent;border-bottom:4px solid transparent;
   transition:transform .18s ease;transform:rotate(90deg)}
@@ -172,6 +174,8 @@ body.pricing-off #kpiCostCard{display:none}
 .legend{display:flex;gap:16px;color:var(--dim);font-size:11px;margin-top:12px;flex-wrap:wrap}
 .legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:middle}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+/* 工具栏按用途分组：组与组之间一条浅色竖线（窄屏换行时它跟着按钮走，不会掉队） */
+.toolbar-sep{width:1px;align-self:stretch;min-height:20px;background:var(--line);margin:0 2px;border-radius:1px}
 button{cursor:pointer;font:inherit;font-size:12px;font-weight:500;padding:6px 14px;border-radius:8px;
   border:1px solid var(--accent);background:var(--accent);color:#fff;box-shadow:var(--shadow-sm);transition:all .15s ease}
 button:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
@@ -184,6 +188,7 @@ button.mini{padding:3px 9px;font-size:11px}
 .id-btn-group{display:inline-flex;gap:2px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:1px}
 .id-btn{background:transparent;border:none;color:var(--dim);padding:2px 6px;border-radius:4px;font-size:11px;font-weight:500;cursor:pointer;transition:all .15s}
 .id-btn:hover{color:var(--fg)}
+.id-btn-label{color:var(--dim);font-size:11px;white-space:nowrap}
 .id-btn.active{background:var(--accent);color:#fff;font-weight:600;box-shadow:var(--shadow-sm)}
 .slot-select{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
   padding:5px 8px;color:var(--fg);font:inherit;font-size:12px;max-width:140px}
@@ -651,7 +656,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   };
 
   // 3. Tab 初始化（与下方主脚本的 MAIN_TABS 保持一致）
-  var TABS = ['gateway','analytics','logs','settings','agents'];
+  var TABS = ['gateway','analytics','agents','settings','logs'];
   var pick = null;
   try {
     var q = new URLSearchParams(location.search).get('tab');
@@ -703,6 +708,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '+ 添加 API Key': '+ Add API Key',
     '+ 添加槽位': '+ Add slot',
     '+ 添加账号 (OAuth)': '+ Add account (OAuth)',
+    '添加': 'Add',
     '0 个 Key': '0 keys',
     '0 个 Key 生效': '0 keys active',
     '0 次': '0 calls',
@@ -841,7 +847,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '出口绑定': 'Exit binding',
     '出站身份：WB = WorkBuddy 独立桌面客户端（默认），VSC = 官方 VSCode 插件，CLI = 官方 CodeBuddy CLI；三者对应不同的出站指纹与配额通道。': 'Outbound identity: WB = WorkBuddy standalone desktop client (default), VSC = official VSCode extension, CLI = official CodeBuddy CLI; the three use different outbound fingerprints and quota channels.',
     '出站身份：默认 WorkBuddy 桌面端 (WB) / 官方 VSCode 插件 (VSC) / 官方 CodeBuddy CLI (CLI)': 'Outbound identity: default WorkBuddy desktop (WB) / official VSCode extension (VSC) / official CodeBuddy CLI (CLI)',
+    '出站身份：': 'Outbound identity:',
     '分配代理出口给未绑定账号': 'Assign proxy exits to unbound accounts',
+    '一键分配代理': 'Assign proxy exits',
     '分钟': 'minutes',
     '分钟)': 'min)',
     '分钟取一次价': 'minutes per price fetch',
@@ -870,6 +878,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '刷新完成:': 'Refresh finished:',
     '刷新明细': 'Refresh details',
     '刷新积分': 'Refresh credits',
+    '一键刷新积分': 'Refresh all credits',
     '刷新积分失败:': 'Refreshing credits failed:',
     '刷新间隔（分钟）': 'Fetch interval (minutes)',
     '剥掉的后缀：': 'Stripped suffix:',
@@ -914,11 +923,13 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '固定国内版出口': 'China exit only',
     '固定国际版出口': 'Global exit only',
     '国内版': 'China',
+    '（国内版）': '(China)',
     '国内版 (China)': 'China',
     '国内版 (China) · copilot.tencent.com': 'China · copilot.tencent.com',
     '国内版成长任务与日常福利': 'China growth tasks and daily perks',
     '国家未知': 'Country unknown',
     '国际版': 'Global',
+    '（国际版）': '(Global)',
     '国际版 (Global)': 'Global',
     '国际版 (Global) · www.workbuddy.ai': 'Global · www.workbuddy.ai',
     '国际版每日活跃打卡': 'Global daily activity check-in',
@@ -1074,6 +1085,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '扫描中...': 'Scanning...',
     '扫描失败:': 'Scan failed:',
     '扫描桌面客户端账号': 'Scan for desktop client accounts',
+    '扫描桌面客户端': 'Scan desktop client',
     '批量操作失败:': 'Batch operation failed:',
     '把 Key 没有绑定出口，它的积分由国际版与国内版两套价格相加而来，只能当量级看。': 'keys have no exit bound; their credits add the Global and China price sets together, so treat them as a rough magnitude only.',
     '把)': ')',
@@ -1325,11 +1337,13 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '编辑': 'Edit',
     '编辑 API Key': 'Edit API key',
     '网关与账号': 'Gateway & accounts',
+    '管理账号池与代理出口，查看当日调用量、估算花费、成功率、最近请求与网关模型清单。': 'Manage the account pool and proxy exits; review call volume, estimated cost, success rate, recent requests and the gateway model list.',
     '网关实时目录里新增的模型，上游新上架的名字无需改代码就会进入下一轮取价；两次取价之间就被调用的新模型，第一笔请求即按内存里的目录': 'models newly added to the live catalog of the gateway; names upstream has just listed enter the next price fetch with no code change, and a new model called between two fetches is',
     '网关平均生成速度': 'Gateway average generation speed',
     '网关日志已清空': 'Gateway logs cleared',
     '网关每隔这段时间去 OpenRouter 取一次价：每个模型每份不同的价格存成一条': 'The gateway fetches prices from OpenRouter every so often: each distinct price set of a model is stored as one',
     '网关设置': 'Gateway settings',
+    '面板密码与界面语言、API Key 与出口绑定、代理槽与限额、价格估算、出站身份与本地网络工具。': 'Panel password and UI language, API Keys and exit binding, proxy slots and quotas, price estimation, outbound identity and local web tools.',
     '估算价格': 'Estimated cost',
     '估算价格（国内版）': 'Estimated cost (China)',
     '估算价格（国际版）': 'Estimated cost (Global)',
@@ -1608,6 +1622,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "+ 添加 API Key": "+ 新增 API Key",
     "+ 添加槽位": "+ 新增槽位",
     "+ 添加账号 (OAuth)": "+ 新增帳號 (OAuth)",
+    "添加": "新增",
     "API Key 不能为空": "API Key 不能為空",
     "API Key 与出口绑定": "API Key 與出口繫結",
     "GitHub 项目仓库": "GitHub 專案倉庫",
@@ -1671,7 +1686,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "出口绑定": "出口繫結",
     "出站身份：WB = WorkBuddy 独立桌面客户端（默认），VSC = 官方 VSCode 插件，CLI = 官方 CodeBuddy CLI；三者对应不同的出站指纹与配额通道。": "出站身份：WB = WorkBuddy 獨立桌面客戶端（預設），VSC = 官方 VSCode 外掛，CLI = 官方 CodeBuddy CLI；三者對應不同的出站指紋與配額通道。",
     "出站身份：默认 WorkBuddy 桌面端 (WB) / 官方 VSCode 插件 (VSC) / 官方 CodeBuddy CLI (CLI)": "出站身份：預設 WorkBuddy 桌面端 (WB) / 官方 VSCode 外掛 (VSC) / 官方 CodeBuddy CLI (CLI)",
+    "出站身份：": "出站身份：",
     "分配代理出口给未绑定账号": "分配代理出口給未繫結帳號",
+    "一键分配代理": "一鍵分配代理",
     "分钟": "分鐘",
     "分钟)": "分鐘)",
     "分钟取一次价": "分鐘取一次價",
@@ -1692,6 +1709,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "刷新完成: ": "重新整理完成: ",
     "刷新明细": "重新整理明細",
     "刷新积分": "重新整理積分",
+    "一键刷新积分": "一鍵重新整理積分",
     "刷新积分失败:": "重新整理積分失敗:",
     "刷新积分失败: ": "重新整理積分失敗: ",
     "刷新间隔（分钟）": "重新整理間隔（分鐘）",
@@ -1814,6 +1832,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "所有已启用账号都已绑定代理出口": "所有已啟用帳號都已繫結代理出口",
     "手填的映射存在数据目录的 pricing-overrides.json（不改源码），登记后立即触发一次取价；留空提交即删除该映射。候选只是字面相似度建议，不自动采用。": "手填的對映存在資料目錄的 pricing-overrides.json（不改原始碼），登記後立即觸發一次取價；留空提交即刪除該對映。候選只是字面相似度建議，不自動採用。",
     "扫描桌面客户端账号": "掃描桌面客戶端帳號",
+    "扫描桌面客户端": "掃描桌面客戶端",
     "批量操作失败:": "批次操作失敗:",
     "批量操作失败: ": "批次操作失敗: ",
     "把 Key 没有绑定出口，它的积分由国际版与国内版两套价格相加而来，只能当量级看。": "把 Key 沒有繫結出口，它的積分由國際版與國內版兩套價格相加而來，只能當量級看。",
@@ -1927,7 +1946,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "网关平均生成速度": "閘道平均生成速度",
     "网关日志已清空": "閘道日誌已清空",
     "网关每隔这段时间去 OpenRouter 取一次价：每个模型每份不同的价格存成一条": "閘道每隔這段時間去 OpenRouter 取一次價：每個模型每份不同的價格存成一條",
+    "管理账号池与代理出口，查看当日调用量、估算花费、成功率、最近请求与网关模型清单。": "管理帳號池與代理出口，查看當日呼叫量、估算花費、成功率、最近請求與閘道模型清單。",
     "网关设置": "閘道設定",
+    "面板密码与界面语言、API Key 与出口绑定、代理槽与限额、价格估算、出站身份与本地网络工具。": "面板密碼與介面語言、API Key 與出口繫結、代理槽與限額、價格估算、出站身份與本地網路工具。",
     "网关调用量": "閘道呼叫量",
     "网关运行日志": "閘道執行日誌",
     "网关默认上游已切换并永久保存为:": "閘道預設上游已切換並永久儲存為:",
@@ -2522,14 +2543,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <button class="main-nav-btn" id="btnNavAnalytics" onclick="switchMainTab('analytics')">
         数据看板
       </button>
-      <button class="main-nav-btn" id="btnNavLogs" onclick="switchMainTab('logs')">
-        运行日志
+      <button class="main-nav-btn" id="btnNavAgents" onclick="switchMainTab('agents')">
+        智能体配置
       </button>
       <button class="main-nav-btn" id="btnNavSettings" onclick="switchMainTab('settings')">
         设置
       </button>
-      <button class="main-nav-btn" id="btnNavAgents" onclick="switchMainTab('agents')">
-        智能体配置
+      <button class="main-nav-btn" id="btnNavLogs" onclick="switchMainTab('logs')">
+        运行日志
       </button>
     </nav>
     <a class="gh-link" href="https://github.com/ardeyouxipianyi/workbuddy2api-hub" target="_blank" rel="noopener noreferrer"
@@ -2596,6 +2617,11 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 </div>
 <main>
   <div id="pageGateway" class="main-page">
+  <!-- 页面头部：标题 + 一行说明，与另外四个页面的头部结构保持一致 -->
+  <div style="margin-bottom:16px">
+    <h2 style="margin:0;font-size:16px;color:var(--fg)">网关与账号</h2>
+    <div style="font-size:12px;color:var(--dim);margin-top:4px">管理账号池与代理出口，查看当日调用量、估算花费、成功率、最近请求与网关模型清单。</div>
+  </div>
   <!-- 版本中枢控制栏 (三列等高对齐网格) -->
   <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-bottom:18px">
     
@@ -2681,19 +2707,26 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <div id="accountsBody" class="collapse">
       <div class="collapse-inner">
     <div class="toolbar">
-    <button onclick="openLoginModal()">+ 添加账号 (OAuth)</button>
-    <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">每日签到 (国内版)</button>
-      <button class="sec" id="btnDailyChat" onclick="doDailyChat(this)" style="display:none">每日活跃打卡 (国际版)</button>
-      <button class="sec" id="btnDailyChatWeb" onclick="doDailyChatWeb(this)" style="display:none">网页通道打卡 (国际版)</button>
+    <button onclick="openLoginModal()">添加</button>
     <!-- 桌面客户端自 2026-09-24 起把 token 改成加密存储（$wbEncrypted 信封）。
          网关现在会从正在运行的桌面端进程内存里回收静态密钥来解密（只读、密钥
          只留在内存里，实现见 wb_atrest.py），所以这个入口重新放出来。 -->
-    <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描桌面客户端账号</button>
-    <button class="sec" onclick="exportAccounts(this)">导出账号</button>
-    <button class="sec" onclick="openImport()">导入账号</button>
-    <button class="sec" onclick="fetchCredits(this)">刷新积分</button>
+    <button class="sec" id="btnScanDesktop" onclick="scanDesktop(this)">扫描桌面客户端</button>
+    <button class="sec" onclick="openImport()">导入</button>
+    <button class="sec" onclick="exportAccounts(this)">导出</button>
+    <span class="toolbar-sep" aria-hidden="true"></span>
+    <button class="sec" onclick="fetchCredits(this)">一键刷新积分</button>
     <button class="sec" onclick="refreshAccounts(this)" title="逐个刷新所有账号的上游访问凭证（相当于对每个账号点一次「刷新凭证」）">一键刷新凭证</button>
-    <button class="sec" onclick="autoAssignSlots()" title="把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响">分配代理出口给未绑定账号</button>
+    <span class="toolbar-sep" aria-hidden="true"></span>
+    <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">每日签到 (国内版)</button>
+    <button class="sec" id="btnDailyChat" onclick="doDailyChat(this)" style="display:none">每日活跃打卡 (国际版)</button>
+    <!-- 网页通道打卡按钮不再上屏（2026-10-10 起）：网页通道那一步已经由设置里的
+         「国际版每日活跃打卡」自动带在「每日活跃打卡」里，手动补跑走
+         /accounts/daily-chat-web 即可。要放回面板：去掉下面的 display:none，
+         并在 updateUI() 里恢复它按视图显隐。 -->
+    <button class="sec" id="btnDailyChatWeb" onclick="doDailyChatWeb(this)" style="display:none">网页通道打卡 (国际版)</button>
+    <span class="toolbar-sep" aria-hidden="true"></span>
+    <button class="sec" onclick="autoAssignSlots()" title="把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响">一键分配代理</button>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
     
@@ -2707,7 +2740,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
        数据全部取自 /accounts（window.ACCOUNTS），不额外发请求。 -->
   <section>
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
-      <h2 style="margin:0">当前禁用 <em id="disabledCount"></em></h2>
+      <h2 style="margin:0">当前禁用<em id="disabledRealmTag" style="color:var(--dim);font-weight:500"></em><em id="disabledCount"></em></h2>
       <div class="legend" style="margin:0"><span>「上游限流」到点自动恢复；「本地停用」需手动启用；「日限额」次日零点恢复</span></div>
     </div>
     <div id="disabledList"></div>
@@ -2718,7 +2751,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 
   <section>
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
-      <h2 style="margin:0">最近请求 <em id="recentCount"></em></h2>
+      <h2 style="margin:0">最近请求<em id="recentRealmTag" style="color:var(--dim);font-weight:500"></em><em id="recentCount"></em></h2>
       <div style="display:inline-flex;align-items:center;gap:8px">
         <span style="font-size:12px;color:var(--dim)">显示条数:</span>
         <div style="display:inline-flex;gap:3px;background:var(--panel2);padding:3px;border-radius:8px;border:1px solid var(--line)">
@@ -2743,7 +2776,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   <!-- 版本模型库与能力清单 -->
   <section>
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-      <h2 style="margin:0">网关模型清单 <em id="availModelCount"></em></h2>
+      <h2 style="margin:0">网关模型清单<em id="modelsRealmTag" style="color:var(--dim);font-weight:500"></em><em id="availModelCount"></em></h2>
       <div style="font-size:12px;color:var(--dim)">展示当前视图下官方对话大模型、上下文容量、推理/视觉能力及在售倍率</div>
     </div>
     <div style="overflow-x:auto">
@@ -2878,7 +2911,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <section style="margin-bottom:20px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px">
         <div>
-          <h2 style="margin:0;font-size:16px;color:var(--fg)">Token 时序 <em id="usageSeriesRange" style="font-style:normal;color:var(--dim);font-size:12px"></em></h2>
+          <h2 style="margin:0">Token 时序 <em id="usageSeriesRange" style="font-style:normal;color:var(--dim);font-size:12px"></em></h2>
           <div style="font-size:12px;color:var(--dim)">按当前范围自动选择分钟/小时/天粒度；柱高为总 Token，折线为请求数。</div>
         </div>
         <div style="font-size:12px;color:var(--dim)" id="usageSeriesSummary">-</div>
@@ -2891,7 +2924,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <section style="margin-bottom:20px">
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px">
         <div>
-          <h2 style="margin:0;font-size:16px;color:var(--fg)">积分扣减历史</h2>
+          <h2 style="margin:0">积分扣减历史</h2>
           <div style="font-size:12px;color:var(--dim)">当前范围内最近消耗积分（credit &gt; 0）的请求。</div>
         </div>
         <button class="sec mini" onclick="loadCreditHistory(this)">刷新</button>
@@ -2991,6 +3024,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   <div id="pageSettings" class="main-page">
     <div style="margin-bottom:16px">
       <h2 style="margin:0;font-size:16px;color:var(--fg)">网关设置</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">面板密码与界面语言、API Key 与出口绑定、代理槽与限额、价格估算、出站身份与本地网络工具。</div>
     </div>
 
     <!-- 左侧导航由 initPageNav() 扫描本页的 section 自动生成，
@@ -3727,6 +3761,15 @@ function updateUI(){
   const vbCn = document.getElementById("tabCnViewBadge");
   if(vbCn) vbCn.style.display = !isIntlView ? "inline-block" : "none";
 
+  // 区块标题上的出口标签：这几个区块的内容都按当前视图区域取（账号、禁用汇总、
+  // 最近请求、模型清单），标出来免得把国际版的数字看成全局的。用 <em> 承载：
+  // 侧栏导航由 h2 生成时会剥掉 <em>，所以标签不会串进导航项。
+  const sectionRealm = isIntlView ? "（国际版）" : "（国内版）";
+  ["disabledRealmTag", "recentRealmTag", "modelsRealmTag"].forEach(function(id){
+    const el = document.getElementById(id);
+    if(el) el.textContent = sectionRealm;
+  });
+
   const isIntlGw = (window.ACTIVE_GATEWAY_REALM === "intl");
   const dbIntl = document.getElementById("tabIntlDefaultBadge");
   if(dbIntl) dbIntl.style.display = isIntlGw ? "inline-block" : "none";
@@ -3757,8 +3800,7 @@ function updateUI(){
   if(btnCheckin) btnCheckin.style.display = (window.VIEW_REALM === "cn" ? "inline-block" : "none");
   const btnDailyChat = document.getElementById("btnDailyChat");
   if(btnDailyChat) btnDailyChat.style.display = (window.VIEW_REALM === "intl" ? "inline-block" : "none");
-  const btnDailyChatWeb = document.getElementById("btnDailyChatWeb");
-  if(btnDailyChatWeb) btnDailyChatWeb.style.display = (window.VIEW_REALM === "intl" ? "inline-block" : "none");
+  // btnDailyChatWeb 不上屏（见按钮上的注释），所以这里不再按视图显隐它。
 
   // 计算当前绑定与生效的 Key 数量
   const keys = (typeof API_KEY_ROWS !== 'undefined' && API_KEY_ROWS.length) ? API_KEY_ROWS : (window.API_KEY_ROWS || []);
@@ -4251,15 +4293,19 @@ function fmtCost(cny){
   return fmtCostVal(n, costSymbol());
 }
 // size 是数值字号（默认 18px，网关页的卡片用）：KPI 卡片窄，调用方可以调小。
+// 中间那个「/」跟网关页「次」的处理保持一致：小一号、dim 色、左右各 4px。
+// 红/绿用主题变量而不是写死的色值：深色主题下要跟着变，而且旁边
+// 「请求成功率」的绿就是 --accent2，两张卡并排时是同一个绿。
 function fmtCostBoth(cny, size){
   if(cny == null || cny === '') return '—';
   const raw = Number(cny) || 0;
   const fs = size || 18;
+  const sep = Math.max(10, Math.round(fs * 0.6));
   const cnyStr = fmtCostVal(raw, '￥');
   const usdStr = fmtCostVal(raw / (costUsdRate || 7.1), '$');
-  return '<span style="color:#ef4444;font-size:' + fs + 'px;font-weight:700">' + cnyStr + '</span> ' +
-         '<span style="color:var(--dim);font-weight:400;font-size:' + (fs - 4) + 'px;margin:0 2px">/</span> ' +
-         '<span style="color:#22c55e;font-size:' + fs + 'px;font-weight:700">' + usdStr + '</span>';
+  return '<span style="color:var(--bad);font-size:' + fs + 'px;font-weight:700">' + cnyStr + '</span> ' +
+         '<span style="color:var(--dim);font-weight:500;font-size:' + sep + 'px;margin:0 4px">/</span> ' +
+         '<span style="color:var(--accent2);font-size:' + fs + 'px;font-weight:700">' + usdStr + '</span>';
 }
 function setCostCurrency(cur){
   costCurrency = (cur === 'USD') ? 'USD' : 'CNY';
@@ -4521,12 +4567,29 @@ function authHeaders(base){
   return h;
 }
 
-async function getJSON(url){
-  const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
+async function getJSON(url, opts){
+  // cache 模式分两档，按"响应体在服务端是否有一份 TTL 缓存"来选：
+  //
+  //  - 默认 no-store：不落盘、每次整份重取。登录轮询（/accounts/login/poll）、
+  //    密钥类读取（/settings/reveal）以及任何"写完之后立刻回读"都必须走这档。
+  //  - opts.revalidate（见 POLL_READ）：允许浏览器存一份、每次使用前回源校验。
+  //    用量那几个读接口在服务端带 _STATS_TTL 缓存，同一份缓存期间响应体逐字节
+  //    不变，服务端会发 ETag + Cache-Control: no-cache。no-cache 的语义正是
+  //    "可以存、每次使用前必须回源校验"，于是浏览器自动带上 If-None-Match：
+  //    数字没变就只回一个 304（无 body），省下 10~100KB 的重复传输。
+  //    这里绝不能写 no-store——那会让浏览器连副本都不存，条件请求无从谈起，
+  //    服务端的 ETag 也就永远用不上。
+  const cache = (opts && opts.revalidate) ? 'no-cache' : 'no-store';
+  const r = await fetch(url, {cache: cache, headers: authHeaders()});
   if(r.status === 401 || r.status === 403){ panelSessionLost(); throw new Error('unauthorized'); }
   if(!r.ok) throw new Error(r.status);
   return r.json();
 }
+// 轮询读取的 fetch 选项：这些接口的响应体由服务端的 TTL 缓存决定，同一份缓存
+// 期间不变，所以可以让浏览器存一份、每次回源校验（服务端 ETag 命中即 304）。
+// 只有真的会被轮询、且服务端确实发 ETag 的只读接口才用它；其余读取保持默认的
+// no-store，免得"顺手加上"之后把必须每次都新的响应也变成可缓存校验的。
+const POLL_READ = {revalidate: true};
 async function postJSON(url, body){
   const r = await fetch(url, {method:'POST', headers: authHeaders({'Content-Type':'application/json'}),
                               body: JSON.stringify(body || {})});
@@ -4586,6 +4649,14 @@ function fmtCoolAt(epoch){
   return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate())
     + ' ' + two(d.getHours()) + ':' + two(d.getMinutes());
 }
+// 徽章里放不下完整时间，折算成剩余量：45s / 29m / 2h05m。
+function fmtLeft(seconds){
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if(s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if(m < 60) return m + 'm';
+  return Math.floor(m / 60) + 'h' + String(m % 60).padStart(2, '0') + 'm';
+}
 function coolPills(a){
   const list = a && Array.isArray(a.modelCooldowns) ? a.modelCooldowns : [];
   const pills = list.map(c => {
@@ -4623,7 +4694,12 @@ function accountRow(a){
               : a.reserveBlocked ? '<span class="badge warn">保留积分</span>'
               : a.dailyLimitBlocked ? '<span class="badge warn" title="今日已用 ' + fmt(a.dailyTokensToday || 0) + ' / ' + fmt(a.dailyTokenLimit || 0) + ' token，暂停接单（本地 0 点恢复）">日限额</span>'
               : a.creditLimitReached ? '<span class="badge warn" title="今日已消费 ' + Number(a.dailyCreditsToday || 0).toFixed(2) + ' / ' + (a.dailyCreditLimit || 0) + ' 积分，仅免费模型可用（本地 0 点恢复）">积分限额</span>'
-              : a.inCooldown ? '<span class="badge warn">冷却 ' + (a.cooldownFor||0) + 's</span>'
+              // 熔断/降权也是"不接单"，但跟上游配额无关：上游连续失败把账号
+              // 关进本地保护窗口。少了这两支，账号会被画成绿色「可用」，而池子
+              // 其实是空的——生产上就是这么误导排查的。
+              : a.breakerFor ? '<span class="badge bad" title="上游连续失败触发熔断，本窗口内不接单；账号与凭证本身没问题，' + fmtLeft(a.breakerFor) + '后自动恢复">熔断 ' + fmtLeft(a.breakerFor) + '</span>'
+              : a.degradeFor ? '<span class="badge warn" title="连续未知失败进入降权窗口，' + fmtLeft(a.degradeFor) + '后恢复">降权 ' + fmtLeft(a.degradeFor) + '</span>'
+              : a.inCooldown ? '<span class="badge warn"' + (Number(a.softStreak || 0) > 1 ? ' title="连续软限流 ' + Number(a.softStreak) + ' 次，冷却时间按 2 倍递增"' : '') + '>冷却 ' + (a.cooldownFor||0) + 's</span>'
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
   const pills = coolPills(a);
@@ -4677,6 +4753,7 @@ function accountRow(a){
     +     '<button class="sec mini" onclick="syncProfile(&quot;' + uidAttr + '&quot;, this)" title="从 Web 控制台同步最新昵称（改名后免重登）">同步昵称</button>'
     +   '</div>'
     +   '<div class="acct-actions-row">'
+    +     '<span class="id-btn-label">出站身份：</span>'
     +     '<div class="id-btn-group" title="出站身份：默认 WorkBuddy 桌面端 (WB) / 官方 VSCode 插件 (VSC) / 官方 CodeBuddy CLI (CLI)">'
     +       '<button class="id-btn' + ((!a.product || a.product === 'workbuddy') ? ' active' : '') + '" onclick="setAccountProduct(&quot;' + uidAttr + '&quot;, &quot;workbuddy&quot;, this)">WB</button>'
     +       '<button class="id-btn' + (a.product === 'vscode' ? ' active' : '') + '" onclick="setAccountProduct(&quot;' + uidAttr + '&quot;, &quot;vscode&quot;, this)">VSC</button>'
@@ -4761,8 +4838,22 @@ function disabledRows(){
     }
     if(a.inCooldown){
       const secs = Number(a.cooldownFor || 0);
+      const streak = Number(a.softStreak || 0);
       rows.push({who, realm, scope: '账号', kind: '上游限流', detail,
-                 reason: a.lastError || '上游 429',
+                 reason: (a.lastError || '上游 429')
+                       + (streak > 1 ? '（连续软限流 ' + streak + ' 次，冷却按 2 倍递增）' : ''),
+                 until: secs > 0 ? fmtCoolAt(now + secs) : ''});
+    }
+    if(a.breakerFor){
+      const secs = Number(a.breakerFor || 0);
+      rows.push({who, realm, scope: '账号', kind: '熔断', detail,
+                 reason: '上游连续失败触发熔断，本窗口内不接单（账号与凭证本身没问题，恢复后可继续用）',
+                 until: secs > 0 ? fmtCoolAt(now + secs) : ''});
+    }
+    if(a.degradeFor){
+      const secs = Number(a.degradeFor || 0);
+      rows.push({who, realm, scope: '账号', kind: '降权', detail,
+                 reason: '连续未知失败进入降权窗口，优先级被压低',
                  until: secs > 0 ? fmtCoolAt(now + secs) : ''});
     }
     (Array.isArray(a.modelCooldowns) ? a.modelCooldowns : []).forEach(c => {
@@ -4806,7 +4897,7 @@ function renderDisabled(){
     box.innerHTML = '<div class="legend" style="margin:0"><span>当前没有禁用的账号或模型。</span></div>';
     return;
   }
-  const badge = k => k === '上游限流' ? 'warn' : (k === '本地停用' ? 'bad' : 's');
+  const badge = k => k === '上游限流' ? 'warn' : (k === '本地停用' || k === '熔断' ? 'bad' : 's');
   box.innerHTML = '<div class="table-wrap"><table class="data-cards"><thead><tr>'
     + '<th style="text-align:left">账号</th>'
     + '<th style="text-align:center;width:76px">版本</th>'
@@ -4872,7 +4963,7 @@ function renderAccounts(){
 
 async function loadAccounts(){
   try{
-    const [acct, byAcct] = await Promise.all([getJSON('/accounts?realm=all'), getJSON('/usage/by-account')]);
+    const [acct, byAcct] = await Promise.all([getJSON('/accounts?realm=all'), getJSON('/usage/by-account', POLL_READ)]);
     window.ACCOUNTS = acct.accounts || [];
     USAGE_BY_ACCOUNT = {};
     (byAcct.accounts || []).forEach(a => { USAGE_BY_ACCOUNT[a.account] = a; });
@@ -4904,7 +4995,7 @@ async function fetchCredits(btn){
   }catch(e){
     toast('刷新积分失败: ' + e.message, 'bad');
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '刷新积分'; }
+    if(btn){ btn.disabled = false; btn.textContent = '一键刷新积分'; }
   }
 }
 const queryCredits = fetchCredits;
@@ -5066,7 +5157,7 @@ async function exportAccounts(btn){
   }catch(e){
     toast('导出失败: ' + e.message, 'err');
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '导出账号'; }
+    if(btn){ btn.disabled = false; btn.textContent = '导出'; }
   }
 }
 
@@ -5215,7 +5306,7 @@ async function scanDesktop(btn){
     const body = document.getElementById('desktopScanBody');
     if(body) body.innerHTML = '<p class="hint" style="color:var(--warn)">扫描失败: ' + esc(e.message) + '</p>';
   }finally{
-    if(btn){ btn.disabled = false; btn.textContent = '扫描桌面客户端账号'; }
+    if(btn){ btn.disabled = false; btn.textContent = '扫描桌面客户端'; }
   }
 }
 
@@ -5858,9 +5949,11 @@ async function refreshInner(gen){
   let usage, recent, perf;
   try{
     [usage, recent, perf] = await Promise.all([
-      getJSON('/usage?realm=' + encodeURIComponent(window.VIEW_REALM)),
+      getJSON('/usage?realm=' + encodeURIComponent(window.VIEW_REALM), POLL_READ),
+      // /usage/recent 不在这里改成可校验：它没有服务端缓存，每次新请求都进榜，
+      // 响应体每轮都在变，服务端也就没有稳定的校验符可发——照旧整份重取。
       getJSON('/usage/recent?limit=' + RECENT_LIMIT + '&page=' + RECENT_PAGE + '&realm=' + encodeURIComponent(window.VIEW_REALM)),
-      getJSON('/usage/perf?realm=' + encodeURIComponent(window.VIEW_REALM)),
+      getJSON('/usage/perf?realm=' + encodeURIComponent(window.VIEW_REALM), POLL_READ),
     ]);
     // 取数期间又发起了更新的一轮（例如刚切了区域），这批结果已经过期，
     // 直接扔掉，交给排队的那一轮渲染，免得把旧区域的数字画上去。
@@ -5915,7 +6008,7 @@ async function refreshInner(gen){
   const realmTag = '（' + (window.VIEW_REALM === 'cn' ? '国内版' : '国际版') + '）';
   document.getElementById('cards').innerHTML =
     card('网关调用量' + realmTag, fmt(t.requests) + ' <span style="font-size:13px;font-weight:500;color:var(--dim);margin-left:4px">次</span>', '', '') +
-    card('估算价格' + realmTag, fmtCostBoth(t.cost_cny), '', 'warn') +
+    card('估算价格' + realmTag, fmtCostBoth(t.cost_cny, 22), '', 'warn') +
     card('请求成功率' + realmTag, '<span style="color:' + (perf.errors ? 'var(--warn)' : 'var(--accent2)') + '">' + succStr + '</span>', '', '');
 
   const total = recent.total || 0;
@@ -6003,6 +6096,17 @@ async function refreshInner(gen){
   await bootPanel();
 })();
 
+/* 侧栏尽早建：区块是静态标记，现场生成不依赖任何接口。原来只在
+   switchMainTab() 里建，而它排在启动链的末端——/panel/status、/settings、
+   /realm 三趟串行往返，再加 Promise.all 里那批数据加载（含走上游的
+   /v1/models 与国内版成长任务）之后才轮到，所以刷新时左侧要先空一列、
+   过一会儿才补上。这里在 DOMContentLoaded 就建（head 里那段已按 ?tab=
+   与上次选择定好 .active），switchMainTab() 那次会因清单未变直接返回，
+   不会重建、也不会闪。 */
+document.addEventListener('DOMContentLoaded', function(){
+  initPageNav(document.querySelector('.main-page.active'));
+});
+
 let RECENT_LIMIT = parseInt(localStorage.getItem('WB_RECENT_LIMIT') || '20', 10);
 if(![10, 20, 50, 100].includes(RECENT_LIMIT)) RECENT_LIMIT = 20;
 let RECENT_PAGE = 1;
@@ -6060,7 +6164,7 @@ function generatePageList(current, total){
 
 // Tab ids in nav order. One list so the restore path and the nav cannot
 // drift apart.
-const MAIN_TABS = ['gateway', 'analytics', 'logs', 'settings', 'agents'];
+const MAIN_TABS = ['gateway', 'analytics', 'agents', 'settings', 'logs'];
 const MAIN_TAB_STORE = 'wb-proxy-main-tab';
 let currentMainTab = 'gateway';
 let analyticsRange = 'today';
@@ -8436,8 +8540,8 @@ async function loadAnalyticsMatrix(){
   try{
       const q = analyticsQuery();
     const [usage, perf, models] = await Promise.all([
-      getJSON('/usage' + q),
-      getJSON('/usage/perf' + q),
+      getJSON('/usage' + q, POLL_READ),
+      getJSON('/usage/perf' + q, POLL_READ),
       // The catalog is only a display filter, so a failure here must not
       // blank the table; null keeps the previous allowlist.
       getJSON('/v1/models?realm=all').catch(() => null),
@@ -8775,7 +8879,7 @@ function renderPerfMatrix(usage, perf){
 async function loadAnalytics(){
   try {
     // 载荷永远按当前选中的窗口取，它的 window 桶就是第一列要展示的数字。
-    const data = await getJSON('/usage/analytics' + analyticsQuery());
+    const data = await getJSON('/usage/analytics' + analyticsQuery(), POLL_READ);
     renderAnalytics(data);
     loadUsageSeries();
   } catch(err) {
@@ -8784,7 +8888,7 @@ async function loadAnalytics(){
 }
 
 function loadUsageSeries(){
-  getJSON('/usage/timeseries' + analyticsQuery())
+  getJSON('/usage/timeseries' + analyticsQuery(), POLL_READ)
     .then(data => { renderUsageSeries(data); renderCreditHistory(data); })
     .catch(() => {});
 }
@@ -8853,7 +8957,7 @@ function renderUsageSeries(data){
 async function loadCreditHistory(btn){
   if(btn) btn.disabled = true;
   try{
-    const data = await getJSON('/usage/timeseries' + analyticsQuery());
+    const data = await getJSON('/usage/timeseries' + analyticsQuery(), POLL_READ);
     renderUsageSeries(data);
     renderCreditHistory(data);
     if(btn) toast('积分扣减历史已刷新', 'ok');

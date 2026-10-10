@@ -8,10 +8,12 @@ first_buddy 是 auto 类（不接受接取），它是其他任务与猫猫旅�
 旧流程把它当未接取任务跳过，于是 17 个任务全部 "prerequisite not met: first_buddy"，
 旅行也 400 "no active buddy"。
 """
+import io
 import json
 import os
 import sys
 import unittest
+import urllib.error
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -54,6 +56,11 @@ class _Resp(object):
 
     def __exit__(self, *a):
         return False
+
+
+def _http_error(url, code, body):
+    return urllib.error.HTTPError(url, code, "Bad Request", {},
+                                  io.BytesIO(body.encode("utf-8")))
 
 
 class GrowthPrereqTests(unittest.TestCase):
@@ -118,10 +125,17 @@ class GrowthPrereqTests(unittest.TestCase):
 
     def test_travel_without_buddy_is_friendly(self):
         calls = []
+        T.fetch_growth_tasks = lambda acc: []      # 没有 first_buddy，无法补齐前置
 
         def fake_urlopen(req, timeout=10, proxy=""):
             calls.append(req.full_url)
-            return _Resp({"code": 0, "data": {"state": "idle", "buddy_id": 0}})
+            if req.full_url.endswith("/travel/status"):
+                return _Resp({"code": 0, "data": {"state": "idle", "buddy_id": 0}})
+            if req.full_url.endswith("/travel/config"):
+                return _Resp({"code": 0, "data": {"locations": [{"id": 1, "name": "咖啡馆"}]}})
+            if req.full_url.endswith("/travel/depart"):
+                raise _http_error(req.full_url, 400, '{"code":400,"msg":"no active buddy"}')
+            return _Resp({"code": 0, "data": {}})
         orig = T._accounts.urlopen
         T._accounts.urlopen = fake_urlopen
         try:
@@ -130,15 +144,64 @@ class GrowthPrereqTests(unittest.TestCase):
             T._accounts.urlopen = orig
         self.assertFalse(res["ok"])
         self.assertIn("Buddy", res["msg"])
-        self.assertFalse(any("/depart" in u for u in calls), calls)
+        self.assertEqual(sum(1 for u in calls if "/depart" in u), 1, calls)
 
-    def test_travel_departs_when_buddy_exists(self):
+    def test_travel_completes_first_buddy_and_retries(self):
         calls = []
+        state = {"fb": "not_accepted", "departs": 0}
+
+        def fetch(acc):
+            return [_task("first_buddy", status=state["fb"],
+                          current=1 if state["fb"] != "not_accepted" else 0,
+                          target=1, task_type="auto")]
+        T.fetch_growth_tasks = fetch
+
+        def report(acc, evs, base=None):
+            calls.append("report")
+            state["fb"] = "completed"
+            return True
+        T.report_events = report
+
+        def claim(acc, code):
+            calls.append("claim:" + code)
+            state["fb"] = "claimed"
+            return {"ok": True, "credit": 300}
+        T.claim_task = claim
 
         def fake_urlopen(req, timeout=10, proxy=""):
             calls.append(req.full_url)
             if req.full_url.endswith("/travel/status"):
-                return _Resp({"code": 0, "data": {"state": "idle", "buddy_id": 42}})
+                return _Resp({"code": 0, "data": {"state": "idle", "buddy_id": 0}})
+            if req.full_url.endswith("/travel/config"):
+                return _Resp({"code": 0, "data": {"locations": [{"id": 1, "name": "咖啡馆"}]}})
+            if req.full_url.endswith("/travel/depart"):
+                state["departs"] += 1
+                if state["departs"] == 1:
+                    raise _http_error(req.full_url, 400,
+                                      '{"code":400,"msg":"no active buddy"}')
+                return _Resp({"code": 0, "data": {"location": {"name": "咖啡馆"}}})
+            return _Resp({"code": 0, "data": {}})
+        orig = T._accounts.urlopen
+        T._accounts.urlopen = fake_urlopen
+        try:
+            res = T.do_cat_travel(FakeAccount())
+        finally:
+            T._accounts.urlopen = orig
+        self.assertTrue(res["ok"], res)
+        self.assertIn("report", calls)
+        self.assertIn("claim:first_buddy", calls)
+        self.assertEqual(state["departs"], 2, calls)
+
+    def test_travel_departs_directly_when_buddy_exists(self):
+        calls = []
+        # status 里 buddy_id 恒为 0（猫在家），不得因此误走补齐前置
+        T.fetch_growth_tasks = lambda acc: (_ for _ in ()).throw(
+            AssertionError("有 Buddy 时不该走补齐前置"))
+
+        def fake_urlopen(req, timeout=10, proxy=""):
+            calls.append(req.full_url)
+            if req.full_url.endswith("/travel/status"):
+                return _Resp({"code": 0, "data": {"state": "idle", "buddy_id": 0}})
             if req.full_url.endswith("/travel/config"):
                 return _Resp({"code": 0, "data": {"locations": [{"id": 1, "name": "咖啡馆"}]}})
             if req.full_url.endswith("/travel/depart"):
