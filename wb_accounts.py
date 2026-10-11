@@ -1420,26 +1420,33 @@ class Account(object):
         try:
             with urlopen(req, timeout=20, proxy=self.proxy) as resp:
                 _ = resp.read()
-            self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
-            if self.path and os.path.exists(os.path.dirname(self.path)):
-                self.save(os.path.dirname(self.path))
             try:
                 self.fetch_credits()
             except Exception:
                 pass
             result = {"ok": True, "msg": "每日活跃对话成功完成"}
+            web_ok = True
             if web is None:
                 web = bool(self.path) and wb_settings.daily_chat_web(os.path.dirname(self.path))
             if web:
                 res = self.daily_chat_web(trigger=None)
                 result["web"] = res
-                if res.get("ok"):
+                web_ok = bool(res.get("ok"))
+                if web_ok:
                     result["msg"] = ("每日活跃对话成功完成（网页通道 %s：%d 段输出，%d ms）"
                                      % (res.get("status") or "completed",
                                         res.get("chunks") or 0, res.get("elapsed_ms") or 0))
                 else:
                     result["msg"] = ("每日活跃对话成功完成（网页通道失败：%s）"
                                      % res.get("error"))
+            # 只有真正计入官方「每日活跃」的网页通道成功了才算今天做过：网页腿失败时
+            # 若照写 lastDailyChat，当天后续巡检会直接跳过该账号，那天的 30/50 积分静默
+            # 丢掉且不再重试（面板还显示成功）。web=False（没开网页通道）时维持原
+            # 语义：桌面腿成功即算完成。
+            if web_ok:
+                self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
             return result
         except urllib.error.HTTPError as exc:
             try:

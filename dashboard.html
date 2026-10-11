@@ -891,6 +891,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '出站身份：': 'Outbound identity:',
     '分配代理出口给未绑定账号': 'Assign proxy exits to unbound accounts',
     '一键分配代理': 'Assign proxy exits',
+    '一键切换所有出站身份：': 'Switch all outbound identities: ',
+    '混合': 'mixed',
     '分钟': 'minutes',
     '分钟)': 'min)',
     '分钟取一次价': 'minutes per price fetch',
@@ -1035,6 +1037,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '将覆盖': 'Will overwrite',
     '将覆盖同 UID 的现有账号（含其凭证），确定继续？': 'Existing accounts with the same UID, including their credentials, will be overwritten. Continue?',
     '将该账号的出站身份切换为': 'Switch the outbound identity of this account to',
+    '将把全部账号的出站身份切换为 ': 'Switch the outbound identity of ALL accounts to ',
+    '？（含另一个版本）': '? (including the other version)',
+    '把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI': 'Switch every account (both versions) to the next outbound identity: WB → VSC → CLI',
     '将跳过': 'Will skip',
     '尚未选择文件。': 'No file selected yet.',
     '就绪': 'Ready',
@@ -1049,6 +1054,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '已保存': 'Saved',
     '已停用': 'Disabled',
     '已全部停用所有账号': 'All accounts disabled',
+    '已把全部账号的出站身份切换为 ': 'Switched the outbound identity of ALL accounts to ',
     '已全部启用所有账号': 'All accounts enabled',
     '已关闭保留积分': 'Reserved credits off',
     '已关闭变体继承：带后缀的名字不再自动取价': 'Variant inheritance off: suffixed names are no longer priced automatically',
@@ -1851,6 +1857,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "出站身份：": "出站身份：",
     "分配代理出口给未绑定账号": "分配代理出口給未繫結帳號",
     "一键分配代理": "一鍵分配代理",
+    "一键切换所有出站身份：": "一鍵切換所有出站身份：",
     "分钟": "分鐘",
     "分钟)": "分鐘)",
     "分钟取一次价": "分鐘取一次價",
@@ -1926,6 +1933,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "将覆盖同 UID 的现有账号（含其凭证），确定继续？": "將覆蓋同 UID 的現有帳號（含其憑證），確定繼續？",
     "将该账号的出站身份切换为": "將該帳號的出站身份切換為",
     "将该账号的出站身份切换为 ": "將該帳號的出站身份切換為 ",
+    "将把全部账号的出站身份切换为 ": "將把全部帳號的出站身份切換為 ",
+    "？（含另一个版本）": "？（含另一個版本）",
+    "把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI": "把全部帳號（含另一個版本）的出站身份切到下一個：WB → VSC → CLI",
     "尚未选择文件。": "尚未選擇檔案。",
     "展开查看每个模型当前生效的策略": "展開檢視每個模型目前生效的策略",
     "展开逐条查看 / 手填 OpenRouter id": "展開逐條檢視 / 手填 OpenRouter id",
@@ -1937,6 +1947,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "已保存 ": "已儲存 ",
     "已保存积分数据刷新间隔": "已儲存積分資料重新整理間隔",
     "已全部停用所有账号": "已全部停用所有帳號",
+    "已把全部账号的出站身份切换为 ": "已把全部帳號的出站身份切換為 ",
     "已全部启用所有账号": "已全部啟用所有帳號",
     "已关闭变体继承：带后缀的名字不再自动取价": "已關閉變體繼承：帶字尾的名字不再自動取價",
     "已关闭：工具声明原样透传": "已關閉：工具宣告原樣透傳",
@@ -2995,6 +3006,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <button class="sec" id="btnDailyChatWeb" onclick="doDailyChatWeb(this)" style="display:none">网页通道打卡 (国际版)</button>
     <span class="toolbar-sep" aria-hidden="true"></span>
     <button class="sec" onclick="autoAssignSlots()" title="把尚未绑定出口的已启用账号依次分配到已启用的代理槽；已有绑定的账号不受影响">一键分配代理</button>
+    <button class="sec" id="btnProductAll" onclick="cycleAllProducts(this)" title="把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI">一键切换所有出站身份：<span id="productAllLabel">WB</span></button>
     <button class="sec" onclick="setAll(true, this)">全部启用</button>
     <button class="sec" onclick="setAll(false, this)">全部停用</button>
     
@@ -4269,6 +4281,10 @@ function updateUI(){
     const el = document.getElementById(id);
     if(el) el.textContent = sectionRealm;
   });
+
+  // 工具栏上「一键切换所有出站身份」的当前值：它作用于全部账号（含另一个
+  // 版本），所以不看视图、只看 window.ACCOUNTS。
+  updateProductAllButton();
 
   const isIntlGw = (window.ACTIVE_GATEWAY_REALM === "intl");
   const dbIntl = document.getElementById("tabIntlDefaultBadge");
@@ -6312,6 +6328,43 @@ async function setAccountProduct(uid, prod, btn){
   }
 }
 async function switchProduct(uid, btn){ return setAccountProduct(uid, 'workbuddy', btn); }
+// 一键切换所有出站身份：后端 /accounts/product 不带 uid / realm 就是全量
+// （含另一个版本），所以这里只负责挑下一个身分、并把当前身分显示在按钮上。
+const PRODUCT_ORDER = ['workbuddy', 'vscode', 'cli'];
+const PRODUCT_SHORT = {workbuddy: 'WB', vscode: 'VSC', cli: 'CLI'};
+function allProductsUniform(){
+  const list = window.ACCOUNTS || [];
+  if(!list.length) return null;
+  const first = list[0].product || 'workbuddy';
+  return list.every(a => (a.product || 'workbuddy') === first) ? first : null;
+}
+function updateProductAllButton(){
+  const label = document.getElementById('productAllLabel');
+  if(!label) return;
+  // 账号还没加载完时保持原样，别把按钮先写成「混合」再改回来。
+  if(!(window.ACCOUNTS || []).length) return;
+  const cur = allProductsUniform();
+  label.textContent = cur ? PRODUCT_SHORT[cur] : '混合';
+}
+async function cycleAllProducts(btn){
+  const list = window.ACCOUNTS || [];
+  if(!list.length){ toast('还没有账号', 'bad'); return; }
+  const cur = allProductsUniform();
+  // cur 为 null（各账号身分不一致）时落到第一项，等于「统一成 WB」。
+  const next = PRODUCT_ORDER[(PRODUCT_ORDER.indexOf(cur) + 1) % PRODUCT_ORDER.length];
+  const label = PRODUCT_SHORT[next];
+  if(!confirm('将把全部账号的出站身份切换为 ' + label + '？（含另一个版本）')) return;
+  if(btn) btn.disabled = true;
+  try{
+    await postJSON('/accounts/product', {product: next});
+    await loadAccounts();
+    toast('已把全部账号的出站身份切换为 ' + label, 'ok');
+  }catch(e){
+    toast('切换失败: ' + e.message, 'bad');
+  }finally{
+    if(btn) btn.disabled = false;
+  }
+}
 
 async function refreshOne(uid, btn){
   if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }

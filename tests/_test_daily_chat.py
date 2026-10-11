@@ -217,6 +217,51 @@ class WebChannelTests(unittest.TestCase):
         self.assertFalse(any("/console/as/" in r.full_url for r in calls),
                          [r.full_url for r in calls])
 
+    def test_a_failed_web_step_leaves_the_day_open_for_retry(self):
+        """网页腿失败不能写 lastDailyChat：那天还得接着重试，否则 30 积分静默丢掉。"""
+        acc = self.account()
+        _calls, fake = self.stub()
+        self.stub_turn({"ok": False, "status": "working", "chunks": 0,
+                        "error": "会话在 120s 内没有跑完（状态=working）"})
+        old = wb_accounts.urlopen
+        wb_accounts.urlopen = fake
+        try:
+            res = acc.daily_chat(web=True)
+        finally:
+            wb_accounts.urlopen = old
+        self.assertTrue(res.get("ok"), res)          # 桌面腿成功，返回形状不变
+        self.assertFalse(res.get("web", {}).get("ok"), res)
+        self.assertIn("网页通道失败", res.get("msg", ""))
+        self.assertIsNone(acc.last_daily_chat)       # 但今天不算做过
+        self.assertTrue(acc.can_daily_chat())        # 下一次巡检还会重试
+
+    def test_a_finished_web_step_marks_the_day_done(self):
+        acc = self.account()
+        _calls, fake = self.stub()
+        self.stub_turn()
+        old = wb_accounts.urlopen
+        wb_accounts.urlopen = fake
+        try:
+            res = acc.daily_chat(web=True)
+        finally:
+            wb_accounts.urlopen = old
+        self.assertTrue(res.get("web", {}).get("ok"), res)
+        self.assertTrue(acc.last_daily_chat)
+        self.assertFalse(acc.can_daily_chat())
+
+    def test_the_web_step_being_off_still_marks_the_day_done(self):
+        acc = self.account()
+        _calls, fake = self.stub()
+        old = wb_accounts.urlopen
+        wb_accounts.urlopen = fake
+        try:
+            res = acc.daily_chat(web=False)
+        finally:
+            wb_accounts.urlopen = old
+        self.assertTrue(res.get("ok"), res)
+        self.assertTrue(acc.last_daily_chat)
+        self.assertFalse(acc.can_daily_chat())
+
     def test_the_web_toggle_defaults_on_and_round_trips(self):
         directory = os.path.join(_TMP.name, "web-toggle")
         self.assertTrue(wb_settings.daily_chat_web(directory))
