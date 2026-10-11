@@ -340,7 +340,11 @@ def peer_is_trusted(peer_ip):
         addr = ipaddress.ip_address(str(peer_ip))
     except ValueError:
         return False
-    if addr.is_loopback:
+    # Windows 双栈下连 127.0.0.1 的对端会显示成 ::ffff:127.0.0.1。ipaddress 在
+    # Python 3.13 之前不把 IPv4-mapped 地址算作回环（.is_loopback 为 False），
+    # 于是本机反代的请求会被当成不可信来源，限流桶退化成所有客户端共用一个。
+    mapped = addr.ipv4_mapped if addr.version == 6 else None
+    if addr.is_loopback or (mapped is not None and mapped.is_loopback):
         return True
     for net in TRUSTED_PROXIES:
         if addr.version == net.version and addr in net:

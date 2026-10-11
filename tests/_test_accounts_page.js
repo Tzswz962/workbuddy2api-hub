@@ -58,16 +58,16 @@ assert.ok(names(mainTabs[1]).includes('accounts'), 'accounts 必须在主标签�
 
 // 切到账号页要顺手把签到记录拉起来；开关关掉（默认）时账号区就在
 // 「网关与账号」页，切到网关页同样要拉。
-assert.ok(/if\(tab === 'accounts' \|\| \(!_accountsSeparateTab && tab === 'gateway'\)\)\{ loadActivityHistory\(\); \}/.test(script),
-  '切到账号页（或合并后的网关页）应触发 loadActivityHistory');
+assert.ok(/if\(tab === 'accounts' \|\| \(!_accountsSeparateTab && tab === 'gateway'\)\)\{ loadActivityBoard\(\); \}/.test(script),
+  '切到账号页（或合并后的网关页）应触发 loadActivityBoard');
 
 // 签到记录区块的骨架
 for(const id of ['activityRange', 'activityTask', 'activityResult', 'activityAccount',
                  'activityList', 'activityMore', 'activityMoreInfo', 'activityCount']){
   assert.ok(html.includes('id="' + id + '"'), '签到记录区块缺少 #' + id);
 }
-assert.ok(/id="btnActivityMore"[^>]*onclick="loadActivityHistory\(false, true\)"/.test(html),
-  '「加载更多」应接上 loadActivityHistory(false, true)');
+assert.ok(/id="btnActivityMore"[^>]*onclick="loadActivityBoard\(false, true\)"/.test(html),
+  '「加载更多」应接上 loadActivityBoard(false, true)');
 assert.ok(/id="activityRange"[\s\S]{0,600}?<option value="7d" selected>/.test(html),
   '默认区间应是近 7 天');
 // 筛选值的取值必须与服务端约定一致，写错了服务端会回 400
@@ -144,7 +144,7 @@ let api;
 try {
   api = new Function(script + `
     return {
-      loadActivityHistory: loadActivityHistory,
+      loadActivityBoard: loadActivityBoard,
       renderActivityAccounts: renderActivityAccounts,
       switchMainTab: switchMainTab,
       applyAccountsTabLayout: applyAccountsTabLayout,
@@ -170,7 +170,7 @@ function check(label, ok, detail){
   el('activityAccount').value = '';
   REQUESTS = [];
   RESPONSE = {rows: [], total: 0};
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('默认请求近 7 天、100 行', REQUESTS[0] === '/activity/history?range=7d&limit=100', REQUESTS[0]);
   check('空结果给出空态', listHtml().includes('这个区间里没有签到或活跃记录。'), listHtml());
   check('空结果不显示加载更多', el('activityMore').style.display === 'none');
@@ -182,7 +182,7 @@ function check(label, ok, detail){
   el('activityResult').value = 'failed';
   el('activityAccount').value = 'uid-abcdef1234';
   REQUESTS = [];
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('筛选条件进查询串',
     REQUESTS[0] === '/activity/history?range=30d&task=checkin&result=failed&uid=uid-abcdef1234&limit=100',
     REQUESTS[0]);
@@ -198,7 +198,7 @@ function check(label, ok, detail){
     {ts: '2026-10-08T08:00:00+08:00', uid: 'uid-abcdef1234', nickname: '',
      realm: 'intl', task: 'daily_chat', trigger: 'manual', ok: false, message: ''},
   ]};
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   const h = listHtml();
   check('时间按落盘的墙上时间显示', h.includes('10-09 21:03'), h.slice(0, 160));
   check('昵称进账号列', h.includes('老王'));
@@ -217,26 +217,26 @@ function check(label, ok, detail){
   RESPONSE = {total: 250, limit: 100, rows: Array.from({length: 100}, (_, i) => ({
     ts: '2026-10-09T00:00:00+08:00', uid: 'u' + i, nickname: 'a' + i, realm: 'cn',
     task: 'checkin', trigger: 'scheduler', ok: true, message: 'ok'}))};
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('还有更多时显示加载更多', el('activityMore').style.display === 'flex');
   check('更多提示带已显示与总数',
     el('activityMoreInfo').textContent === '已显示最新 100 条 / 共 250 条',
     el('activityMoreInfo').textContent);
   REQUESTS = [];
-  await api.loadActivityHistory(false, true);
+  await api.loadActivityBoard(false, true);
   check('加载更多按页加 limit',
     REQUESTS[0] === '/activity/history?range=30d&limit=200', REQUESTS[0]);
   check('加载更多不清空已有表格', listHtml().includes('<tbody>'), listHtml().slice(0, 80));
 
   // 2e. limit 有上限，点到底也不会无限往上加
-  for(let i = 0; i < 12; i++) await api.loadActivityHistory(false, true);
+  for(let i = 0; i < 12; i++) await api.loadActivityBoard(false, true);
   check('limit 封顶在 1000', REQUESTS[REQUESTS.length - 1] === '/activity/history?range=30d&limit=1000',
     REQUESTS[REQUESTS.length - 1]);
 
   // 2f. 换筛选条件要回到第一页，否则第一屏会缺最新记录
   el('activityRange').value = 'today';
   REQUESTS = [];
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('换筛选条件重置 limit', REQUESTS[0] === '/activity/history?range=today&limit=100', REQUESTS[0]);
 
   // 2g. 账号下拉取自账号池，重建选项不能把已选中的账号冲掉
@@ -252,7 +252,7 @@ function check(label, ok, detail){
 
   // 2h. 服务端拒绝筛选值（400）时给出提示，并把刷新按钮放开
   FETCH_FAILS = true;
-  await api.loadActivityHistory();
+  await api.loadActivityBoard();
   check('读取失败时给出提示', listHtml().includes('读取签到记录失败'), listHtml());
   check('失败后刷新按钮恢复可用', el('btnActivityRefresh').disabled === false);
   FETCH_FAILS = false;
