@@ -986,6 +986,7 @@ if hasattr(time, "tzset"):
             ref = canon(ref_window(M27, M28))
             cache_env_nowrite()
             restart()
+            P._usage_alltime_snapshot(None)
             with ScanCounter() as counter:
                 got = canon(window_raw(M27, M28))
             check("夏令时：切换后规则日闭窗口走日桶（扫描 0 次）、逐字节一致",
