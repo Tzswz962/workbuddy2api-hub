@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.6.20-2496ED?style=flat-square" alt="Version 1.6.20"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.1-2496ED?style=flat-square" alt="Version 1.6.20"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -131,7 +131,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 121 个套件：88 个 Python + 33 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 136 个套件：100 个 Python + 36 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -202,10 +202,12 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 ### 7. 本地网络工具（可选，默认关闭）
 
-Codex App 这类客户端会在 Responses 请求里声明 `web_search` / `web_fetch`，而上游没有对应的执行器——声明送上去只会拿到一句 unsupported call。打开「设置 → 本地网络工具」后，网关把那份声明换成自己的同名 function，拦下模型的调用并在本地执行（搜索走 DuckDuckGo HTML 版，抓页面抓模型给出的 URL），再把结果喂回模型，最多代跑 3 轮（`WB_MAX_WEB_ROUNDS` 可调，上限 8）；搜索过程会作为 `web_search_call` 卡片事件与 `url_citation` 引用回到客户端。
+Codex App 这类客户端会在 Responses 请求里声明 `web_search` / `web_fetch`，而上游没有对应的执行器——声明送上去只会拿到一句 unsupported call。打开「设置 → 本地网络工具」后，网关把那份声明换成自己的同名 function，拦下模型的调用并在本地执行（搜索在 DuckDuckGo / Bing / Wikipedia / Stack Overflow / Google News 之间自动轮换，抓页面抓模型给出的 URL），再把结果喂回模型，最多代跑 3 轮（`WB_MAX_WEB_ROUNDS` 可调，上限 8）；搜索过程会作为 `web_search_call` 卡片事件与 `url_citation` 引用回到客户端。
 
 - 关闭时（默认）声明原样透传，客户端自己声明的搜索工具照常拿到调用；
-- 打开后网关会主动出网抓取模型给出的 URL（只挡字面私网地址），且每轮代跑都会多跑一次上游、多消耗该账号额度；国内网络下 DuckDuckGo 可能连不上，那时模型拿到的是错误文本；
+- 打开后网关会主动出网抓取模型给出的 URL（字面私网地址与解析进内网的域名都会被挡；
+  `WB_WEB_TOOLS_PROXY` 可以给这组工具单独指定出口代理），每轮代跑都会多跑一次上游、多消耗该账号额度；
+- 某个搜寻引擎被限流／拦截时会自动轮换到下一家，只有全部不可用才把明确错误交给模型；常规引擎（DuckDuckGo / Bing）接手时对模型无感，Wikipedia / Stack Overflow / Google News 这类非常规来源会在结果里标明来源；
 - 只影响声明了这两个工具的客户端，普通 `/v1/chat/completions` 客户端不经过这条路径。
 
 ### 8. 智能体一键配置
@@ -355,27 +357,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
-- **修复「网页通道打卡」在认证代理下必然 407**：账号绑定带 user/pwd 的代理槽时，网页通道那一步固定失败并回 `OSError: Tunnel connection failed: 407 Proxy Authentication Required`，而桌面通道与面板「出口 IP 测试」都正常。原因是 `wb_webagent.AcpChannel._connect()` 用裸 `http.client` + `set_tunnel()` 直连代理，只传了 `host/port`：`urllib.request.ProxyHandler` 会替 urlopen 那条路径把 URL 里的凭据转成 `Proxy-Authorization: Basic ...`，而 `set_tunnel()` 不带这个头——于是同一个代理 URL 在两条通道上行为不一致。
-  - 现在 `_connect()` 走 `_proxy_parts()` 解析代理 URL，把 `Proxy-Authorization` 显式塞进 CONNECT（取值口径与 `ProxyHandler.proxy_open` 一致：先 `unquote` 再 base64），两种写法都认：`http://user:pass@host:port` 与无 scheme 的 `user:pass@host:port`（后者此前连 host/port 都会被 `urlparse` 误判成 scheme，一并修正）；没填凭据时不发该头，免认证代理行为不变。
-  - 新增 `tests/_test_web_agent.py` 的 `ProxyTunnelTests`：钉住两种 URL 形态的解析、转义字符与 urllib 同口径、无凭据不发头、隧道确实带上该头，以及直连时不走隧道。
-
-- **修复「网页腿失败也写 lastDailyChat，当天积分静默丢掉」**：`_daily_chat_upstream()` 在桌面腿成功后立刻写 `lastDailyChat`，而网页腿（唯一计入官方「每日活跃」的那条）失败也照写；于是当天后续巡检 `can_daily_chat()` 直接跳过该账号，那天的 30/50 积分既不到账也不再重试，面板还显示「成功」。现在只有网页腿成功（或 `web=False`、没开网页通道）才写盘，失败时留到下一个巡检周期重试。
-  - `tests/_test_daily_chat.py` 补三条：网页腿失败不写盘且 `can_daily_chat()` 仍为真、网页腿成功写盘、`web=False` 维持原语义。
-
-- **新增「配置器 CLI」：客户端不在网关机器上也能一条命令接入**（#280）：看板的一键配置运行在网关进程里，只在网关本机、用 `127.0.0.1` 打开看板时可用（远程访问与容器 / OpenWrt 部署按设计拒绝），网关跑在服务器 / NAS / 路由器上时，客户端装在别的电脑就用不上。现在 `wb_agents.py` 同时是可执行的配置器——`list` / `status` / `apply` / `restore`，在**客户端所在的机器**本地写配置（与看板共用同一套写入、备份、还原逻辑），只通过 HTTP 从网关取模型表；网关侧新增 `GET /agents/cli` 下发该脚本（免面板鉴权，正文与仓库内 `wb_agents.py` 逐字节一致、不含机密）。`--dry-run` 与真实写入共用同一条 `plan()` 生成路径；Key 走 `--key` → `WB_PROXY_API_KEY` → 交互提示，提示仅在 stdin 与 stdout 都是终端时出现（避免没有控制台的进程里 `getpass` 永久阻塞）。
-  - 顺手修「apply → apply → restore 把自产文件当原件还原」：按内容哈希判定归属——仍逐字节等于我们最后写入的 → `restore` 删除；被用户手改过 → 备份并恢复用户版本。此前含 API Key 的 `.credentials.yaml` 会留在磁盘上，与文档承诺相悖。
-  - `release/portable_runtime.py` 的 `REQUIRED_FILES` 补 `Lib/getpass.py`（新增 import 后裁剪运行时缺该模块）；README 套件计数 119 → 120。
-
-- **账号工具栏新增「一键切换所有出站身份」**（#254）：一次把**全部账号**（含另一个版本）的出站身份切到下一个——WB → VSC → CLI → 循环。按钮上直接显示当前身分，各账号不一致时显示「混合」，此时点一下统一成 WB。服务端 `/accounts/product` 本来就支持不带 `uid` 的全量切换（面板此前只有单账号的行内按钮，以及 429 时的自动换身分），这次补的是入口与提示；切完当场落盘，重启不丢。
-  - `tests/_test_product_switch.py`（新套件）：钉住全量 / 按区域 / 单账号三条分支、非法身分被拒、落盘后重启仍在、重复切换不报变更；
-  - `tests/_test_accounts_page.js`：钉住按钮位置、轮转顺序与「不带 uid」的提交形状，并在假 DOM 里真跑一遍。
-
-- **补一道「冲突标记」门禁**：仓库里已经三次把解冲突的残留提交进 main（#131 专门清过一次 dashboard 的，README 又在 #243/#245 那批合并里带进 12~15 行），此前没有任何测试盯它——Python 文件会直接 `SyntaxError`，HTML/JS 则是静默坏掉，回滚检查还会把「合并时顺手整理掉这些行」算成弄丢 main 的改动（#245 那次报红就是这个）。`tests/_test_release_engineering.py` 新增 `RepoHygieneTests`：扫全树（跳过运行时数据与打包产物目录），任一行以 `<<<<<<<` / `>>>>>>>` / `|||||||` 开头即失败。
-
-- **智能体一键配置新增 ZCode 客户端**：把网关作为 `wb-proxy` provider 写进 ZCode 的活配置 `~/.zcode/v2/provider_config.json`（`providerConfigRules.providerRules` + `providerOrder`）。规则按稳定 `providerId` 定位，重复 apply 更新同一条而非堆叠；其余 provider、它们的顺序与 `modelConfigRules` 逐字节保留。模型表来自 `GET /v1/models`，写成 `personalModelIds` + `modelOrder`。该文件由 ZCode 应用自己持有、运行中会被重写——卡片文案与文档都提示「配置前先退出 ZCode」。
-  - `tests/_test_agents.py` 扩到 126 项：zcode 形状断言 + 「重复 apply 不堆叠 / 其他 provider 与 modelConfigRules 逐字节保留 / 还原字节级」。
-
-已发布版本的完整记录（v1.4.5 ~ v1.6.20，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+已发布版本的完整记录（v1.4.5 ~ v1.7.1，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 ## 七、致谢与引用声明 (Credits & References)
 
 协议兼容、风控规避与任务链路设计过程中，参考并吸纳了以下开源项目的经验与逆向成果：
