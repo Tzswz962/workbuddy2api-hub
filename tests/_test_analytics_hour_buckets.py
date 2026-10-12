@@ -600,7 +600,7 @@ check("逐行口径的计价次数 == 窗口内非中止行数（8）", calls_sc
 # 午夜窗口：小时层与日桶层给出同一份窗口半（两条对齐路径互相印证）。
 restart()
 by_hours = P._analytics_window_from_hours(None, TODAY0, None, pricing_on)
-by_days = P._analytics_window_from_days(None, TODAY_KEY, pricing_on)
+by_days = P._analytics_window_from_days(None, TODAY_KEY, None, pricing_on)
 check("午夜窗口：小时层与日桶层一致（逐字节）",
       canon(by_hours) == canon(by_days), first_diff(canon(by_days), canon(by_hours)))
 
@@ -616,16 +616,29 @@ _, calls = cost_calls(lambda: win(NOON30, None))
 got = canon(win(NOON30, None))
 check("非整点起点（12:30）：退回扫描、结果一致", got == ref, first_diff(ref, got))
 check("非整点起点：确实走了整段扫描（计数桩 > 0）", calls > 0, calls)
-# 4.2 until 切在桶中间（早于折过的最大 at）：退回扫描、结果一致。
+# 4.2 until 切进折过的数据里（早于折过的最大 at）：落小时格点、那一刻没有
+#     整秒行时由小时层按「at < until 的桶」回答（闭窗口）；不落格点（切在
+#     桶中间）时退回扫描。两种情形结果都必须与逐行口径一致。
 cache_env_off()
 restart()
 ref = canon(win(NOON1, NOON1 + 7200))
 cache_env_nowrite()
 restart()
 got = canon(win(NOON1, NOON1 + 7200))
-check("until 切在桶中间：退回扫描、结果一致", got == ref, first_diff(ref, got))
+check("until 切进数据（落小时格点）：结果与逐行口径一致",
+      got == ref, first_diff(ref, got))
+check("until 切进数据（落小时格点）：小时层按闭窗口回答（计数桩 == 0）",
+      cost_calls(lambda: win(NOON1, NOON1 + 7200))[1] == 0)
+cache_env_off()
+restart()
+ref_mid = canon(win(NOON1, NOON1 + 7200 + 1800))
+cache_env_nowrite()
+restart()
+got_mid = canon(win(NOON1, NOON1 + 7200 + 1800))
+check("until 切在桶中间（不落格点）：退回扫描、结果一致",
+      got_mid == ref_mid, first_diff(ref_mid, got_mid))
 check("until 切在桶中间：走的是现折小时桶那条冷路径（计数桩 > 0）",
-      cost_calls(lambda: win(NOON1, NOON1 + 7200))[1] > 0)
+      cost_calls(lambda: win(NOON1, NOON1 + 7200 + 1800))[1] > 0)
 # 4.3 小时子表被剪掉的天：该天的窗口退回扫描、结果一致。
 cache_env(enabled=1, min_bytes=10 ** 9, min_seconds=10 ** 9, hours=1)
 restart()
@@ -936,7 +949,7 @@ if hasattr(time, "tzset"):
             lo2 = time.mktime((2026, 10, 25, 0, 0, 0, 0, 0, -1))
             key2 = time.strftime("%Y-%m-%d", time.localtime(lo2))
             by_hours = P._analytics_window_from_hours(None, lo2, None, pricing_on)
-            by_days = P._analytics_window_from_days(None, key2, pricing_on)
+            by_days = P._analytics_window_from_days(None, key2, None, pricing_on)
             check("夏令时切换日：小时层与日桶层一致（逐字节）",
                   by_hours is not None and by_days is not None
                   and canon(by_hours) == canon(by_days),

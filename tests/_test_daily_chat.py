@@ -4,7 +4,9 @@ Two channels are covered: the desktop-identity chat completion (always sent)
 and the web conversation added for issue #75/#59, whose request shape is
 pinned here so it cannot drift from what the web app actually sends.
 """
-import json, os, sys, unittest, time
+import io
+import json
+import urllib.error, os, sys, unittest, time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
@@ -273,6 +275,29 @@ class WebChannelTests(unittest.TestCase):
             json.dump({"daily_chat_web": "false"}, fh)
         self.assertFalse(wb_settings.daily_chat_web(directory))
 
+
+
+
+
+class CnCheckinTests(unittest.TestCase):
+    def test_already_checked_in_is_treated_as_success(self):
+        acc = wb_accounts.Account({"uid": "u-test-cn", "realm": "cn", "accessToken": "token"})
+        def fake_http_json(url, data, method, headers, timeout, proxy=""):
+            err_body = json.dumps({"code": 10001, "msg": "今天已签到，请明天再来"}).encode("utf-8")
+            fp = io.BytesIO(err_body)
+            raise urllib.error.HTTPError(url, 400, "Bad Request", {}, fp)
+
+        real_http_json = wb_accounts.http_json
+        wb_accounts.http_json = fake_http_json
+        try:
+            res = acc._checkin_upstream()
+            self.assertTrue(res.get("ok"), res)
+            self.assertEqual(res.get("code"), 10001)
+            self.assertIn("今天已签到", res.get("msg"))
+            self.assertTrue(acc.last_checkin)
+        finally:
+            wb_accounts.http_json = real_http_json
+
+
 if __name__ == "__main__":
     unittest.main()
-

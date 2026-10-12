@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -192,6 +193,98 @@ class KeyblobTests(unittest.TestCase):
             self.assertTrue(info["error"])
             with self.assertRaises(A.AtRestError):
                 A.read_key_id()
+
+
+class ConfigDirProbeTests(unittest.TestCase):
+    """config_dir 在 ~/.workbuddy-ai 与 ~/.workbuddy 之间按 keyblob 存在性探测。
+
+    国际版客户端把 keyblob 放 ~/.workbuddy-ai（与 wb_proxy 读产品模型目录的
+    口径一致），老布局 ~/.workbuddy 继续兜底；环境变量永远最高优先。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="wb-atrest-home-")
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.realpath(self.tmp.name)
+        self._expand = mock.patch.object(
+            A.os.path, "expanduser",
+            lambda p: os.path.join(self.home, p[2:]) if p.startswith("~") else p)
+        self._expand.start()
+        self.addCleanup(self._expand.stop)
+
+    def _with_env(self, **names):
+        return mock.patch.dict(os.environ, {k: "" for k in names})
+
+    def _put_keyblob(self, dirname):
+        path = os.path.join(self.home, dirname)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, A.KEYBLOB_NAME), "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(make_keyblob(b64_32())[2]))
+
+    def test_probe_finds_ai_layout(self):
+        self._put_keyblob(".workbuddy-ai")
+        with self._with_env(WORKBUDDY_CONFIG_DIR="", CODEBUDDY_CONFIG_DIR=""):
+            self.assertEqual(A.config_dir(), os.path.realpath(os.path.join(self.home, ".workbuddy-ai")))
+
+    def test_probe_falls_back_to_legacy_layout(self):
+        self._put_keyblob(".workbuddy")
+        with self._with_env(WORKBUDDY_CONFIG_DIR="", CODEBUDDY_CONFIG_DIR=""):
+            self.assertEqual(A.config_dir(), os.path.realpath(os.path.join(self.home, ".workbuddy")))
+
+    def test_probe_order_ai_first(self):
+        self._put_keyblob(".workbuddy-ai")
+        self._put_keyblob(".workbuddy")
+        with self._with_env(WORKBUDDY_CONFIG_DIR="", CODEBUDDY_CONFIG_DIR=""):
+            self.assertEqual(A.config_dir(), os.path.realpath(os.path.join(self.home, ".workbuddy-ai")))
+
+    def test_neither_dir_returns_first_candidate(self):
+        """两个目录都不存在时回落到第一个候选，让 load_keyblob 报常规错误。"""
+        with self._with_env(WORKBUDDY_CONFIG_DIR="", CODEBUDDY_CONFIG_DIR=""):
+            self.assertEqual(A.config_dir(),
+                             os.path.realpath(os.path.join(self.home, A.CONFIG_DIR_CANDIDATES[0])))
+
+    def test_env_var_beats_probe(self):
+        self._put_keyblob(".workbuddy-ai")
+        portable = os.path.join(self.home, "portable")
+        with mock.patch.dict(os.environ, {"WORKBUDDY_CONFIG_DIR": portable}):
+            self.assertEqual(A.config_dir(), os.path.realpath(portable))
+
+
+class MainPidElectionTests(unittest.TestCase):
+    """进程选举对两种客户端 exe 名都成立，报错时把候选名列全。"""
+
+    @staticmethod
+    def _procs(rows):
+        return mock.patch.object(A, "_list_procs", lambda: rows)
+
+    def test_elects_main_by_parentage(self):
+        rows = [(100, 4, "WorkBuddyAI.exe"), (101, 100, "WorkBuddyAI.exe"), (102, 101, "WorkBuddyAI.exe")]
+        with self._procs(rows):
+            self.assertEqual(A._main_pids(), [100])
+
+    def test_accepts_legacy_exe_name(self):
+        rows = [(200, 4, "workbuddy.exe"), (201, 200, "workbuddy.exe")]
+        with self._procs(rows):
+            self.assertEqual(A._main_pids(), [200])
+
+    def test_mixed_install_elects_each_family(self):
+        rows = [(100, 4, "WorkBuddyAI.exe"), (101, 100, "WorkBuddyAI.exe"),
+                (200, 4, "workbuddy.exe"), (201, 200, "workbuddy.exe")]
+        with self._procs(rows):
+            self.assertEqual(sorted(A._main_pids()), [100, 200])
+
+    def test_case_insensitive_match(self):
+        rows = [(100, 4, "WORKBUDDYAI.EXE")]
+        with self._procs(rows):
+            self.assertEqual(A._main_pids(), [100])
+
+    def test_no_client_error_lists_candidates(self):
+        with self._procs([(300, 4, "chrome.exe")]):
+            with self.assertRaises(A.AtRestError) as ctx:
+                A._main_pids()
+        message = str(ctx.exception)
+        self.assertIn("workbuddy.exe", message)
+        self.assertIn("workbuddyai.exe", message)
 
 
 class PathTests(unittest.TestCase):

@@ -16,7 +16,8 @@ base64(...)}` 加密信封。看板照旧能读到 `.info` 文件，但拿出来
     envelope  = base64(JSON{suite,keyId,nonce,authTag,ciphertext})   AES-256-GCM
     framing   : 文件 -> WBEF1/1（keyblob），字段 -> WBEV1/2（.info 里的字段）
 
-静态密钥编译在 WorkBuddy.exe 的原生模块里，磁盘上拿不到明文，所以只能从**正在
+静态密钥编译在桌面客户端（WorkBuddy.exe / WorkBuddyAI.exe，见
+`DESKTOP_EXE_CANDIDATES`）的原生模块里，磁盘上拿不到明文，所以只能从**正在
 运行的**主进程内存里找回来（见 `recover_key`）：判据是 sha256(窗口)[:8] 等于
 keyblob 里 static-v1 槽的 protectorKeyId，因此客户端升级后依然可用。
 
@@ -316,12 +317,29 @@ def seal(key, plaintext, framing, key_id=None, nonce=None):
 
 
 # ------------------------------------------------------------------ keyblob
+#: 桌面客户端的配置目录候选（keyblob 所在）。与 wb_proxy.read_product_config_models
+#: 的口径一致：国际版装在 ~/.workbuddy-ai，国内版装在 ~/.workbuddy；不同版本
+#: 的安装器两者都可能写，所以按存在性探测而不是写死一个。
+CONFIG_DIR_CANDIDATES = (".workbuddy-ai", ".workbuddy")
+
+
 def config_dir():
-    """客户端配置目录（keyblob 所在）。可用环境变量指向便携版的位置。"""
-    raw = (os.environ.get("WORKBUDDY_CONFIG_DIR")
-           or os.environ.get("CODEBUDDY_CONFIG_DIR")
-           or os.path.join(os.path.expanduser("~"), ".workbuddy"))
-    return os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
+    """客户端配置目录（keyblob 所在）。可用环境变量指向便携版的位置。
+
+    未设环境变量时按 CONFIG_DIR_CANDIDATES 顺序取第一个存在 keyblob 的目录
+    （兼容 `~/.workbuddy-ai` 的新版安装布局）；都不存在时回落到第一个候选，
+    让 load_keyblob() 报出常规的「keyblob 不存在」而不是这里的探测细节。
+    """
+    env = (os.environ.get("WORKBUDDY_CONFIG_DIR")
+           or os.environ.get("CODEBUDDY_CONFIG_DIR"))
+    if env:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(env)))
+    home = os.path.expanduser("~")
+    for name in CONFIG_DIR_CANDIDATES:
+        candidate = os.path.join(home, name)
+        if os.path.isfile(os.path.join(candidate, KEYBLOB_NAME)):
+            return os.path.realpath(candidate)
+    return os.path.realpath(os.path.join(home, CONFIG_DIR_CANDIDATES[0]))
 
 
 def keyblob_path():
@@ -467,12 +485,21 @@ def _list_procs():
     return out
 
 
-def _main_pids(exe_name="workbuddy.exe"):
+#: 桌面客户端主进程的候选 exe 名。不同版本的安装器叫法不同：有 WorkBuddy.exe，
+#: 也有 WorkBuddyAI.exe（如 F:\workBuddy\WorkBuddyAI\ 这类默认布局）。
+DESKTOP_EXE_CANDIDATES = ("workbuddy.exe", "workbuddyai.exe")
+
+
+def _main_pids(exe_names=DESKTOP_EXE_CANDIDATES):
     """Electron 主进程 = 父进程不是同一个 exe 的那个（其余是渲染进程）。"""
+    if isinstance(exe_names, str):
+        exe_names = (exe_names,)
+    wanted = {name.lower() for name in exe_names}
     wb = [(pid, ppid) for pid, ppid, name in _list_procs()
-          if name.lower() == exe_name.lower()]
+          if name.lower() in wanted]
     if not wb:
-        raise AtRestError("没有发现正在运行的 %s —— 请先启动并登录桌面客户端" % exe_name)
+        raise AtRestError("没有发现正在运行的 %s —— 请先启动并登录桌面客户端"
+                          % " / ".join(exe_names))
     wbp = {pid for pid, _ in wb}
     return [pid for pid, ppid in wb if ppid not in wbp]
 
@@ -667,7 +694,7 @@ def _slices(regions, limit=SLICE):
 
 
 def hunt_key(key_id=None, workers=None, log=None):
-    """从 WorkBuddy.exe 主进程内存里找回静态密钥，返回 64 位小写 hex。
+    """从桌面客户端主进程内存里找回静态密钥，返回 64 位小写 hex。
 
     只读：OpenProcess(PROCESS_VM_READ|PROCESS_QUERY_INFORMATION) + VirtualQueryEx
     + ReadProcessMemory，不往目标进程写任何东西。
@@ -728,7 +755,7 @@ def hunt_key(key_id=None, workers=None, log=None):
                 except Exception:
                     continue
                 return key_hex
-    raise AtRestError(last_error or "没能在 WorkBuddy.exe 内存里找到密钥（keyId=%s）" % key_id)
+    raise AtRestError(last_error or "没能在桌面客户端进程内存里找到密钥（keyId=%s）" % key_id)
 
 
 # ------------------------------------------------------------------ 内存密钥
@@ -772,7 +799,7 @@ def recover_key(force=False, log=None):
         _KEY_CACHE["key"] = key
         _KEY_CACHE["recoveredAt"] = time.time()
     if log:
-        log("已从 WorkBuddy.exe 内存回收 at-rest 密钥（keyId=%s），仅保存在内存中"
+        log("已从桌面客户端进程内存回收 at-rest 密钥（keyId=%s），仅保存在内存中"
             % derive_key_id(key))
     return key
 

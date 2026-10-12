@@ -1503,8 +1503,18 @@ class Account(object):
             return {"ok": (code == 0 or code == 10001), "code": code, "msg": msg, "data": payload.get("data")}
         except urllib.error.HTTPError as exc:
             try:
-                body = json.loads(exc.read().decode("utf-8") or "{}")
-                return {"ok": False, "error": body.get("msg") or ("HTTP %d" % exc.code)}
+                raw_b = exc.read().decode("utf-8") or "{}"
+                body = json.loads(raw_b)
+                code = body.get("code")
+                msg = body.get("msg") or ("HTTP %d" % exc.code)
+                # 上游如果在今日已签到时返回 HTTP 400 且 code 为 10001 / "今天已签到"
+                # 这说明今日事实上已经处于签到完成状态，按成功处理，并记录最后签到时间
+                if code == 10001 or "今天已签到" in msg or "已签到" in msg:
+                    self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                    if self.path and os.path.exists(os.path.dirname(self.path)):
+                        self.save(os.path.dirname(self.path))
+                    return {"ok": True, "code": code, "msg": msg, "data": body.get("data")}
+                return {"ok": False, "error": msg}
             except Exception:
                 return {"ok": False, "error": "HTTP %d" % exc.code}
         except Exception as exc:

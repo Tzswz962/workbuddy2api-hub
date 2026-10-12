@@ -184,6 +184,37 @@ res_c = P.aggregate_stream(iter(stream_valid), "m", None)
 check("valid tool: finish_reason is tool_calls", res_c["choices"][0]["finish_reason"] == "tool_calls")
 check("valid tool: tool_calls present", len(res_c["choices"][0]["message"].get("tool_calls", [])) == 1)
 
+
+
+
+print("[11] additional_tools item in responses input is merged into chat tools")
+resp_additional = {
+    "model": "gpt-6.1-sol",
+    "input": [
+        {
+            "type": "additional_tools",
+            "tools": [{"type": "function", "name": "exec_command", "description": "run command"}]
+        },
+        {"role": "user", "content": "run ls"}
+    ]
+}
+chat_additional = P.responses_to_chat(resp_additional)
+check("additional_tools merged into chat tools",
+      any(t.get("name") == "exec_command" for t in chat_additional.get("tools", [])),
+      chat_additional.get("tools"))
+check("additional_tools not leaking into chat messages",
+      len(chat_additional.get("messages", [])) == 1
+      and chat_additional["messages"][0]["role"] == "user",
+      chat_additional.get("messages"))
+
+
+print("[12] finish_reason empty string in stream chunk normalized to None")
+chunk_with_empty_finish = '{"choices":[{"delta":{"content":"chunk"},"finish_reason":""}]}'
+cleaned_chunk = json.loads(P.clean_chunk(chunk_with_empty_finish))
+check("finish_reason normalized to None",
+      cleaned_chunk["choices"][0]["finish_reason"] is None,
+      cleaned_chunk["choices"][0])
+
 print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

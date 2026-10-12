@@ -3237,11 +3237,281 @@ def _pricing_inputs(pricing_on=None):
 
 
 def _pricing_unchanged(previous, current):
-    """True when two _pricing_inputs() tuples describe the same prices."""
+    """True when two _pricing_inputs() tuples describe the same prices.
+
+    只留给行级结果记忆（_row_cost_remember）：那里按「价表代次」整表判定，
+    保守但正确。状态指纹走 _pricing_used_unchanged()（T15 的收窄判定）。
+    """
     if previous is None or current is None:
         return False
     return (previous[0] == current[0] and previous[1] is current[1]
             and previous[2] is current[2] and previous[3] is current[3])
+
+
+# ---------------------------------------------------------------------------
+# 「用到的价」状态指纹（T15）：状态指纹收窄成折叠行真正用到的价
+#
+# 价表内容一变（哪怕只是新增一个无关模型的价格），带价格指纹的 5 条状态
+# （snapshot×3 + analytics×2）此前全部判废、各重折 12-15s；但已折行的成本
+# 在设计上就是历史价——带 cost_policy 的行按不可变策略计价，无引用老行由
+# 时间线解析（见 _fold_usage_snapshot 的注释："a later price change cannot
+# rewrite yesterday's totals"）——所以绝大多数重折是白付。
+#
+# 这里把状态指纹从「(policies, timeline, pricing_doc) 三张表的对象身份」收窄
+# 成一份记录（state["pricing"]，checkpoint 的 "pricing" 字段，schema 5）：
+#   * refs           折叠解析出来的每个 pid 的策略内容摘要（_object_digest 按
+#                    对象身份记忆，热路径 O(1)）；pid 当时查不到记 None（=该
+#                    pid 必须继续缺席，出现即作废）。
+#   * timeline       时间线依赖的投影摘要（没有依赖时 None）。
+#   * timeline_at    无引用且成本非零的行的 at 上界。
+#   * timeline_models 上述行的模型集合。
+#   * unresolved     上述行里整条时间线都没提到的模型（解析扫过全部行）。
+#   * backfilled     上述行里出现过回填解析（解析扫过全部行）。
+#   * builtin        用到内置快照时，内置价目表文档的内容摘要。
+#
+# 判定侧 _pricing_used_unchanged() 从当前价表重算同一份记录并逐项比对，不等
+# 就判废重折；相等的部分保证「重折会给出同样的数」。
+#
+# 不动的东西：_row_cost / _row_cost_remember（行级记忆代次仍用整表判定）、
+# series（不算价）、任何聚合口径与窗口路径。
+# ---------------------------------------------------------------------------
+
+# 记录里的固定字段（进程内构造与 checkpoint 采纳都按这一组校验）。
+_PRICED_FIELDS = ("refs", "timeline", "timeline_at", "timeline_models",
+                  "unresolved", "backfilled", "builtin")
+
+
+def _pricing_record_new():
+    """一份空的状态指纹记录（见上面一节；字段固定、可 JSON 往返）。"""
+    return {"refs": {}, "timeline": None, "timeline_at": None,
+            "timeline_models": [], "unresolved": [], "backfilled": False,
+            "builtin": None}
+
+
+def _pricing_record_ok(record):
+    """状态指纹记录的形状；不合格的记录按「价表变了」处理（判废重折）。"""
+    if not isinstance(record, dict):
+        return False
+    for field in _PRICED_FIELDS:
+        if field not in record:
+            return False
+    refs = record["refs"]
+    if not isinstance(refs, dict):
+        return False
+    for pid, digest in refs.items():
+        if not isinstance(pid, str) or not (digest is None
+                                            or isinstance(digest, str)):
+            return False
+    for field in ("timeline", "builtin"):
+        value = record[field]
+        if not (value is None or isinstance(value, str)):
+            return False
+    at = record["timeline_at"]
+    if not (at is None or _usage_cache_number(at)):
+        return False
+    for field in ("timeline_models", "unresolved"):
+        value = record[field]
+        if not isinstance(value, list) or not all(isinstance(v, str)
+                                                  for v in value):
+            return False
+    return isinstance(record["backfilled"], bool)
+
+
+def _copy_pricing_record(record):
+    """记录的深拷贝：落盘在状态锁外序列化，记录必须和活状态脱钩。"""
+    if record is None:
+        return None
+    copy = dict(record)
+    copy["refs"] = dict(record.get("refs") or {})
+    copy["timeline_models"] = list(record.get("timeline_models") or ())
+    copy["unresolved"] = list(record.get("unresolved") or ())
+    return copy
+
+
+def _timeline_at_value(value):
+    """一个 at 值按数字比（坏值按 0，与折叠里的 `at or 0` 同口径）。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _timeline_row_at(row):
+    """时间线一行的 at。"""
+    return _timeline_at_value(row.get("at"))
+
+
+# 时间线投影摘要的记忆：值是一个元组 (时间线对象, 参数键, 摘要)，一次 get 拿全
+# （与 _object_digest 的记忆同一个写法）——两个状态锁下的线程同时算也不会读到
+# 拼起来的值；元组里握着时间线对象，身份不会被回收复用。
+_pricing_timeline_memo = {}
+
+
+def _pricing_timeline_digest(timeline, record):
+    """记录里时间线依赖的投影摘要（折叠侧收尾与判定侧共用一份定义）。
+
+    投影 = [[行 at, 该行里 timeline_models 的 {model: pid} 子字典], ...]，
+    摘要 = 排序 JSON + sha1：
+
+      * backfilled 为真（有行靠回填解析）：整条时间线——那批行的解析扫过全部
+        行，任何追加都可能改变结果（保守）；
+      * 否则：at <= timeline_at 的行，外加最早那一行（二分夹逼 index=0 时会读
+        它）；每行只取 timeline_models 里的子字典，无关模型的价变动不进依赖
+        ——这正是 T15 要收掉的重折。行本身（连 at）都要进投影：at 的增减会
+        挪动二分的结果；
+      * unresolved（整条时间线都没提到过的模型）：整条时间线里「提到它的行」
+        ——那批行的解析扫过全部行，之后任何时刻补一行都会改变结果。
+
+    timeline_models 为空（没有无引用非零成本的行）时没有依赖，返回 None。
+    按（时间线对象, 记录参数）记忆：一次刷新里 5 条状态共用同一份时间线，
+    记录没变时只算一次。
+    """
+    models = record.get("timeline_models") or ()
+    if not models:
+        return None
+    key = (record.get("timeline_at"), tuple(models),
+           tuple(record.get("unresolved") or ()),
+           bool(record.get("backfilled")))
+    hit = _pricing_timeline_memo.get(id(timeline))
+    if hit is not None and hit[0] is timeline and hit[1] == key:
+        return hit[2]
+    wanted = set(models)
+    rows = list(timeline or ())
+    parts = []
+    if key[3]:
+        scope = rows
+    else:
+        bound = _timeline_at_value(record.get("timeline_at"))
+        scope = [row for row in rows if _timeline_row_at(row) <= bound]
+        if rows and not scope:
+            scope = rows[:1]
+    parts.append([[_timeline_row_at(row),
+                   {m: pid for m, pid in (row.get("policies") or {}).items()
+                    if m in wanted}]
+                  for row in scope])
+    for model in sorted(record.get("unresolved") or ()):
+        parts.append([[_timeline_row_at(row), (row.get("policies") or {})[model]]
+                      for row in rows
+                      if model in (row.get("policies") or {})])
+    try:
+        payload = json.dumps(parts, sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":")).encode("utf-8")
+    except Exception:
+        return None
+    digest = hashlib.sha1(payload).hexdigest()
+    if len(_pricing_timeline_memo) > 8:
+        # 正常进程里时间线只在价格变化时换代；这里只是给长期运行兜底
+        # （与 _object_digest 的记忆同一条规则）。
+        _pricing_timeline_memo.clear()
+    _pricing_timeline_memo[id(timeline)] = (timeline, key, digest)
+    return digest
+
+
+def _priced_note(priced, row, cost, pricing):
+    """把一行「用到的价」记进状态指纹记录（折叠侧；见上面一节）。
+
+    refs 收下解析出来的 pid 的内容摘要（显式引用 + 时间线解析）；无显式引用
+    且成本非零的行另记时间线依赖。总开关关掉（cost 带 disabled）或价表读不
+    出来（pricing 为 None）时不记——前者折叠没读任何价、后者记不完整，两种
+    都由判定侧按「记录对不上」兜底作废。
+
+    热路径开销：每行几次 dict 查找 + 按对象身份记忆的摘要（第一次之后 O(1)），
+    只有无引用非零成本的行（旧前缀，一次性折过）才会碰列表；那批行里落到
+    内置快照的（模型从未进过时间线）再问一次 policy_ref_at 把依赖记准。
+    """
+    if priced is None or pricing is None or not cost:
+        return
+    if cost.get("disabled"):
+        return
+    source = cost.get("source")
+    if source and source != "builtin":
+        if source not in priced["refs"]:
+            # 一次扫描里价表不变，同一个 pid 的摘要只算一次：命中记忆之后
+            # 这一步就只剩一次成员检查（真机 4.7 万行里只有几个不同 pid）。
+            policy = (pricing[1] or {}).get(source)
+            priced["refs"][source] = (_object_digest(policy)
+                                      if policy is not None else None)
+    else:
+        # 内置快照：文档摘要一变，这些行的价就变（同一份文档只算一次摘要）。
+        doc = pricing[3]
+        if doc is not None and priced["builtin"] is None:
+            priced["builtin"] = _object_digest(doc)
+    pid = row.get("cost_policy")
+    if pid:
+        # 显式引用：价由 refs 看住，与时间线无关；引用的策略当前查不到时
+        # 按「不存在」记，它一旦出现（内容当然也就变了）必须作废重折。
+        if pid not in priced["refs"]:
+            priced["refs"][pid] = None
+        return
+    if not cost.get("known") or not cost.get("cny"):
+        return                       # 零成本：数值上不依赖价表（refs 已记）
+    at = row.get("at") or 0
+    bound = priced["timeline_at"]
+    if bound is None or at > bound:
+        priced["timeline_at"] = at
+    model = row.get("model")
+    if model is not None and model not in priced["timeline_models"]:
+        priced["timeline_models"].append(model)
+        priced["timeline_models"].sort()
+    backfilled = bool(cost.get("backfilled"))
+    if source == "builtin":
+        # 解析结果没进 cost（pid 为空、或它的策略查不到，两条都落到内置快照）：
+        # 再问一次时间线，把「解析出没出 pid / 是不是回填」记准。
+        resolved, scan_backfilled = wb_pricing.policy_ref_at(at, model)
+        if resolved is None:
+            # 整条时间线都没提到这个模型：解析扫过全部行，之后任何时刻补一
+            # 行都会改变结果，所以它按「整条时间线里提到它的行」记账。
+            if model is not None and model not in priced["unresolved"]:
+                priced["unresolved"].append(model)
+                priced["unresolved"].sort()
+        else:
+            backfilled = backfilled or bool(scan_backfilled)
+            if resolved not in priced["refs"]:
+                priced["refs"][resolved] = None
+    if backfilled:
+        priced["backfilled"] = True
+
+
+def _pricing_record_close(priced, pricing):
+    """一次成功的折叠收尾：把时间线投影摘要刷成当前参数下的值。
+
+    记录在折叠过程中增量更新（新行进来只加不改），摘要必须跟着参数走——
+    下一次判定拿它跟「当前时间线按同一组参数算出来的投影」比。按时间线对象
+    与参数记忆，参数没动时这里只是一次查表。
+    """
+    if priced is None or pricing is None:
+        return
+    priced["timeline"] = _pricing_timeline_digest(pricing[2], priced)
+
+
+def _pricing_used_unchanged(record, pricing):
+    """折叠行真正用到的价，与当前价表一致？（T15 的状态判废判定）
+
+    只读记录与当前价表、不碰日志：refs 逐个 pid 比对内容摘要（查不到 = 变化；
+    折叠时查不到的 pid 出现也是变化），时间线依赖重算同一份投影摘要，builtin
+    比对文档摘要。任何一项对不上就返回 False（状态作废、重折）。
+
+    pricing 为 None（价表读不出来）时不能确认，一律 False；总开关关着时折叠
+    没读任何价，只有「折叠时也没用价」（record 为 None）才算一致。
+    """
+    if pricing is None:
+        return False
+    if not pricing[0]:
+        return record is None
+    if not _pricing_record_ok(record):
+        return False
+    policies = pricing[1]
+    for pid, digest in record["refs"].items():
+        policy = policies.get(pid) if policies else None
+        current = _object_digest(policy) if policy is not None else None
+        if current != digest:
+            return False
+    if record["timeline"] != _pricing_timeline_digest(pricing[2], record):
+        return False
+    if record["builtin"] is not None:
+        if _object_digest(pricing[3]) != record["builtin"]:
+            return False
+    return True
 
 
 def _realm_inputs():
@@ -3333,7 +3603,7 @@ def _realm_fold_reproducible(disk):
     return pool == disk
 
 
-def _scan_usage_from(offset, fold, stop_at=None, skip=None, path=None):
+def _scan_usage_from(offset, fold, stop_at=None, skip=None, skip_raw=None, path=None):
     """Fold every row past `offset` into `fold(row)`; returns (offset, error).
 
     The offset handed back is the end of the last row the pass got through.
@@ -3343,7 +3613,12 @@ def _scan_usage_from(offset, fold, stop_at=None, skip=None, path=None):
 
     `skip(line)` drops a line before the parse; the windowed readers pass
     _line_outside_window() here, so a line the range excludes costs a substring
-    search instead of a json.loads.
+    search instead of a json.loads. `skip_raw(raw)` is the same test on the
+    undecoded line, run before the decode: the windowed readers pass
+    _line_outside_window_bytes(), which only answers True for a line the text
+    check above would drop as well, so a line it drops skips the decode too
+    and no other line reads differently. Both are optional and either may be
+    given alone.
 
     `stop_at` caps the read at the offset an all-time fold has already covered,
     so a windowed payload built on top of that fold describes exactly the same
@@ -3354,9 +3629,10 @@ def _scan_usage_from(offset, fold, stop_at=None, skip=None, path=None):
 
     The log is read in binary and the offset advances by the length of each
     line: a tell() per line costs more than the parse it would be tracking,
-    and an offset only has to be a byte count. Each line is decoded to text
-    before it is looked at, which is the order the text-mode readers read in
-    and the one the pre-filter expects.
+    and an offset only has to be a byte count. Every line that reaches the
+    text checks is decoded to text before it is looked at, which is the order
+    the text-mode readers read in and the one the text-mode pre-filter
+    expects; a line `skip_raw` drops never gets that far.
 
     `error` is the exception that stopped the read, or None. A row the fold
     cannot swallow ends the pass exactly where it used to - the readers have
@@ -3385,6 +3661,14 @@ def _scan_usage_from(offset, fold, stop_at=None, skip=None, path=None):
                     # The line straddles the covered bytes, so the all-time
                     # fold never saw it either: leave it out of this pass too.
                     break
+                # The bytes-level pre-filter runs first: a line it can read
+                # exactly and place outside the window never becomes text at
+                # all. It only answers for lines the text filter below would
+                # drop too (see _line_outside_window_bytes), so the rows this
+                # pass folds are exactly the rows it folded before.
+                if skip_raw is not None and skip_raw(raw):
+                    offset = end
+                    continue
                 try:
                     # Decoded before anything else, exactly as the text-mode
                     # readers do: a line no reader can decode stops them where
@@ -3613,7 +3897,7 @@ def _row_cost_remember(key, pricing, cost):
 
 
 def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
-                         pricing=None):
+                         pricing=None, priced=None):
     """Fold one parsed row into a usage snapshot.
 
     One definition for both callers: the all-time fold (fed only the rows past
@@ -3635,6 +3919,9 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
     `pricing` 是本次扫描开头取到的 _pricing_inputs() 元组（调用方从同一个
     值里取指纹，两处看到的是同一份价表）；传给 _row_cost 当记忆的代次，
     None 表示价表读不出来、不进表。
+
+    `priced` 是本次扫描要填的「用到的价」记录（见「用到的价」状态指纹一节），
+    只有推进状态的那条折叠传它；窗口半/冷扫描传 None，一行都不记。
     """
     if r and not row_matches_realm(row, r):
         return
@@ -3649,6 +3936,11 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
     # _row_cost 按行记忆（见「行级结果记忆」）：同一个视图里这一行只算一次，
     # 第二个视图直接取上次的结果；pricing 是本次扫描的价表代次。
     cost = _row_cost(row, pricing, pricing_on)
+    if outcome != "client_aborted":
+        # 折进去的每一行都把「用到的价」记进状态指纹（中止行只记 errors，
+        # 不碰价，所以不记）。记的是这次折叠真正读到的价，价表无关的变动
+        # 因此不再判废这条状态（见「用到的价」状态指纹一节）。
+        _priced_note(priced, row, cost, pricing)
     model = row.get("model")
     targets = (snap,) if not also else (snap,) + tuple(also)
     if outcome != "completed":
@@ -3700,33 +3992,87 @@ _usage_snap_state = {}
 _usage_snap_state_lock = threading.Lock()
 
 
-def _usage_snap_state_ready(r, pricing_on):
-    """把 `r` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
+def _usage_snap_state_advance(r, pricing_on):
+    """（不折叠）取/建状态、采纳 checkpoint、判废归零、记身份指纹。
 
-    调用方必须已持有 _usage_snap_state_lock。日桶与 all-time 折叠共用这一次
-    扫描（见 _fold_usage_snapshot 的 also），所以窗口半与 all-time 半描述的
-    永远是同一段字节——这正是旧实现用 stop_at 想保证的事。
+    调用方必须已持有 _usage_snap_state_lock。返回本次扫描取到的价表代次
+    （_pricing_inputs 的元组）：调用方把它传给折叠当行级记忆的代次，与记进
+    状态指纹的是同一份，两处不会看到两份价表。
+
+    状态指纹是「折叠行真正用到的价」记录（T15，见「用到的价」状态指纹一节）：
+    折叠时逐行更新（state["pricing"]），扫描成功后把时间线投影摘要刷成当前
+    参数下的值（_pricing_record_close）——下一次判废拿它跟「当前价表按同一组
+    参数算出来的投影」比（_pricing_used_unchanged）。
+
+    状态是否「冷」（这次要付一次全量重折）看折过的位置：state["offset"] > 0
+    表示有可续折的数据；0 表示折叠要从文件头开始——状态刚建、刚被价表 /
+    realm / 日志判废、或 checkpoint 采纳失败。判定只看已折位置与三份指纹，
+    一行都不折，所以窗口路径拿它分流是纯加速：重折之后两边给出的字节完全
+    一致（见 _usage_snap_state_cold）。
+
+    采纳/判废只有这一段定义：_usage_snap_state_ready（all-time 折叠）与
+    窗口路径的冷热判定共用它，两边的规则因此不会漂移。
     """
     state = _usage_snap_state.get(r)
     if state is None:
         state = _usage_snap_state[r] = {"snap": None, "offset": 0, "key": None,
                                         "pricing": None, "realm": None,
                                         "tail": b"", "days": {}, "days_floor": None,
-                                        "hours_floor_at": None}
+                                        "hours_floor_at": None,
+                                        "hits": [], "hits_overflow": False}
     pricing = _pricing_inputs(pricing_on)
     realm = _realm_inputs()
     log_key = _usage_log_key()
+    # 重折时状态指纹从这份空记录重新长起；总开关关着 / 价表读不出来时
+    # 记 None（折叠没读任何价，判定侧只认「记录也是 None」这一种一致）。
+    fresh = _pricing_record_new() if (pricing is not None
+                                      and pricing[0]) else None
     if state["snap"] is None:
         # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
         if not _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
             state.update({"snap": _empty_stats(), "offset": 0, "tail": b"",
-                          "days": {}, "days_floor": None, "hours_floor_at": None})
-    elif (not _pricing_unchanged(state["pricing"], pricing)
+                          "days": {}, "days_floor": None, "hours_floor_at": None,
+                          "hits": [], "hits_overflow": False, "pricing": fresh})
+    elif (not _pricing_used_unchanged(state["pricing"], pricing)
             or state["realm"] != realm
             or not _log_resume_ok(state, log_key)):
         state.update({"snap": _empty_stats(), "offset": 0, "tail": b"",
-                      "days": {}, "days_floor": None, "hours_floor_at": None})
-    state.update({"pricing": pricing, "realm": realm, "key": log_key})
+                      "days": {}, "days_floor": None, "hours_floor_at": None,
+                      "hits": [], "hits_overflow": False, "pricing": fresh})
+    state.update({"realm": realm, "key": log_key})
+    return pricing
+
+
+def _usage_snap_state_cold(r, pricing_on):
+    """窗口请求现在会不会付一次全量重折？True = 会（窗口改走冷扫描）。
+
+    调用方必须已持有 _usage_snap_state_lock。判定就是 all-time 折叠的前半段
+    （_usage_snap_state_advance），不折任何行；为真时窗口半改走按日/按小时
+    分组的冷扫描（_scan_usage_snapshot_window_days / _hours，~1s 量级），
+    重折留给 all-time 视图（_usage_alltime_snapshot）与预热器。
+
+    这条路不写折叠结果，也不改「重折该不该发生」：状态里 offset 仍是 0，
+    下一个 all-time 请求照样从文件头折到文件尾——窗口请求不会把状态冻在
+    冷态。重折发生之后，走不走这条路给出的字节完全相同（冷扫描与日桶/小时
+    桶之和本就是同一批行、同一个求和口径，见两个冷路径函数的 docstring）。
+    """
+    _usage_snap_state_advance(r, pricing_on)
+    return _usage_snap_state[r]["offset"] <= 0
+
+
+def _usage_snap_state_ready(r, pricing_on):
+    """把 `r` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
+
+    调用方必须已持有 _usage_snap_state_lock。日桶与 all-time 折叠共用这一次
+    扫描（见 _fold_usage_snapshot 的 also），所以窗口半与 all-time 半描述的
+    永远是同一段字节——这正是旧实现用 stop_at 想保证的事。
+
+    采纳 checkpoint 与判废归零在 _usage_snap_state_advance 里（窗口路径的
+    冷热判定也用那一段，见 _usage_snap_state_cold），这里只管折到文件尾。
+    """
+    pricing = _usage_snap_state_advance(r, pricing_on)
+    state = _usage_snap_state[r]
+    priced = state["pricing"]
 
     def fold(row):
         # 一行折三处：all-time 半 + 它所属那天的窗口半 + 那个小时的小时桶。
@@ -3735,12 +4081,13 @@ def _usage_snap_state_ready(r, pricing_on):
         hour = None if day is None else _usage_hour_bucket(state, row, day)
         extras = () if day is None else ((day,) if hour is None else (day, hour))
         _fold_usage_snapshot(row, state["snap"], r, None, None, pricing_on,
-                             also=extras, pricing=pricing)
+                             also=extras, pricing=pricing, priced=priced)
 
     offset, error = _scan_usage_from(state["offset"], fold)
     if error is None:
         state["offset"] = offset
         state["tail"] = _log_tail_signature(offset)
+        _pricing_record_close(priced, pricing)
     return state, offset, error
 
 
@@ -3769,7 +4116,8 @@ def _usage_alltime_snapshot(r, pricing_on=None):
             log(f"usage snapshot read failed: {error}")
             snap = state["snap"]
             state.update({"snap": None, "offset": 0, "tail": b"",
-                          "days": {}, "days_floor": None, "hours_floor_at": None})
+                          "days": {}, "days_floor": None, "hours_floor_at": None,
+                          "hits": [], "hits_overflow": False})
     # 落盘决定在锁外做（见 checkpoint 一节）：写盘要逐把读三份状态，在状态
     # 锁里再取别的状态锁会构成锁序环。折叠失败的那次不写——它的 offset 已经
     # 归零，落盘函数也会跳过。
@@ -3782,8 +4130,9 @@ def _scan_usage_snapshot_window(r, since, until, pricing_on=None):
     """One pass over the log, keeping only the rows inside the window.
 
     Nothing is carried over here - a window moves with the clock - but the
-    pre-filter drops the parse for every line it can prove is outside it,
-    which is what keeps a cold day or week view cheap on a multi-day log.
+    pre-filter drops the parse for every line it can prove is outside it, and
+    its bytes-level half drops the decode of those lines as well, which is
+    what keeps a cold day or week view cheap on a multi-day log.
 
     The bounds reach the pre-filter through `or None` because that is the
     test the fold itself applies (`if since and at < since`): a bound of 0
@@ -3801,39 +4150,65 @@ def _scan_usage_snapshot_window(r, since, until, pricing_on=None):
         lambda row: _fold_usage_snapshot(row, snap, r, since, until, pricing_on,
                                          pricing=pricing),
         skip=lambda line: _line_outside_window(line, since or None,
-                                                 until or None))
+                                                 until or None),
+        skip_raw=lambda raw: _line_outside_window_bytes(raw, since or None,
+                                                        until or None))
     if error is not None:
         log(f"usage snapshot read failed: {error}")
     return snap
 
 
-def _usage_snapshot_window_from_days(r, day_key, pricing_on):
+def _usage_snapshot_window_from_days(r, since, until, pricing_on):
     """窗口半快照 = 窗口内的日桶之和；日桶不可用时返回 None。
 
     先把 all-time 折叠推进到文件尾：日桶与它同一次扫描推进，窗口半与
     all-time 半因此描述同一段字节。
+
+    until 开放（None）时窗口从起点一路到文件尾；until 给出时它必须是本地
+    午夜（调用方已按格点判过，这里再校验一次），窗口就是「起点那天起、
+    until 那天之前」的日桶之和。桶按 at 严格切分（恰好落在 until 上的行归
+    until 那天那一桶，见 _usage_hour_bucket），桶切不出那一刻的行，所以
+    那一刻有整秒行时整条路退回 None（见 _closed_window_edge_ok），调用方
+    接着整段扫描，结果不变。
+
+    状态冷（从没折过/刚被价表、realm、日志判废/采纳失败）时直接返回 None：
+    那条路要先付一次全量重折，窗口请求不背它——调用方退回按日分组的冷扫描
+    （同一批行、同一个求和口径，逐字节相同），重折留给 all-time 视图与
+    预热器（见 _usage_snap_state_cold）。
     """
     with _usage_snap_state_lock:
+        if _usage_snap_state_cold(r, pricing_on):
+            return None
         state, offset, error = _usage_snap_state_ready(r, pricing_on)
         if error is not None:
             # 折叠失败时状态已经归零，日桶跟着清空：这一次退回整段扫描，
             # 与「没有缓存」时的行为一致。
             log(f"usage snapshot read failed: {error}")
             state.update({"snap": None, "offset": 0, "tail": b"",
-                          "days": {}, "days_floor": None, "hours_floor_at": None})
+                          "days": {}, "days_floor": None, "hours_floor_at": None,
+                          "hits": [], "hits_overflow": False})
             return None
-        if not _days_cover(state, day_key):
+        day_key = _window_day_key_safe(since)
+        if day_key is None or not _days_cover(state, day_key):
             return None
+        until_key = None
+        if until is not None:
+            until_key = _window_day_key_safe(until)
+            if until_key is None or not _closed_window_edge_ok(state, until):
+                return None
         snap = _empty_stats()
         days = state["days"]
         for key in sorted(days):
-            if key >= day_key:
-                _add_usage_snapshot(snap, days[key])
+            if key < day_key:
+                continue
+            if until_key is not None and key >= until_key:
+                break
+            _add_usage_snapshot(snap, days[key])
     _usage_cache_maybe_save("snapshot", offset)
     return snap
 
 
-def _usage_snapshot_window_from_hours(r, since, pricing_on):
+def _usage_snapshot_window_from_hours(r, since, until, pricing_on):
     """窗口半快照 = 整点窗口内的小时桶之和；小时层不可用时返回 None。
 
     与日桶版同一条规矩：先把 all-time 折叠推进到文件尾（小时桶与它同一次
@@ -3846,22 +4221,43 @@ def _usage_snapshot_window_from_hours(r, since, pricing_on):
         （见 _usage_hour_bucket），这时整个窗口退回扫描，不能只跳过那一天；
       * 每个小时桶的 at 落在「窗口起点 + k*3600」的格点上，且与所属日桶
         对得上（日桶 at + 序号*3600）。这一条挡住夏令时把日边界挪动的
+        情形——与 _series_slice 的格点校验同源；
+      * until 给出时（闭窗口）它也必须落在同一套小时格点上，且直到那一刻
+        没有整秒行（见 _closed_window_edge_ok）：桶按 at 严格切分，窗口
+        只取 at < until 的那批桶，恰好落在 until 上的行由边沿账挡回整段
+        扫描。
+
         情形——与 _series_slice 的格点校验同源。
+
+    状态冷（从没折过/刚被价表、realm、日志判废/采纳失败）时直接返回 None：
+    那条路要先付一次全量重折，窗口请求不背它——调用方退回按小时分组的冷
+    扫描（同一批行、同一个求和口径，逐字节相同），重折留给 all-time 视图
+    与预热器（见 _usage_snap_state_cold）。
     """
     key = _hour_window_key(since)
     if key is None:
         return None
     day_key, k0 = key
+    until_key = None
+    if until is not None:
+        until_key = _hour_window_key(until)
+        if until_key is None:
+            return None
     with _usage_snap_state_lock:
+        if _usage_snap_state_cold(r, pricing_on):
+            return None
         state, offset, error = _usage_snap_state_ready(r, pricing_on)
         if error is not None:
             log(f"usage snapshot read failed: {error}")
             state.update({"snap": None, "offset": 0, "tail": b"",
-                          "days": {}, "days_floor": None, "hours_floor_at": None})
+                          "days": {}, "days_floor": None, "hours_floor_at": None,
+                          "hits": [], "hits_overflow": False})
             return None
         if not _days_cover(state, day_key):
             return None
         if not _hours_cover(state, since):
+            return None
+        if until_key is not None and not _closed_window_edge_ok(state, until):
             return None
         lo = int(since)
         snap = _empty_stats()
@@ -3869,6 +4265,8 @@ def _usage_snapshot_window_from_hours(r, since, pricing_on):
         for key in sorted(days):
             if key < day_key:
                 continue
+            if until_key is not None and key > until_key[0]:
+                break
             bucket = days[key]
             hours = bucket.get("hours")
             if hours is None:
@@ -3885,6 +4283,10 @@ def _usage_snapshot_window_from_hours(r, since, pricing_on):
                     return None
                 if (at - lo) % 3600:
                     return None
+                if until_key is not None and (key, int(hour)) >= until_key:
+                    # 闭窗口：until 那一刻归后一桶（桶按 at 严格切分），
+                    # 只取 at < until 的桶；那一刻有整秒行时上面已经退回。
+                    break
                 _add_usage_snapshot(snap, sub)
     _usage_cache_maybe_save("snapshot", offset)
     return snap
@@ -3893,28 +4295,45 @@ def _usage_snapshot_window_from_hours(r, since, pricing_on):
 def _usage_snapshot_window(r, since, until, pricing_on=None):
     """窗口半快照：对齐窗口由日桶/小时桶相加，其余保持整段扫描。
 
-    只有「until 开放 + 起点落在格点上」的窗口拆得成存量桶的并集：起点是
-    本地午夜时用日桶（today / week / month 都是），起点是本地整点时用小时
-    桶（自定义区间的常见形态，见 _hour_window_key）。自定义区间与带 until
-    的区间一律走整段扫描：起点不落在格点上就拆不开，而 until 落在某天/某
-    小时中间时，那个桶里还有窗口外的行，加进去就是错的。
+    只有「两端都落在同一套格点上」的窗口拆得成存量桶的并集：起点是本地
+    午夜、终点（开放或闭）也是本地午夜时用日桶（today / week / month 与
+    「到某天零点」都是），两端落在本地整点上时用小时桶（自定义区间的常见
+    形态，见 _hour_window_key）。闭窗口的右边界按「at < until 的桶」切
+    （见 _closed_window_edge_ok）：那一刻有整秒行时退回整段扫描，结果与
+    改动前逐字节一致——闭窗口本来走的就是这条兜底。起点不落在格点上、
+    或 until 不落格点的窗口同样保持整段扫描。
     """
     if until is None:
-        day_key = _window_day_key(since)
+        day_key = _window_day_key_safe(since)
         if day_key is not None and _usage_day_buckets_enabled():
-            snap = _usage_snapshot_window_from_days(r, day_key, pricing_on)
+            snap = _usage_snapshot_window_from_days(r, since, None, pricing_on)
             if snap is not None:
                 return snap
             # 日桶没盖住窗口起点（还没折过/被剪枝/折叠出错）：冷路径现折一份
             # 按日分组的窗口半，口径与日桶状态一致，两条路径的字节因此相同。
-            return _scan_usage_snapshot_window_days(r, since, pricing_on)
-        if _usage_day_buckets_enabled() and _hour_window_key(since) is not None:
-            snap = _usage_snapshot_window_from_hours(r, since, pricing_on)
+            return _scan_usage_snapshot_window_days(r, since, None, pricing_on)
+        if _usage_day_buckets_enabled() and _window_hour_key_safe(since) is not None:
+            snap = _usage_snapshot_window_from_hours(r, since, None, pricing_on)
             if snap is not None:
                 return snap
             # 小时层没盖住窗口起点（还没折过/被剪枝/那天的小时格点不成立）：
             # 冷路径现折一份按小时分组的窗口半，口径与小时桶状态一致。
-            return _scan_usage_snapshot_window_hours(r, since, pricing_on)
+            return _scan_usage_snapshot_window_hours(r, since, None, pricing_on)
+        return _scan_usage_snapshot_window(r, since, until, pricing_on)
+    # 闭窗口：两端都落在格点上才有桶可借（与上面同一套格点校验）。
+    if _usage_day_buckets_enabled():
+        if (_window_day_key_safe(since) is not None
+                and _window_day_key_safe(until) is not None):
+            snap = _usage_snapshot_window_from_days(r, since, until, pricing_on)
+            if snap is not None:
+                return snap
+            return _scan_usage_snapshot_window_days(r, since, until, pricing_on)
+        if (_window_hour_key_safe(since) is not None
+                and _window_hour_key_safe(until) is not None):
+            snap = _usage_snapshot_window_from_hours(r, since, until, pricing_on)
+            if snap is not None:
+                return snap
+            return _scan_usage_snapshot_window_hours(r, since, until, pricing_on)
     return _scan_usage_snapshot_window(r, since, until, pricing_on)
 
 
@@ -4113,6 +4532,9 @@ def usage_timeseries_etag(realm=None, range=None, since=None, until=None,
 # and record_error put the timestamp first and json.dumps keeps that order -
 # which is what makes the window pre-filter below possible.
 _AT_PREFIX = '{"at": '
+# The same prefix as bytes: _line_outside_window_bytes() reads the undecoded
+# line, and deriving the bytes from the text keeps the two in step.
+_AT_PREFIX_B = _AT_PREFIX.encode("ascii")
 
 
 def _line_outside_window(line, lo, hi):
@@ -4154,6 +4576,57 @@ def _line_outside_window(line, lo, hi):
     if not ((lo is not None and at < lo) or (hi is not None and at > hi)):
         return False
     return line.find('"at"', end) < 0
+
+
+def _line_outside_window_bytes(raw, lo, hi):
+    """_line_outside_window() on the undecoded line: True only when the text
+    check would answer True too.
+
+    The scan reads bytes and only then decodes, so the same test can run
+    before the decode and a line it drops never becomes text at all - which
+    is the whole point, since a narrow window leaves most of a multi-day log
+    outside it. The rules are the text version's, read off the bytes: same
+    prefix, same first comma, same float-token requirement, same window
+    comparison, same "no later `"at"` key" test (see that docstring for what
+    each one is protecting).
+
+    One extra condition: the line has to be ASCII from end to end. Two things
+    ride on it. It makes the byte read exact - every character the text check
+    would see is the byte the check saw - and it is what keeps a line no
+    reader can decode out of the skip path. On the text path that line stops
+    the pass with UnicodeDecodeError before any filter runs (see
+    _scan_usage_from), so skipping it here would fold in rows the old pass
+    never reached. ASCII is a subset of UTF-8, so an all-ASCII line always
+    decodes, and a line with anything else in it returns False and is decoded
+    and filtered exactly as before.
+
+    False therefore means "decode it and check as before", never "this line
+    is inside the window". Bounds must be the ones handed to
+    _line_outside_window(): this check is only allowed to drop lines that one
+    drops.
+    """
+    if not raw.startswith(_AT_PREFIX_B):
+        return False
+    end = raw.find(b",", len(_AT_PREFIX_B))
+    if end < 0:
+        return False
+    token = raw[len(_AT_PREFIX_B):end]
+    # 46/101/69 are `.`/`e`/`E` as byte values. The test is spelled with int
+    # needles because on bytes an int needle is a plain single-byte scan
+    # (memchr), where `b"." in token` runs the general substring search - about
+    # four times the cost on a token this short, paid once per skipped line.
+    # The answer is the text version's either way.
+    if 46 not in token and 101 not in token and 69 not in token:
+        return False
+    try:
+        at = float(token)
+    except ValueError:
+        return False
+    if not ((lo is not None and at < lo) or (hi is not None and at > hi)):
+        return False
+    if raw.find(b'"at"', end) >= 0:
+        return False
+    return raw.isascii()
 
 
 def _usage_timeseries_scan(realm, lo, hi, step):
@@ -4265,6 +4738,7 @@ def _usage_timeseries_uncached(realm, lo, hi, step):
                 log("usage timeseries fold failed: %s" % error)
                 state.update({"days": {}, "days_floor": None, "max_at": 0,
                               "credits": [], "minutes": {}, "minutes_from": None,
+                              "hits": [], "hits_overflow": False,
                               "offset": 0, "tail": b""})
             else:
                 out = _series_slice(state, realm, lo, hi, step, day_key)
@@ -5804,7 +6278,7 @@ def _bump_analytics_models(tgt, m_id, vals, is_err, cost_cny):
 
 
 def _fold_usage_analytics(row, realm, maps, half, pricing_on=None, also=None,
-                          pricing=None):
+                          pricing=None, priced=None):
     """Fold one parsed row into one half of the analytics payload.
 
     `maps` holds the four maps that half folds into and `half` names the stat
@@ -5823,6 +6297,9 @@ def _fold_usage_analytics(row, realm, maps, half, pricing_on=None, also=None,
 
     `pricing` 是本次扫描开头取到的 _pricing_inputs() 元组（见
     _fold_usage_snapshot 的同名参数）。
+
+    `priced` 是本次扫描要填的「用到的价」记录（见「用到的价」状态指纹一节），
+    只有推进状态的那条折叠传它；窗口半/冷扫描传 None。
     """
     if realm and not row_matches_realm(row, realm):
         return
@@ -5835,6 +6312,8 @@ def _fold_usage_analytics(row, realm, maps, half, pricing_on=None, also=None,
         return
     is_err = outcome != "completed"
     cost = _row_cost(row, pricing, pricing_on)
+    # 折进去的每一行都把「用到的价」记进状态指纹（中止行在上面整行跳过）。
+    _priced_note(priced, row, cost, pricing)
     cost_cny = cost["cny"] if cost["known"] else 0.0
     vals = _analytics_row_values(row)
     acct_uid = row.get("account") or "(unattributed)"
@@ -5928,6 +6407,57 @@ def _analytics_all_time(realm, pricing_on=None):
     return maps, offset
 
 
+def _analytics_state_advance(realm, pricing_on=None):
+    """（不折叠）取/建状态、采纳 checkpoint、判废归零、记指纹。
+
+    调用方必须已持有 _analytics_state_lock。返回本次扫描取到的价表代次
+    （与记进状态指纹的是同一份）。状态是否「冷」（这次要付一次全量重折）看
+    state["offset"]：> 0 表示有可续折的数据，0 表示折叠要从文件头开始——
+    状态刚建、刚被价表 / realm / 日志判废、或 checkpoint 采纳失败。与
+    snapshot 侧同一套分工：采纳/判废只有这一段定义，_analytics_state_ready
+    与窗口路径的冷热判定（_analytics_state_cold）共用它，两边不会漂移。
+    """
+    state = _analytics_state.get(realm)
+    if state is None:
+        state = _analytics_state[realm] = {"maps": _new_analytics_maps(),
+                                           "offset": 0, "key": None,
+                                           "pricing": None, "realm": None,
+                                           "tail": b"", "days": {},
+                                           "days_floor": None, "max_at": 0,
+                                           "hours_keep": True,
+                                           "hits": [], "hits_overflow": False}
+    pricing = _pricing_inputs(pricing_on)
+    realm_inputs = _realm_inputs()
+    log_key = _usage_log_key()
+    fresh = _pricing_record_new() if (pricing is not None
+                                      and pricing[0]) else None
+    if state["key"] is None:
+        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
+        if not _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
+            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                          "days": {}, "days_floor": None, "max_at": 0,
+                          "hits": [], "hits_overflow": False, "pricing": fresh})
+    elif (not _pricing_used_unchanged(state["pricing"], pricing)
+            or state["realm"] != realm_inputs
+            or not _log_resume_ok(state, log_key)):
+        state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
+                      "days": {}, "days_floor": None, "max_at": 0,
+                      "hits": [], "hits_overflow": False, "pricing": fresh})
+    state.update({"realm": realm_inputs, "key": log_key})
+    return pricing
+
+
+def _analytics_state_cold(realm, pricing_on=None):
+    """窗口请求现在会不会付一次全量重折？True = 会（窗口改走冷扫描）。
+
+    调用方必须已持有 _analytics_state_lock。语义与 _usage_snap_state_cold
+    逐条相同：判定不折叠、不写结果，窗口请求不会把状态冻在冷态（offset 仍是
+    0，下一个 all-time 半的请求照样从零折到文件尾），重折之后两边字节一致。
+    """
+    _analytics_state_advance(realm, pricing_on)
+    return _analytics_state[realm]["offset"] <= 0
+
+
 def _analytics_state_ready(realm, pricing_on=None):
     """把 `realm` 的 all-time 折叠推进到文件尾；返回 (state, offset, error)。
 
@@ -5938,29 +6468,17 @@ def _analytics_state_ready(realm, pricing_on=None):
     `hours_keep` 标记这份状态要维护小时子表（剪枝线比日桶短，见
     _prune_day_buckets）；`max_at` 是折过的最大 at（含 realm 不匹配的行），
     小时窗口靠它判断窗口上界有没有切掉桶里的行。
+
+    状态指纹是「折叠行真正用到的价」记录（T15，见「用到的价」状态指纹一节）：
+    折叠时逐行更新（state["pricing"]），扫描成功后刷时间线投影摘要
+    （_pricing_record_close），判废走 _pricing_used_unchanged。
+
+    采纳 checkpoint 与判废归零在 _analytics_state_advance 里（窗口路径的
+    冷热判定也用那一段），这里只管折到文件尾。
     """
-    state = _analytics_state.get(realm)
-    if state is None:
-        state = _analytics_state[realm] = {"maps": _new_analytics_maps(),
-                                           "offset": 0, "key": None,
-                                           "pricing": None, "realm": None,
-                                           "tail": b"", "days": {},
-                                           "days_floor": None, "max_at": 0,
-                                           "hours_keep": True}
-    pricing = _pricing_inputs(pricing_on)
-    realm_inputs = _realm_inputs()
-    log_key = _usage_log_key()
-    if state["key"] is None:
-        # 全新状态（进程刚起来）：先问 checkpoint，问不到才从零折起。
-        if not _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
-            state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
-                          "days": {}, "days_floor": None, "max_at": 0})
-    elif (not _pricing_unchanged(state["pricing"], pricing)
-            or state["realm"] != realm_inputs
-            or not _log_resume_ok(state, log_key)):
-        state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
-                      "days": {}, "days_floor": None, "max_at": 0})
-    state.update({"pricing": pricing, "realm": realm_inputs, "key": log_key})
+    pricing = _analytics_state_advance(realm, pricing_on)
+    state = _analytics_state[realm]
+    priced = state["pricing"]
 
     def fold(row):
         # 一行折三处：all-time 半 + 它所属那天的窗口半 + 那天里它所属那小时
@@ -5978,35 +6496,58 @@ def _analytics_state_ready(realm, pricing_on=None):
             also = ((day, _ANALYTICS_WINDOW), (hour, _ANALYTICS_WINDOW))
         _fold_usage_analytics(
             row, realm, state["maps"], _ANALYTICS_ALL, pricing_on, also=also,
-            pricing=pricing)
+            pricing=pricing, priced=priced)
 
     offset, error = _scan_usage_from(state["offset"], fold)
     if error is None:
         state["offset"] = offset
         state["tail"] = _log_tail_signature(offset)
+        _pricing_record_close(priced, pricing)
     return state, offset, error
 
 
-def _analytics_window_from_days(realm, day_key, pricing_on):
+def _analytics_window_from_days(realm, day_key, until, pricing_on):
     """窗口半 maps = 窗口内的日桶之和；日桶不可用时返回 None。
 
     先确保 all-time 折叠推进到文件尾：日桶与它同一次扫描推进，窗口半与
     all-time 半因此描述同一段字节（旧实现用 stop_at 保证的同一件事）。
+
+    until 给出时（闭窗口）它必须是本地午夜（调用方已按格点判过，这里再
+    校验一次），窗口只取 at < until 的那批日桶：恰好落在 until 上的行归
+    until 那天那一桶（桶按 at 严格切分，见 _usage_hour_bucket），桶切不出
+    那一刻的行，所以那一刻有整秒行时整条路退回 None（见
+    _closed_window_edge_ok），调用方接着整段扫描，结果不变。
+
+    状态冷（从没折过/刚被价表、realm、日志判废/采纳失败）时直接返回 None：
+    那条路要先付一次全量重折，窗口请求不背它——调用方退回按日分组的冷扫描
+    （同一批行、同一个求和口径，逐字节相同），重折留给 all-time 半与预热器
+    （见 _analytics_state_cold）。
     """
     with _analytics_state_lock:
+        if _analytics_state_cold(realm, pricing_on):
+            return None
         state, offset, error = _analytics_state_ready(realm, pricing_on)
         if error is not None:
             log("compute_usage_analytics failed: %s" % error)
             state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
-                          "days": {}, "days_floor": None, "max_at": 0})
+                          "days": {}, "days_floor": None, "max_at": 0,
+                          "hits": [], "hits_overflow": False})
             return None
         if not _days_cover(state, day_key):
             return None
+        until_key = None
+        if until is not None:
+            until_key = _window_day_key_safe(until)
+            if until_key is None or not _closed_window_edge_ok(state, until):
+                return None
         maps = _new_analytics_maps()
         days = state["days"]
         for key in sorted(days):
-            if key >= day_key:
-                _add_analytics_window_maps(maps, days[key])
+            if key < day_key:
+                continue
+            if until_key is not None and key >= until_key:
+                break
+            _add_analytics_window_maps(maps, days[key])
     _usage_cache_maybe_save("analytics", offset)
     return maps
 
@@ -6038,20 +6579,38 @@ def _analytics_window_from_hours(realm, since, until, pricing_on):
 
     成立条件（缺一不可，任何一条不成立就退回扫描——正确性优先）：
       * 窗口起点落在本地午夜起算的小时格点上（调用方已判过，这里再按桶校验）；
-      * until 开放，或 until 不低于折过的最大 at（否则窗口上界会切掉桶里的行）；
+      * until 开放，或 until 不低于折过的最大 at（否则窗口上界会切掉桶里的行），
+        或 until 落在同一套小时格点上且直到那一刻没有整秒行（见
+        _closed_window_edge_ok）——这时窗口只取 at < until 的那批桶，恰好
+        落在 until 上的行由边沿账挡回整段扫描；
       * days_floor 覆盖窗口起点所在的天（更早的天没有桶）；
       * 窗口起点所在的天及其后每一天都有 hours 子表（被剪枝线剪掉、或本地
         午夜落在不存在的小时里而摘掉的那天，都会让窗口整体退回扫描）。
+
+    状态冷（从没折过/刚被价表、realm、日志判废/采纳失败）时直接返回 None：
+    那条路要先付一次全量重折，窗口请求不背它——调用方退回按小时分组的冷
+    扫描（同一批行、同一个求和口径，逐字节相同），重折留给 all-time 半与
+    预热器（见 _analytics_state_cold）。
     """
     with _analytics_state_lock:
+        if _analytics_state_cold(realm, pricing_on):
+            return None
         state, offset, error = _analytics_state_ready(realm, pricing_on)
         if error is not None:
             log("compute_usage_analytics failed: %s" % error)
             state.update({"maps": _new_analytics_maps(), "offset": 0, "tail": b"",
-                          "days": {}, "days_floor": None, "max_at": 0})
+                          "days": {}, "days_floor": None, "max_at": 0,
+                          "hits": [], "hits_overflow": False})
             return None
-        if until is not None and until < state["max_at"]:
-            return None
+        cut_at = None
+        if until is not None:
+            if until < state["max_at"]:
+                # 闭窗口切进桶里：until 必须落在同一套小时格点上、且直到
+                # 那一刻没有整秒行，桶才切得出这个窗口。
+                if (_window_hour_key_safe(until) is None
+                        or not _closed_window_edge_ok(state, until)):
+                    return None
+                cut_at = int(until)
         day_key = _local_day_key(since)
         if not _days_cover(state, day_key):
             return None
@@ -6060,6 +6619,8 @@ def _analytics_window_from_hours(realm, since, until, pricing_on):
         for key in sorted(state["days"]):
             if key < day_key:
                 continue
+            if cut_at is not None and _day_key_start(key) > cut_at:
+                break
             bucket = state["days"][key]
             hours = bucket.get("hours")
             if hours is None:
@@ -6077,6 +6638,10 @@ def _analytics_window_from_hours(realm, since, until, pricing_on):
                     return None
                 if int(sub["at"]) < lo_i:
                     continue
+                if cut_at is not None and int(sub["at"]) >= cut_at:
+                    # 闭窗口：until 那一刻归后一桶（桶按 at 严格切分），
+                    # 只取 at < until 的桶；那一刻有整秒行时上面已经退回。
+                    break
                 _add_analytics_window_maps(maps, sub)
     _usage_cache_maybe_save("analytics", offset)
     return maps
@@ -6085,18 +6650,21 @@ def _analytics_window_from_hours(realm, since, until, pricing_on):
 def _analytics_window(realm, since, until, stop_at, pricing_on):
     """窗口半 analytics：对齐窗口由日桶/小时桶相加，其余保持整段扫描。
 
-    与 _usage_snapshot_window 同一条规矩，外加一层小时桶：只有「until 开放 +
-    起点是本地午夜」的窗口拆得成整天的并集；起点落在整小时的其它窗口（自定义
-    区间）拆得成整小时的并集，由 analytics 自己的小时层回答（见「小时层」
-    一节）；其余一律保持整段扫描。
+    与 _usage_snapshot_window 同一条规矩，外加一层小时桶：起点是本地午夜、
+    终点开放或也是本地午夜的窗口拆得成整天的并集；起点落在整小时的其它窗口
+    （自定义区间）拆得成整小时的并集，由 analytics 自己的小时层回答（见
+    「小时层」一节）；其余一律保持整段扫描。闭窗口的右边界按「at < until
+    的桶」切，那一刻有整秒行时退回扫描（见 _closed_window_edge_ok）。
     """
-    day_key = _window_day_key(since) if until is None else None
-    if day_key is not None and _usage_day_buckets_enabled():
-        maps = _analytics_window_from_days(realm, day_key, pricing_on)
+    day_key = _window_day_key_safe(since)
+    until_day = None if until is None else _window_day_key_safe(until)
+    if (day_key is not None and _usage_day_buckets_enabled()
+            and (until is None or until_day is not None)):
+        maps = _analytics_window_from_days(realm, day_key, until, pricing_on)
         if maps is not None:
             return maps
         # 日桶没盖住窗口起点：冷路径现折一份按日分组的窗口半，口径一致。
-        return _scan_usage_analytics_window_days(realm, since, stop_at,
+        return _scan_usage_analytics_window_days(realm, since, until, stop_at,
                                                  pricing_on)
     if _window_hour_aligned(since) and _usage_day_buckets_enabled():
         maps = _analytics_window_from_hours(realm, since, until, pricing_on)
@@ -6135,7 +6703,8 @@ def _scan_usage_analytics_window(realm, since, until, stop_at=None, pricing_on=N
 
     _, error = _scan_usage_from(
         0, fold, stop_at=stop_at,
-        skip=lambda line: _line_outside_window(line, since, until))
+        skip=lambda line: _line_outside_window(line, since, until),
+        skip_raw=lambda raw: _line_outside_window_bytes(raw, since, until))
     if error is not None:
         log("compute_usage_analytics failed: %s" % error)
     return maps
@@ -6470,6 +7039,67 @@ def _window_hour_aligned(since):
     return (_local_midnight(since) - since) % 3600 == 0
 
 
+# 闭窗口边沿账的上限：只有「at 恰好落在整秒上」的行进账，真实日志里几乎为
+# 零（at 是 time.time() 的浮点秒，落在整秒上的概率约百万分之一）。手改过的
+# 日志可能有很多，超过上限就停记并留痕——闭窗口退回整段扫描，正确性优先。
+_CLOSED_WINDOW_HITS_MAX = 256
+
+
+def _closed_window_hit_record(state, at):
+    """行恰好落在整秒上时记一笔（闭窗口走桶求和的边沿账）。
+
+    桶按 at 严格切分（见 _usage_hour_bucket）：闭窗口 [since, until] 与
+    「at < until 的那批桶」只差「恰好落在 until 上的行」，所以直到那一刻
+    没有整秒行时，桶的和就是窗口的全部（见 _closed_window_edge_ok）。这份
+    账只收真正进了桶的那些行（realm/剪枝线与折叠同一套判定），记录点因此
+    在 _usage_day_bucket 的过滤之后。
+
+    at 不是有限数（手改日志的 Infinity/NaN）时整秒判定不成立就跳过——
+    `at // 1` 对这些值不抛异常，不把一次折叠打断在这里。
+    """
+    if at != at // 1:
+        return
+    hits = state["hits"]
+    if len(hits) >= _CLOSED_WINDOW_HITS_MAX:
+        state["hits_overflow"] = True
+        return
+    hits.append(int(at))
+
+
+def _closed_window_edge_ok(state, until):
+    """闭窗口的右边界能否由存量桶回答：直到 until 为止没有行落在整秒上。
+
+    直到那一刻没有整秒行时，「[since, until] 的行」与「at < until 的桶」是
+    同一批（桶按 at 严格切分，恰好落在 until 上的行归后一桶）；真有一行
+    恰好落在 until 上时桶切不出它，只能退回整段扫描。账记满（见
+    _closed_window_hit_record）同样退回。
+    """
+    if state["hits_overflow"]:
+        return False
+    return until not in state["hits"]
+
+
+def _window_day_key_safe(ts):
+    """_window_day_key 的取值安全版：取值离谱时返回 None。
+
+    手写的极大 since/until（例如 6e18）会让 _local_midnight 里的
+    time.localtime 抛 OSError——那只是「这个窗口服务不了」的一种，按退回
+    整段扫描处理，不该把端点打成 500（与 _series_window_day_key 同一个用意）。
+    """
+    try:
+        return _window_day_key(ts)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _window_hour_key_safe(ts):
+    """_hour_window_key 的取值安全版：取值离谱时返回 None（同上）。"""
+    try:
+        return _hour_window_key(ts)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _new_window_snapshot_bucket(at):
     """一份带格点 at 的窗口半快照桶（日桶与小时桶共用这个形状）。
 
@@ -6556,6 +7186,7 @@ def _usage_day_bucket(state, row, r, factory):
         # 剪枝线以下的天：那些桶已经被丢掉，而且任何可服务的窗口都从
         # days_floor 那天起，这一行不在其中——跳过不影响窗口。
         return None
+    _closed_window_hit_record(state, at)
     days = state["days"]
     bucket = days.get(key)
     if bucket is None:
@@ -6815,16 +7446,19 @@ def _copy_analytics_window_maps(maps):
     return out
 
 
-def _scan_usage_snapshot_window_days(r, since, pricing_on=None):
+def _scan_usage_snapshot_window_days(r, since, until, pricing_on=None):
     """窗口半的冷路径：整段扫一遍，先按日分桶再相加。
 
     日桶状态不可用（还没折过、被剪枝、折叠出错）时走这里。结果必须与日桶
-    状态给出的窗口半逐字节一致：窗口起点是本地午夜，两边装的是同一批行、
-    同一个「按日分组」的求和口径，只是桶一个现折、一个存量。
+    状态给出的窗口半逐字节一致：窗口起点是本地午夜（until 给出时终点也是
+    本地午夜），两边装的是同一批行、同一个「按日分组」的求和口径，只是桶
+    一个现折、一个存量。
 
-    这条路通常紧跟一次 all-time 折叠（_usage_snapshot_window_from_days 先
-    折到文件尾才发现日桶不够用），所以行级记忆在这里几乎全中：同一批行刚
-    在 all-time 半算过价与日键。价表照样在本函数开头取一次。
+    状态冷时它是窗口请求的直接答案（不折状态，重折留给 all-time 视图与
+    预热器，见 _usage_snap_state_cold）；其余情形它紧跟一次 all-time 折叠
+    （_usage_snapshot_window_from_days 先折到文件尾才发现日桶不够用），
+    行级记忆几乎全中：同一批行刚在 all-time 半算过价与日键。窗口外的行由
+    skip 挡在解析之前，这条路只付窗口内那批行。价表照样在本函数开头取一次。
     """
     pricing = _pricing_inputs(pricing_on)
     days = {}
@@ -6832,6 +7466,8 @@ def _scan_usage_snapshot_window_days(r, since, pricing_on=None):
     def fold(row):
         at = row.get("at") or 0
         if since and at < since:
+            return
+        if until and at > until:
             return
         key = _local_day_key(at)
         bucket = days.get(key)
@@ -6842,7 +7478,10 @@ def _scan_usage_snapshot_window_days(r, since, pricing_on=None):
 
     _, error = _scan_usage_from(
         0, fold,
-        skip=lambda line: _line_outside_window(line, since or None, None))
+        skip=lambda line: _line_outside_window(line, since or None,
+                                               until or None),
+        skip_raw=lambda raw: _line_outside_window_bytes(raw, since or None,
+                                                        until or None))
     if error is not None:
         log(f"usage snapshot read failed: {error}")
     snap = _empty_stats()
@@ -6851,13 +7490,13 @@ def _scan_usage_snapshot_window_days(r, since, pricing_on=None):
     return snap
 
 
-def _scan_usage_snapshot_window_hours(r, since, pricing_on=None):
+def _scan_usage_snapshot_window_hours(r, since, until, pricing_on=None):
     """窗口半的冷路径：整段扫一遍，先按小时分桶再相加。
 
     小时层状态不可用（还没折过、被剪枝、折叠出错、那天的格点不成立）时走
-    这里。结果必须与小时桶状态给出的窗口半逐字节一致：窗口起点是本地整点，
-    两边装的是同一批行、同一个「按（日，小时）分组」的求和口径，只是桶
-    一个现折、一个存量。
+    这里。结果必须与小时桶状态给出的窗口半逐字节一致：窗口起点是本地整点
+    （until 给出时终点也落在同一套格点上），两边装的是同一批行、同一个
+    「按（日，小时）分组」的求和口径，只是桶一个现折、一个存量。
 
     分组与 _usage_hour_bucket 同一套算术（日键 + 离午夜多少个 3600 秒），
     但这里对 at 早于本地午夜的行照折不误（键可以是负的）：状态侧那种行会
@@ -6875,6 +7514,8 @@ def _scan_usage_snapshot_window_hours(r, since, pricing_on=None):
         at = row.get("at") or 0
         if since and at < since:
             return
+        if until and at > until:
+            return
         key = _local_day_key(at)
         day_at = day_ats.get(key)
         if day_at is None:
@@ -6888,7 +7529,10 @@ def _scan_usage_snapshot_window_hours(r, since, pricing_on=None):
 
     _, error = _scan_usage_from(
         0, fold,
-        skip=lambda line: _line_outside_window(line, since or None, None))
+        skip=lambda line: _line_outside_window(line, since or None,
+                                               until or None),
+        skip_raw=lambda raw: _line_outside_window_bytes(raw, since or None,
+                                                        until or None))
     if error is not None:
         log(f"usage snapshot read failed: {error}")
     snap = _empty_stats()
@@ -6897,7 +7541,8 @@ def _scan_usage_snapshot_window_hours(r, since, pricing_on=None):
     return snap
 
 
-def _scan_usage_analytics_window_days(realm, since, stop_at=None, pricing_on=None):
+def _scan_usage_analytics_window_days(realm, since, until, stop_at=None,
+                                      pricing_on=None):
     """窗口半 analytics 的冷路径：按日分桶再相加（见 snapshot 版）。"""
     pricing = _pricing_inputs(pricing_on)
     days = {}
@@ -6905,6 +7550,8 @@ def _scan_usage_analytics_window_days(realm, since, stop_at=None, pricing_on=Non
     def fold(row):
         at = row.get("at") or 0
         if since is not None and at < since:
+            return
+        if until is not None and at > until:
             return
         key = _local_day_key(at)
         maps = days.get(key)
@@ -6915,7 +7562,8 @@ def _scan_usage_analytics_window_days(realm, since, stop_at=None, pricing_on=Non
 
     _, error = _scan_usage_from(
         0, fold, stop_at=stop_at,
-        skip=lambda line: _line_outside_window(line, since, None))
+        skip=lambda line: _line_outside_window(line, since, until),
+        skip_raw=lambda raw: _line_outside_window_bytes(raw, since, until))
     if error is not None:
         log("compute_usage_analytics failed: %s" % error)
     out = _new_analytics_maps()
@@ -6961,7 +7609,8 @@ def _scan_usage_analytics_window_hours(realm, since, until, stop_at=None,
 
     _, error = _scan_usage_from(
         0, fold, stop_at=stop_at,
-        skip=lambda line: _line_outside_window(line, since, until))
+        skip=lambda line: _line_outside_window(line, since, until),
+        skip_raw=lambda raw: _line_outside_window_bytes(raw, since, until))
     if error is not None:
         log("compute_usage_analytics failed: %s" % error)
     out = _new_analytics_maps()
@@ -7147,6 +7796,7 @@ def _usage_series_state_ready(r):
         state = _series_state[r] = {
             "days": {}, "days_floor": None, "max_at": 0, "credits": [],
             "minutes": {}, "minutes_from": None,
+            "hits": [], "hits_overflow": False,
             "offset": 0, "key": None, "realm": None, "tail": b""}
     realm = _realm_inputs()
     log_key = _usage_log_key()
@@ -7155,10 +7805,12 @@ def _usage_series_state_ready(r):
         if not _usage_cache_adopt_series(r, state, log_key, realm):
             state.update({"days": {}, "days_floor": None, "max_at": 0,
                           "credits": [], "minutes": {}, "minutes_from": None,
+                          "hits": [], "hits_overflow": False,
                           "offset": 0, "tail": b""})
     elif state["realm"] != realm or not _log_resume_ok(state, log_key):
         state.update({"days": {}, "days_floor": None, "max_at": 0,
                       "credits": [], "minutes": {}, "minutes_from": None,
+                      "hits": [], "hits_overflow": False,
                       "offset": 0, "tail": b""})
     state.update({"realm": realm, "key": log_key})
     offset, error = _scan_usage_from(
@@ -7206,13 +7858,41 @@ def _series_window_day_key(lo):
         return None
 
 
+def _series_closed_cut_ok(state, lo_i, hi, step):
+    """闭窗口的右边界能否由存量桶回答：hi 落在桶格点上，且直到它没有整秒行。
+
+    桶按 at 严格切分（日/小时桶锚在本地午夜，分钟环锚在 epoch 分钟），所以
+    hi 落在与桶同一条格点上时，「[lo, hi] 的行」与「at < hi 的桶」只差
+    「恰好落在 hi 上的行」；那一刻有整秒行时桶切不出它，只能退回整段扫描
+    （见 _closed_window_edge_ok）。取值离谱的 hi（手写 URL）按不成立处理，
+    退回整段扫描——与 _series_window_day_key 的取值保护同一个用意。
+    """
+    if not _closed_window_edge_ok(state, hi):
+        return False
+    if step == 60:
+        try:
+            return _series_minute_grid_ok(hi)
+        except (OverflowError, ValueError):
+            return False
+    try:
+        hi_i = int(hi)
+    except (OverflowError, ValueError):
+        return False
+    if hi_i != hi:
+        return False
+    return (hi_i - lo_i) % step == 0
+
+
 def _series_slice_minutes(state, realm, lo, hi, day_key):
     """分钟环的切片；不满足对齐/覆盖条件时返回 None（退回整段扫描）。
 
     成立条件（缺一不可，任何一条不成立就退回整段扫描——正确性优先）：
       * 窗口起点是分钟格点（见 _series_minute_grid_ok）；
       * hi 不低于折过的最大 at：否则窗口上界会切进桶里，而桶是聚合值，
-        切不出一半来（与日/小时切片同一条）；
+        切不出一半来（与日/小时切片同一条）。hi 切进数据里（闭窗口）时
+        还要过闭窗口闸门（见 _series_closed_cut_ok）：hi 落在分钟格点上、
+        且直到那一刻没有整秒行，才按「at < hi 的桶」切，恰好落在 hi 上的
+        行由边沿账挡回整段扫描；
       * 窗口起点不早于 max_at - 6h：环的保留线，更早的窗口环里没有桶；
       * 窗口起点晚于 minutes_from：环只从那条线之后才完整（采用过没有
         分钟环的旧 checkpoint 时才有这条线，见 _usage_series_state_ready）；
@@ -7227,11 +7907,15 @@ def _series_slice_minutes(state, realm, lo, hi, day_key):
         # 答不出窗口里的行，也不能把窗口静默答成空序列——退回整段扫描，
         # 由扫描给出真值（正确的空序列也由它给）。
         return None
+    lo_i = int(lo)
+    cut = False
     if hi < state["max_at"]:
-        return None
+        # 上界切进环里：闭窗口闸门不成立就退回整段扫描（结果不变）。
+        if not _series_closed_cut_ok(state, lo_i, hi, 60):
+            return None
+        cut = True
     if not _series_minute_grid_ok(lo):
         return None
-    lo_i = int(lo)
     if lo_i < state["max_at"] - _SERIES_MINUTE_WINDOW:
         return None
     minutes_from = state.get("minutes_from")
@@ -7252,6 +7936,10 @@ def _series_slice_minutes(state, realm, lo, hi, day_key):
             return None
         if at < lo_i:
             continue
+        if cut and at >= hi:
+            # 闭窗口：hi 那一刻归后一桶（桶按 at 严格切分），只取 at < hi
+            # 的桶；那一刻有整秒行时上面已经退回。
+            break
         out = _series_output_bucket(sub)
         # 整段扫描的桶 at 是 lo + k*60，类型跟着 lo 走（int 或 float）；
         # 存量桶的 at 是整数，这里按 lo 的类型对齐，两边的 JSON 字节才一致。
@@ -7264,11 +7952,14 @@ def _series_payload(state, realm, lo, hi, step, series):
     """切片载荷的公共部分：窗口头 + credit 历史。
 
     credit 历史：缓冲按 at 倒序稳定排序后取窗口内的前 50 条——与整段扫描
-    的选择逐条相同（见 _series_credit_push 的论证）。
+    的选择逐条相同（见 _series_credit_push 的论证）。窗口的两端都要过滤：
+    缓冲收的是整份日志的计费行，闭窗口的上界切进缓冲里时（hi < max_at），
+    at > hi 的行不属于窗口，整段扫描不会收它们，切片也必须裁掉。
     """
     credits = sorted(state["credits"], key=lambda item: item.get("at") or 0,
                      reverse=True)
-    credits = [c for c in credits if (c.get("at") or 0) >= lo][:_SERIES_CREDITS_KEEP]
+    credits = [c for c in credits
+               if lo <= (c.get("at") or 0) <= hi][:_SERIES_CREDITS_KEEP]
     return {"ok": True, "realm": realm or "all",
             "bucket_seconds": step, "since": lo, "until": hi,
             "series": series, "credits": credits}
@@ -7281,7 +7972,10 @@ def _series_slice(state, realm, lo, hi, step, day_key):
       * 窗口起点是本地午夜（day_key 由 _window_day_key 给出）；
       * 桶宽是 3600 或 86400（与窗口对齐的两种）；
       * days_floor 覆盖窗口起点（剪枝/更早的天没折过就只能整段扫）；
-      * hi 不低于折过的最大 at，否则窗口上界会切掉桶里的行；
+      * hi 不低于折过的最大 at，否则窗口上界会切掉桶里的行；hi 切进数据里
+        （闭窗口）时还要过闭窗口闸门（见 _series_closed_cut_ok）：hi 落在
+        同一套桶格点上、且直到那一刻没有整秒行，才按「at < hi 的桶」切，
+        恰好落在 hi 上的行由边沿账挡回整段扫描；
       * 每个桶的 at 落在 lo + k*step 的格点上。这一条同时挡住夏令时：日长
         不是 86400 秒的那天之后，每一天的本地午夜都不再落在 86400 的格点上，
         于是自动退回整段扫描。时区没有夏令时（cn/路由器）时恒真。
@@ -7293,20 +7987,31 @@ def _series_slice(state, realm, lo, hi, step, day_key):
         return _series_slice_minutes(state, realm, lo, hi, day_key)
     if step not in (3600, 86400):
         return None
+    lo_i = int(lo)
+    cut = False
     if hi < state["max_at"]:
-        return None
+        # 上界切进桶里：闭窗口闸门不成立就退回整段扫描（结果不变）。
+        if not _series_closed_cut_ok(state, lo_i, hi, step):
+            return None
+        cut = True
     if not _days_cover(state, day_key):
         return None
-    lo_i = int(lo)
     series = []
+    done = False
     for key in sorted(state["days"]):
-        if key < day_key:
+        if key < day_key or done:
             continue
         bucket = state["days"][key]
         day_at = int(bucket["at"])
         if (day_at - lo_i) % 86400:
             return None
         if step == 86400:
+            if cut and day_at >= hi:
+                # 闭窗口：hi 那一刻归后一桶（桶按 at 严格切分），只取
+                # at < hi 的桶；那一刻有整秒行时上面已经退回。这一天及其后
+                # 的桶都在窗口外，done 把循环收口。
+                done = True
+                continue
             series.append(_series_output_bucket(bucket))
             continue
         hours = bucket.get("hours")
@@ -7320,6 +8025,10 @@ def _series_slice(state, realm, lo, hi, step, day_key):
                 return None
             if (int(sub["at"]) - lo_i) % 3600:
                 return None
+            if cut and int(sub["at"]) >= hi:
+                # 闭窗口的右边界（放在格点校验之后——错开的桶要先退回扫描）。
+                done = True
+                break
             series.append(_series_output_bucket(sub))
     return _series_payload(state, realm, lo, hi, step, series)
 
@@ -7585,7 +8294,11 @@ _USAGE_CACHE_KIND_NAME = "usage-aggregate-cache-%s.json"
 # 时的回退来源——能通过新校验器的段（by_account / series / remaining）照常
 # 采纳，通不过的（缺小时表的 snapshot / analytics）在升级后第一次刷新时做一次
 # 全量折叠，之后 checkpoint 照旧。
-_USAGE_CACHE_SCHEMA = 4
+# v5：snapshot / analytics 的 "pricing" 字段从「三张表的内容摘要」（["on", d1,
+# d2, d3] / ["off"]）换成「折叠行真正用到的价」记录（T15）。旧条目的字段形状
+# 对不上新判定，采纳端直接拒——升级后第一次刷新一次性重折（与 v3→v4 同处置），
+# 之后价表再变只按「用到的价」判废（无关模型的价变动不再重折）。
+_USAGE_CACHE_SCHEMA = 5
 # 升级前唯一布局的版本号：v3 单文件。只出现在只读回退路径上。
 _USAGE_CACHE_LEGACY_SCHEMA = 3
 # 五类状态的固定集合（文件名、kind 标签与写盘循环都用它）。
@@ -7799,28 +8512,6 @@ def _object_digest(obj):
         _usage_cache_digest_memo.clear()
     _usage_cache_digest_memo[id(obj)] = (obj, digest)
     return digest
-
-
-def _pricing_inputs_key(inputs):
-    """把 _pricing_inputs() 的元组压成一段跨进程可比的价格指纹。
-
-    进程内那套靠对象身份（_pricing_unchanged），身份活不过重启，所以这里存
-    内容摘要。摘要取的是取价函数真正返回的对象而不是价表文件：文件损坏时会
-    回退到内联表，折叠读到的也是内联表，指纹必须描述折叠真正读的东西；文件
-    不在时内联表有没有变过，也只有摘要看得出来。
-    """
-    if inputs is None:
-        return None
-    if not inputs[0]:
-        # 总开关关着：取价路径一个价表都不读，开关本身就是全部输入。
-        return ["off"]
-    digests = []
-    for obj in inputs[1:]:
-        digest = _object_digest(obj)
-        if digest is None:
-            return None
-        digests.append(digest)
-    return ["on"] + digests
 
 
 def _realm_inputs_key(inputs):
@@ -8293,6 +8984,22 @@ def _usage_cache_credits_ok(credits):
     return True
 
 
+def _usage_cache_hits_ok(hits, overflow):
+    """闭窗口边沿账的落盘形状：[整秒 epoch] 列表 + 严格 bool 溢出标记。
+
+    旧版 checkpoint 没有这两个键（entry.get 给 None）→ 拒：升级后第一次刷新
+    重折一次（与 v3→v4「缺小时表的 snapshot/analytics 被拒、一次性重折」
+    同一套处置）。账是「直到某刻没有行落在整秒上」的证明，缺了它闭窗口只能
+    退回扫描（正确但慢），宁可重折一次把它补全。
+    """
+    if not isinstance(hits, list) or not isinstance(overflow, bool):
+        return False
+    for value in hits:
+        if not _usage_cache_int(value):
+            return False
+    return True
+
+
 def _usage_cache_take(kind, realm=None):
     """从 checkpoint 里取出一份状态（取过即删），没有合适的返回 None。
 
@@ -8356,15 +9063,17 @@ def _usage_cache_position_ok(entry, log_key):
     return offset, tail
 
 
-def _usage_cache_fingerprints_ok(entry, pricing_key, realm_key):
-    """价格与 realm 指纹必须和当前进程读到的一致。
+def _usage_cache_fingerprints_ok(entry, pricing_used_ok, realm_key):
+    """「用到的价」与 realm 指纹必须和当前进程读到的一致。
 
-    任一侧取不到（None）都算不一致：取不到就意味着「折叠当时读了什么」已经
-    无法确认，缓存不能当有效用。
+    价格一侧由调用方用 _pricing_used_unchanged(entry["pricing"], pricing)
+    判好（记录形状不符、价表读不出来、总开关翻转都在那里返回 False），这里
+    只把它和 realm 一侧一起收口。任一侧取不到（None）都算不一致：取不到就
+    意味着「折叠当时读了什么」已经无法确认，缓存不能当有效用。
     """
-    if pricing_key is None or realm_key is None:
+    if not pricing_used_ok or realm_key is None:
         return False
-    return entry.get("pricing") == pricing_key and entry.get("realm_inputs") == realm_key
+    return entry.get("realm_inputs") == realm_key
 
 
 def _usage_cache_note_adopted(kind, offset):
@@ -8387,6 +9096,10 @@ def _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
 
     调用方持有 _usage_snap_state_lock，并且只在 state 全新时调用：采用只把
     offset/tail 往前挪，折叠逻辑一行不动。
+
+    闭窗口的边沿账（hits/hits_overflow）是这一份的必填项：旧版 checkpoint
+    没有这两个键，会被拒 → 升级后第一次刷新重折一次（一次性代价，与
+    v3→v4 缺小时表时的处置一致）。
     """
     entry = _usage_cache_take("snapshot", r)
     if entry is None:
@@ -8394,8 +9107,9 @@ def _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
     position = _usage_cache_position_ok(entry, log_key)
     if position is None:
         return False
-    if not _usage_cache_fingerprints_ok(entry, _pricing_inputs_key(pricing),
-                                        _realm_inputs_key(realm)):
+    if not _usage_cache_fingerprints_ok(
+            entry, _pricing_used_unchanged(entry.get("pricing"), pricing),
+            _realm_inputs_key(realm)):
         return False
     snap = entry.get("snap")
     if not _usage_cache_snapshot_ok(snap):
@@ -8407,10 +9121,18 @@ def _usage_cache_adopt_snapshot(r, state, log_key, pricing, realm):
     hours_floor = entry.get("hours_floor_at")
     if hours_floor is not None and not _usage_cache_number(hours_floor):
         return False
+    hits = entry.get("hits")
+    overflow = entry.get("hits_overflow")
+    if not _usage_cache_hits_ok(hits, overflow):
+        return False
     offset, tail = position
     state.update({"snap": snap, "offset": offset, "tail": tail,
                   "days": days, "days_floor": floor,
-                  "hours_floor_at": _hours_floor_on_adopt(days, hours_floor)})
+                  "hours_floor_at": _hours_floor_on_adopt(days, hours_floor),
+                  "hits": list(hits), "hits_overflow": overflow,
+                  # 「用到的价」记录跟着状态一起装进来：后续增量折叠继续往
+                  # 这份记录里加，下一次判废拿它比对当前价表。
+                  "pricing": _copy_pricing_record(entry.get("pricing"))})
     _usage_cache_note_adopted("snapshot", offset)
     return True
 
@@ -8476,15 +9198,16 @@ def _usage_cache_adopt_remaining(state, log_key):
 
 
 def _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
-    """analytics all-time 折叠的采用。"""
+    """analytics all-time 折叠的采用；闭窗口的边沿账是必填项（见 snapshot 版）。"""
     entry = _usage_cache_take("analytics", realm)
     if entry is None:
         return False
     position = _usage_cache_position_ok(entry, log_key)
     if position is None:
         return False
-    if not _usage_cache_fingerprints_ok(entry, _pricing_inputs_key(pricing),
-                                        _realm_inputs_key(realm_inputs)):
+    if not _usage_cache_fingerprints_ok(
+            entry, _pricing_used_unchanged(entry.get("pricing"), pricing),
+            _realm_inputs_key(realm_inputs)):
         return False
     maps = entry.get("maps")
     if not _usage_cache_analytics_ok(maps):
@@ -8496,9 +9219,15 @@ def _usage_cache_adopt_analytics(realm, state, log_key, pricing, realm_inputs):
     max_at = entry.get("max_at")
     if not _usage_cache_number(max_at):
         return False
+    hits = entry.get("hits")
+    overflow = entry.get("hits_overflow")
+    if not _usage_cache_hits_ok(hits, overflow):
+        return False
     offset, tail = position
     state.update({"maps": maps, "offset": offset, "tail": tail,
-                  "days": days, "days_floor": floor, "max_at": max_at})
+                  "days": days, "days_floor": floor, "max_at": max_at,
+                  "hits": list(hits), "hits_overflow": overflow,
+                  "pricing": _copy_pricing_record(entry.get("pricing"))})
     _usage_cache_note_adopted("analytics", offset)
     return True
 
@@ -8530,6 +9259,10 @@ def _usage_cache_adopt_series(r, state, log_key, realm_inputs):
     minutes_from = entry.get("minutes_from")
     if minutes_from is not None and not _usage_cache_number(minutes_from):
         return False
+    hits = entry.get("hits")
+    overflow = entry.get("hits_overflow")
+    if not _usage_cache_hits_ok(hits, overflow):
+        return False
     if minutes is None:
         # 旧版 checkpoint（没有分钟环这个键）：这一份状态是能用的（日/小时桶
         # 与 credits 都在），只是分钟环要从采用点之后才开始折。把完整线记成
@@ -8542,7 +9275,8 @@ def _usage_cache_adopt_series(r, state, log_key, realm_inputs):
     state.update({"days": days, "days_floor": floor, "max_at": max_at,
                   "credits": credits, "offset": offset, "tail": tail,
                   "minutes": _usage_cache_minutes_state(minutes),
-                  "minutes_from": minutes_from})
+                  "minutes_from": minutes_from,
+                  "hits": list(hits), "hits_overflow": overflow})
     _usage_cache_note_adopted("series", offset)
     return True
 
@@ -8608,10 +9342,15 @@ def _usage_cache_snapshot_entry(realm, state):
     tail = state.get("tail")
     if offset <= 0 or not isinstance(tail, bytes) or state.get("snap") is None:
         return None
-    pricing_key = _pricing_inputs_key(state.get("pricing"))
+    # 「用到的价」记录（T15；见「用到的价」状态指纹一节）：形状不合格就不写。
+    # 记录为 None（总开关关着 / 价表读不出来）时也跳过——那份折叠没读任何价，
+    # 落盘没有任何加速作用（采纳端只认「记录也是 None」这一种一致）。
+    record = state.get("pricing")
+    if not _pricing_record_ok(record):
+        return None
     realm_inputs = state.get("realm")
     realm_key = _realm_inputs_key(realm_inputs)
-    if pricing_key is None or realm_key is None:
+    if realm_key is None:
         return None
     if not _realm_fold_reproducible(realm_inputs[1]):
         # 这次折叠的归属冷进程复现不了（见 _realm_fold_reproducible）：写下去
@@ -8619,7 +9358,8 @@ def _usage_cache_snapshot_entry(realm, state):
         return None
     return {"realm": realm, "offset": offset,
             "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
-            "pricing": pricing_key, "realm_inputs": realm_key,
+            # 记录的深拷贝在锁内做，序列化在锁外做（同下面几份深拷贝）。
+            "pricing": _copy_pricing_record(record), "realm_inputs": realm_key,
             # 深拷贝在锁内做，序列化在锁外做（见 _usage_cache_collect）。
             "snap": _copy_usage_snapshot(state["snap"]),
             # 按日分桶的窗口半：与 all-time 半同一次扫描折出来的，位置也
@@ -8631,7 +9371,12 @@ def _usage_cache_snapshot_entry(realm, state):
             # 小时层的剪枝线（见 _hours_cover）：缺了它重启后的小时层要么
             # 不折（None 直接挡住 _usage_hour_bucket），要么服务了被剪过的
             # 天——两者都不对，所以它和日桶一起落盘。
-            "hours_floor_at": state.get("hours_floor_at")}
+            "hours_floor_at": state.get("hours_floor_at"),
+            # 闭窗口的边沿账（见 _closed_window_hit_record）：直到某刻没有行
+            # 落在整秒上的证明。旧版 checkpoint 没有这两个键，采用端因此
+            # 拒整份、升级后一次性重折。
+            "hits": list(state["hits"]),
+            "hits_overflow": bool(state["hits_overflow"])}
 
 
 def _usage_cache_by_account_entry(state):
@@ -8690,22 +9435,28 @@ def _usage_cache_analytics_entry(realm, state):
     tail = state.get("tail")
     if offset <= 0 or not isinstance(tail, bytes):
         return None
-    pricing_key = _pricing_inputs_key(state.get("pricing"))
+    record = state.get("pricing")
+    if not _pricing_record_ok(record):
+        return None          # 同 snapshot：「用到的价」记录不合格就不写
     realm_inputs = state.get("realm")
     realm_key = _realm_inputs_key(realm_inputs)
-    if pricing_key is None or realm_key is None:
+    if realm_key is None:
         return None
     if not _realm_fold_reproducible(realm_inputs[1]):
         return None          # 同 snapshot：这次折叠的归属冷进程复现不了
     return {"realm": realm, "offset": offset,
             "key": list(state["key"] or (0, 0, 0)), "tail": tail.hex(),
-            "pricing": pricing_key, "realm_inputs": realm_key,
+            "pricing": _copy_pricing_record(record), "realm_inputs": realm_key,
             "maps": _copy_analytics_all_time(state["maps"]),
             "days": _usage_cache_days_copy(state.get("days"),
                                            _copy_analytics_window_maps),
             "days_floor": state.get("days_floor"),
             # 折过的最大 at：小时层靠它判断 until 有没有切掉桶里的行。
-            "max_at": state.get("max_at") or 0}
+            "max_at": state.get("max_at") or 0,
+            # 闭窗口的边沿账（见 _closed_window_hit_record）：旧版 checkpoint
+            # 没有这两个键，采用端因此拒整份、升级后一次性重折。
+            "hits": list(state["hits"]),
+            "hits_overflow": bool(state["hits_overflow"])}
 
 
 def _usage_cache_series_entry(realm, state):
@@ -8731,7 +9482,11 @@ def _usage_cache_series_entry(realm, state):
             "max_at": state.get("max_at") or 0,
             "credits": [dict(item) for item in (state.get("credits") or [])],
             "minutes": _usage_cache_minutes_copy(state.get("minutes")),
-            "minutes_from": state.get("minutes_from")}
+            "minutes_from": state.get("minutes_from"),
+            # 闭窗口的边沿账（见 _closed_window_hit_record）：旧版 checkpoint
+            # 没有这两个键，采用端因此拒整份、升级后一次性重折。
+            "hits": list(state["hits"]),
+            "hits_overflow": bool(state["hits_overflow"])}
 
 
 def _usage_cache_collect_kind(kind):
@@ -9813,6 +10568,9 @@ def clean_chunk(raw):
         if obj["usage"] != before:
             changed = True
     for choice in obj.get("choices") or []:
+        if isinstance(choice, dict) and choice.get("finish_reason") == "":
+            choice["finish_reason"] = None
+            changed = True
         delta = choice.get("delta")
         if not isinstance(delta, dict):
             continue
@@ -10470,6 +11228,284 @@ def parse_dsml_tool_calls(text):
         })
     clean = (text[:match.start()].strip() + " " + text[match.end():].strip()).strip()
     return tool_calls, clean
+# ---------------------------------------------------------------------------
+# Printed tool calls on the Chat Completions path
+# ---------------------------------------------------------------------------
+# The Responses path has parsed DSML text since the tool_choice="none" fix, but
+# /v1/chat/completions -- the route the desktop client actually uses -- still
+# forwarded upstream `content` verbatim. When the model printed its call instead
+# of emitting structured tool_calls, the client saw plain text, found no call,
+# and the turn just ended: the markup stayed in the transcript and nothing ran.
+# Reported by the user as "it keeps stopping by itself".
+#
+# Two spellings show up in the wild:
+#   1. the full-width DSML form the suite already pins:
+#      <||DSML|| calls><||DSML|| invoke name="run_code"> ... </||DSML|| invoke>
+#   2. a hybrid the model mixes on its own -- a plain opening tag with DSML
+#      closing tags, and the first parameter's close tag swallowed whole:
+#      <run_code><parameter name="code">...</parameter>
+#      <parameter name="description">...</|DSML| parameter>
+#      </run_code></invoke></|DSML| parameter></|DSML| invoke></|DSML| calls>
+#
+# parse_dsml_tool_calls() above only matches (1): it wants a DSML opening tag
+# for the calls block, which (2) never has. The parser below is driven by the
+# <parameter> elements instead, because those are spelled the same way in both
+# shapes and a parameter name is the one thing a call cannot do without.
+LEAK_PARAM_RE = re.compile(
+    r"<\s*(?:\|\s*DSML\s*\|\s*)?(?P<tag>parameter|param|arg|argument)\b"
+    r"(?P<attrs>[^>]*)>"
+    r"(?P<value>.*?)"
+    r"</\s*(?:\|\s*DSML\s*\|\s*)?(?:parameter|param|arg|argument)\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+LEAK_TAG_RE = re.compile(
+    r"<\s*/?\s*(?:\|\s*DSML\s*\|\s*)?"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?P<attrs>[^>]*)>"
+)
+LEAK_NAME_ATTR_RE = re.compile(r"""name\s*=\s*["']([^"']*)["']""")
+LEAK_WRAPPER_TAGS = {"calls", "tool_calls", "function_calls", "function_call"}
+LEAK_PARAM_TAGS = {"parameter", "param", "arg", "argument"}
+# First characters of every tag the stream filter has to hold text back for.
+LEAK_TAG_PREFIXES = (
+    "<run_code", "<run_shell", "<invoke", "<parameter", "<param", "<arg",
+    "<argument", "<calls", "<tool_calls", "<function_calls", "<function_call",
+    "<think", "<thinking",
+    "</run_code", "</run_shell", "</invoke", "</parameter", "</param",
+    "</arg", "</argument", "</calls", "</tool_calls", "</function_calls",
+    "</function_call", "</think", "</thinking",
+    "<|dsml|", "</|dsml|",
+)
+
+
+def _normalize_dsml_bars(text):
+    """Fold the full-width spelling of the DSML token back to ASCII bars."""
+    return re.sub(r"\uff5c+\s*DSML\s*\uff5c+", "|DSML|", text)
+
+
+def _strip_spans(text, spans):
+    """Remove every [start, end) span, then collapse the leftover blanks."""
+    if not spans:
+        return text
+    kept = []
+    last = 0
+    for start, end in sorted(spans):
+        if start < last:
+            continue
+        kept.append(text[last:start])
+        last = end
+    kept.append(text[last:])
+    return "".join(kept).strip()
+
+
+def parse_leaked_tool_calls(text):
+    """Recover a tool call the model printed instead of emitting.
+
+    Returns (calls, clean_text) with calls in the same shape as
+    parse_dsml_tool_calls(), or (None, text) when nothing was recognised.
+    """
+    if not text or "<" not in text:
+        return None, text
+    # Fold the full-width spelling first so both shapes go through one walk.
+    original = text
+    text = _normalize_dsml_bars(text)
+    found = []
+    for m in LEAK_PARAM_RE.finditer(text):
+        attr = LEAK_NAME_ATTR_RE.search(m.group("attrs") or "")
+        if not attr or not attr.group(1):
+            continue
+        found.append((m.start(), attr.group(1), m.group("value").strip(), m.span()))
+    if not found:
+        return None, original
+    tags = list(LEAK_TAG_RE.finditer(text))
+    calls = []
+    for start, pname, value, span in found:
+        owner = None
+        for tag in tags:
+            if tag.start() >= start:
+                break
+            if tag.group(0).lstrip().startswith("</"):
+                continue
+            tname = tag.group("name").lower()
+            if tname in LEAK_WRAPPER_TAGS or tname in LEAK_PARAM_TAGS:
+                continue
+            owner = tag
+        name = ""
+        if owner is not None:
+            attr = LEAK_NAME_ATTR_RE.search(owner.group("attrs") or "")
+            name = (attr.group(1) if attr else owner.group("name")).strip()
+        if not name:
+            continue
+        key = owner.start() if owner is not None else None
+        if calls and calls[-1]["open"] == key:
+            calls[-1]["params"][pname] = value
+            calls[-1]["spans"].append(span)
+        else:
+            calls.append({"name": name, "params": {pname: value},
+                          "open": key, "spans": [span]})
+    if not calls:
+        return None, original
+    # Everything from the call's opening tag to the last of its parameters is
+    # markup rather than prose, so the whole region goes away in one piece.
+    regions = []
+    for call in calls:
+        first = call["open"]
+        if first is None:
+            first = min(s for s, _e in call["spans"])
+        last = max(e for _s, e in call["spans"])
+        # Swallow the closing tags that trail the last parameter.
+        while True:
+            nxt = last
+            while nxt < len(text) and text[nxt] in " \t\r\n":
+                nxt += 1
+            m = LEAK_TAG_RE.match(text, nxt)
+            if not m or not m.group(0).lstrip().startswith("</"):
+                break
+            last = m.end()
+        regions.append((first, last))
+    clean = _strip_spans(text, regions)
+    # Wrappers and stray tags the region walk did not cover (<|DSML| calls>,
+    # <think>, ...) are markup too; drop any tag carrying the DSML token.
+    leftover = []
+    for m in LEAK_TAG_RE.finditer(clean):
+        if "DSML" in _normalize_dsml_bars(m.group(0)).upper():
+            leftover.append(m.span())
+        elif m.group("name").lower() in LEAK_WRAPPER_TAGS:
+            leftover.append(m.span())
+    clean = _strip_spans(clean, leftover)
+    return [{
+        "id": _new_id("call_"),
+        "name": call["name"],
+        "arguments": json.dumps(call["params"], ensure_ascii=False),
+    } for call in calls], clean
+
+
+def repair_leaked_tool_calls(message):
+    """Move a printed call out of `content` and into `tool_calls`.
+
+    Only fires when the message carries no structured call: a real tool_calls
+    entry always wins, so a model that emits both is left alone. Returns True
+    when the message changed.
+    """
+    if not isinstance(message, dict):
+        return False
+    existing = message.get("tool_calls")
+    if isinstance(existing, list) and existing:
+        return False
+    content = message.get("content")
+    if not isinstance(content, str) or "<" not in content:
+        return False
+    calls, clean = parse_leaked_tool_calls(content)
+    if not calls:
+        calls, clean = parse_dsml_tool_calls(content)
+    if not calls:
+        return False
+    message["content"] = clean
+    message["tool_calls"] = [{
+        "id": call["id"],
+        "type": "function",
+        "function": {"name": call["name"], "arguments": call["arguments"]},
+    } for call in calls]
+    return True
+
+
+def could_be_leaked_call(tail):
+    """True while `tail` (starting at "<") may still grow into printed markup."""
+    low = _normalize_dsml_bars(tail).lower()
+    m = LEAK_TAG_RE.match(low)
+    if m and any(m.group(0).startswith(p) for p in LEAK_TAG_PREFIXES):
+        return True
+    if len(low) > 96 or ">" in low:
+        return False
+    return any(p.startswith(low) or low.startswith(p) for p in LEAK_TAG_PREFIXES)
+
+
+class LeakedToolCallStreamFilter:
+    """Hold back assistant text that may be a printed tool call.
+
+    /v1/chat/completions forwards text the moment it arrives, so a call the
+    model printed instead of emitting would already be on the wire before the
+    stream ended and anything could parse it. Buffer the text instead: release
+    it as soon as it is clearly prose, convert whatever is left at the end.
+
+    feed(text) returns a list of ("text", str) and ("calls", [call, ...]).
+    """
+
+    MAX_HOLD = 262144
+
+    def __init__(self):
+        self.buf = ""
+
+    def _release_all(self):
+        out, self.buf = self.buf, ""
+        return [("text", out)] if out else []
+
+    def feed(self, text):
+        if not text:
+            return []
+        self.buf += text
+        for idx in range(len(self.buf)):
+            if self.buf[idx] != "<":
+                continue
+            if not could_be_leaked_call(self.buf[idx:]):
+                continue
+            if idx:
+                head, self.buf = self.buf[:idx], self.buf[idx:]
+                return [("text", head)]
+            break
+        else:
+            return self._release_all()
+        if len(self.buf) > self.MAX_HOLD:
+            return self._release_all()
+        return []
+
+    def flush(self):
+        if not self.buf:
+            return []
+        buf, self.buf = self.buf, ""
+        calls, clean = parse_leaked_tool_calls(buf)
+        if not calls:
+            calls, clean = parse_dsml_tool_calls(buf)
+        if not calls:
+            return [("text", buf)]
+        out = []
+        if clean:
+            out.append(("text", clean))
+        out.append(("calls", calls))
+        return out
+
+
+def chat_chunk(model, delta, finish=None, chunk_id="chatcmpl-wb"):
+    """One Chat Completions streaming chunk."""
+    return json.dumps({
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+    }, ensure_ascii=False)
+
+
+def chat_text_chunk(model, text, chunk_id="chatcmpl-wb"):
+    return chat_chunk(model, {"content": text}, None, chunk_id)
+
+
+def chat_tool_call_chunks(model, calls, chunk_id="chatcmpl-wb"):
+    """Deltas that hand recovered calls over as structured tool calls."""
+    out = []
+    for i, call in enumerate(calls):
+        out.append(chat_chunk(model, {"tool_calls": [{
+            "index": i,
+            "id": call["id"],
+            "type": "function",
+            "function": {"name": call["name"], "arguments": call["arguments"]},
+        }]}, None, chunk_id))
+    return out
+
+
+def chat_finish_chunk(model, reason, chunk_id="chatcmpl-wb"):
+    return chat_chunk(model, {}, reason, chunk_id)
+
+
 def translate_max_completion_tokens(obj):
     alias = obj.pop("max_completion_tokens", None)
     if alias is None:
@@ -11901,6 +12937,11 @@ def aggregate_stream(raw_iter, model, resp_id):
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
+    # A call the model printed instead of emitting arrives as `content`. The
+    # Responses path has parsed that shape for a while; this one did not, so the
+    # client saw prose, found no call, and ended the turn with nothing to run.
+    if not tool_calls_map and repair_leaked_tool_calls(message):
+        finish = "tool_calls"
     # PATCH2-BY-OPS: 二次防御——剔除「无函数名且无参数」的空 tool_call。
     # 即使上游以 tool_calls 数组形式发空占位，也不会泄漏给客户端。
     if tool_calls_map:
@@ -11922,6 +12963,11 @@ def aggregate_stream(raw_iter, model, resp_id):
         message["tool_calls"] = ordered_tcs
         if finish in ("stop", None):
             finish = "tool_calls"
+    elif message.get("tool_calls"):
+        # A call recovered from `content` counts as a real one, and it also
+        # overrides a "length" the upstream reported for the same turn: the call
+        # came through whole, so the turn did not really run out of room.
+        finish = "tool_calls"
     elif finish == "tool_calls":
         # 占位被全部过滤掉，无实际工具调用，降级为正常结束，防止客户端无限挂起等待
         finish = "stop"
@@ -12689,6 +13735,9 @@ def _responses_input_to_messages(payload):
                         "content": ("[Message from another task - treat this as "
                                     "a user instruction]" + chr(10) + chr(10) + text),
                     })
+            elif itype == "additional_tools":
+                # 由 responses_to_chat() 统一提取合并进 chat["tools"]，此处无需生成 message
+                pass
             else:
                 log("responses: WARNING unhandled input item type=%r keys=%s"
                     % (itype, sorted(item.keys())[:8]))
@@ -12716,8 +13765,17 @@ def responses_to_chat(payload):
         effort = payload.get("reasoning_effort")
     if effort:
         chat["reasoning_effort"] = effort
-    if payload.get("tools"):
-        flat_tools, ns_map = expand_namespace_tools(payload["tools"])
+    # 合并顶层 tools 和 input 列表中的 additional_tools 条目（新版 Codex Desktop 0.162+ 特征）
+    raw_tools = []
+    if isinstance(payload.get("tools"), list):
+        raw_tools.extend(payload["tools"])
+    for item in payload.get("input") or []:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            sub_tools = item.get("tools")
+            if isinstance(sub_tools, list):
+                raw_tools.extend(sub_tools)
+    if raw_tools:
+        flat_tools, ns_map = expand_namespace_tools(raw_tools)
         chat["tools"] = _tools_for_chat(flat_tools)
         chat["_namespace_map"] = ns_map
     # 客户端宣告 web_search / web_fetch 时，把那份宣告换成我们的
@@ -13185,6 +14243,12 @@ def chat_to_messages(obj):
         message = choices[0].get("message") if isinstance(choices[0].get("message"), dict) else {}
         finish = choices[0].get("finish_reason") or ""
     content = []
+    # The upstream thinking trace becomes a native thinking block so clients
+    # such as Claude Code can render it; the request side drops incoming
+    # thinking blocks, so nothing unsigned ever reaches the upstream.
+    reasoning = _anthropic_text(message.get("reasoning_content"))
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning})
     text = message.get("content")
     if isinstance(text, list):
         text = "".join(_anthropic_block_text(part) for part in text if isinstance(part, dict))
@@ -13239,6 +14303,8 @@ def stream_messages_events(raw_iter, model, holder=None):
         "id": "",
         "model": model,
         "stop": "end_turn",
+        "thinking_open": False,
+        "thinking_idx": None,
         "text_open": False,
         "text_idx": None,
         "next": 0,
@@ -13270,16 +14336,33 @@ def stream_messages_events(raw_iter, model, holder=None):
             }
         })
 
+    def ensure_thinking():
+        frames = []
+        if not state["thinking_open"]:
+            state["thinking_idx"] = state["next"]
+            state["next"] += 1
+            state["thinking_open"] = True
+            frames.append(anthropic_sse_frame("content_block_start", {
+                "index": state["thinking_idx"],
+                "content_block": {"type": "thinking", "thinking": ""},
+            }))
+        return frames
+
     def ensure_text():
-        if state["text_open"]:
-            return None
-        state["text_idx"] = state["next"]
-        state["next"] += 1
-        state["text_open"] = True
-        return anthropic_sse_frame("content_block_start", {
-            "index": state["text_idx"],
-            "content_block": {"type": "text", "text": ""},
-        })
+        frames = []
+        if not state["text_open"]:
+            if state["thinking_open"]:
+                state["thinking_open"] = False
+                frames.append(anthropic_sse_frame(
+                    "content_block_stop", {"index": state["thinking_idx"]}))
+            state["text_idx"] = state["next"]
+            state["next"] += 1
+            state["text_open"] = True
+            frames.append(anthropic_sse_frame("content_block_start", {
+                "index": state["text_idx"],
+                "content_block": {"type": "text", "text": ""},
+            }))
+        return frames
 
     for line in raw_iter:
         if state["done"] or state["failed"]:
@@ -13316,10 +14399,19 @@ def stream_messages_events(raw_iter, model, holder=None):
             continue
         choice = choices[0] if isinstance(choices[0], dict) else {}
         delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        # Upstream thinking trace (deepseek-style reasoning_content) becomes
+        # native thinking blocks so the client can display the reasoning.
+        reason = delta.get("reasoning_content")
+        if isinstance(reason, str) and reason:
+            for frame in ensure_thinking():
+                yield frame
+            yield anthropic_sse_frame("content_block_delta", {
+                "index": state["thinking_idx"],
+                "delta": {"type": "thinking_delta", "thinking": reason},
+            })
         text = delta.get("content")
         if isinstance(text, str) and text:
-            frame = ensure_text()
-            if frame:
+            for frame in ensure_text():
                 yield frame
             yield anthropic_sse_frame("content_block_delta", {
                 "index": state["text_idx"],
@@ -13344,6 +14436,9 @@ def stream_messages_events(raw_iter, model, holder=None):
                 entry["name"] = _anthropic_text(fn.get("name"))
             args = fn.get("arguments") if fn.get("arguments") is not None else ""
             if not entry["opened"] and (entry["id"] or entry["name"] or args):
+                if state["thinking_open"]:
+                    state["thinking_open"] = False
+                    yield anthropic_sse_frame("content_block_stop", {"index": state["thinking_idx"]})
                 if state["text_open"]:
                     state["text_open"] = False
                     yield anthropic_sse_frame("content_block_stop", {"index": state["text_idx"]})
@@ -13375,6 +14470,9 @@ def stream_messages_events(raw_iter, model, holder=None):
         start = ensure_start(None)
         if start:
             yield start
+    if state["thinking_open"]:
+        state["thinking_open"] = False
+        yield anthropic_sse_frame("content_block_stop", {"index": state["thinking_idx"]})
     if state["text_open"]:
         state["text_open"] = False
         yield anthropic_sse_frame("content_block_stop", {"index": state["text_idx"]})
@@ -17285,33 +18383,73 @@ class Handler(BaseHTTPRequestHandler):
             last_usage = None
             first_ms = None
             streamed_text = []
+            leak_filter = LeakedToolCallStreamFilter()
+            synthesized_calls = False
+            pending_finish = None
+
+            def write_chunk(payload):
+                nonlocal emitted, first_ms
+                if first_ms is None:
+                    first_ms = int((time.time() - t_start) * 1000)
+                emitted = True
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+
+            def release(actions):
+                nonlocal synthesized_calls
+                for action in actions:
+                    if action[0] == "text":
+                        if action[1]:
+                            write_chunk(chat_text_chunk(model, action[1]))
+                    else:
+                        synthesized_calls = True
+                        for payload in chat_tool_call_chunks(model, action[1]):
+                            write_chunk(payload)
+
             try:
                 for line in upstream:
                     data = strip_data_prefix(line.decode("utf-8", "replace"))
                     if not data or data == "[DONE]" or data.startswith(":"):
                         continue
+                    maybe = None
                     try:
                         maybe = json.loads(data)
+                    except Exception:
+                        maybe = None
+                    if isinstance(maybe, dict):
                         u = maybe.get("usage")
                         if u:
                             if last_usage is None or (u.get("total_tokens") or 0) >= (last_usage.get("total_tokens") or 0):
                                 last_usage = u
                         for ch in (maybe.get("choices") or []):
                             delta = ch.get("delta") or {}
-                            if delta.get("content"):
-                                streamed_text.append(delta["content"])
                             if delta.get("reasoning_content"):
                                 streamed_text.append(delta["reasoning_content"])
-                    except Exception:
-                        pass
-                    cleaned = clean_chunk(data)
+                            piece = delta.get("content")
+                            if piece:
+                                streamed_text.append(piece)
+                                # Hold the text back: it may be a call the model
+                                # printed instead of emitting, and a client that
+                                # reads it as prose ends the turn with nothing to
+                                # run ("it keeps stopping by itself").
+                                delta.pop("content", None)
+                                release(leak_filter.feed(piece))
+                            if ch.get("finish_reason"):
+                                # Hold the terminator too: whether this turn ends
+                                # in tool_calls is only known once the text has
+                                # been flushed at end of stream.
+                                pending_finish = ch["finish_reason"]
+                                ch["finish_reason"] = None
+                    cleaned = clean_chunk(
+                        json.dumps(maybe, ensure_ascii=False)
+                        if isinstance(maybe, dict) else data)
                     if not cleaned:
                         continue
-                    if first_ms is None:
-                        first_ms = int((time.time() - t_start) * 1000)
-                    emitted = True
-                    self.wfile.write(f"data: {cleaned}\n\n".encode("utf-8"))
-                    self.wfile.flush()
+                    write_chunk(cleaned)
+                release(leak_filter.flush())
+                if synthesized_calls or pending_finish is not None:
+                    write_chunk(chat_finish_chunk(
+                        model, "tool_calls" if synthesized_calls else pending_finish))
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client hung up; still account for what upstream produced.
                 wall = int((time.time() - t_start) * 1000)

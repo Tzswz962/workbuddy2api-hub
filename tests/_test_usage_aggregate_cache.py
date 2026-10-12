@@ -470,8 +470,8 @@ check("每个写出的 kind 文件都是 schema=当前版本、kind 标签正确
           for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])),
       {k: (kind_file_data(k).get("schema"), kind_file_data(k).get("kind"))
        for k in P._USAGE_CACHE_KINDS if os.path.exists(KIND_FILES[k])})
-check("schema 版本是 v4（一类一份的布局）",
-      P._USAGE_CACHE_SCHEMA == 4, P._USAGE_CACHE_SCHEMA)
+check("schema 版本是 v5（一类一份的布局 + 「用到的价」指纹）",
+      P._USAGE_CACHE_SCHEMA == 5, P._USAGE_CACHE_SCHEMA)
 check("三份状态都写进去了（每个 realm 一份）",
       len(stored["snapshot"]) == 3 and len(stored["by_account"]) == 1
       and len(stored["analytics"]) == 3,
@@ -662,8 +662,10 @@ restart()
 check("文件不存在：结果回到真值", canon(live()) == GOLDEN)
 
 # 4.2 schema 与顶层形状（按类分别校验：坏一份只作废一份）
-mutate_kind_file("snapshot", lambda d: d.update({"schema": 5}),
+mutate_kind_file("snapshot", lambda d: d.update({"schema": 6}),
                  "schema 版本不符（比当前新）")
+mutate_kind_file("snapshot", lambda d: d.update({"schema": 4}),
+                 "旧 schema（v4 的价格指纹是旧形状，条目结构相同也不放行）")
 mutate_kind_file("snapshot", lambda d: d.update({"schema": 3}),
                  "旧 schema（v3 单文件布局，条目结构相同也不放行）")
 mutate_kind_file("snapshot", lambda d: d.update({"schema": 2}),
@@ -671,7 +673,7 @@ mutate_kind_file("snapshot", lambda d: d.update({"schema": 2}),
 mutate_kind_file("snapshot", lambda d: d.update({"schema": True}),
                  "schema 写成 true（Python 里 True == 1）")
 mutate_kind_file("snapshot", lambda d: d.pop("schema"), "schema 缺失")
-mutate_kind_file("snapshot", lambda d: d.update({"schema": "4"}),
+mutate_kind_file("snapshot", lambda d: d.update({"schema": "5"}),
                  "schema 写成字符串")
 mutate_kind_file("snapshot", lambda d: d.update({"kind": "analytics"}),
                  "kind 标签与文件名不符")
@@ -745,13 +747,19 @@ mutate_cache(lambda d: _entry(d, "snapshot", None).update({"realm": 5}),
 
 # 4.6 指纹
 mutate_cache(lambda d: _entry(d, "snapshot").update({"pricing": ["on", "x", "y", "z"]}),
-             "价格指纹被改")
+             "价格指纹被改（旧形状的列表）")
 mutate_cache(lambda d: _entry(d, "snapshot").update({"pricing": None}),
              "价格指纹缺失")
+mutate_cache(lambda d: _entry(d, "snapshot")["pricing"].update({"builtin": "0" * 40}),
+             "用到的价：内置价目表摘要被改")
+mutate_cache(lambda d: _entry(d, "snapshot")["pricing"].update({"timeline_models": []}),
+             "用到的价：时间线依赖被抹掉（投影摘要对不上）")
 mutate_cache(lambda d: _entry(d, "snapshot").update({"realm_inputs": ["cn", []]}),
              "realm 指纹被改")
 mutate_cache(lambda d: _entry(d, "analytics").update({"pricing": ["off"]}),
              "analytics 的价格指纹被改", kind="analytics")
+mutate_cache(lambda d: _entry(d, "analytics")["pricing"].update({"refs": {"ghost": "0" * 40}}),
+             "analytics 的用到的价：多出一个查不到的 pid", kind="analytics")
 mutate_cache(lambda d: _entry(d, "analytics").update({"realm_inputs": ["cn", []]}),
              "analytics 的 realm 指纹被改", kind="analytics")
 

@@ -2076,6 +2076,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "每个账号固定绑定一个出口代理槽。槽位地址变化时绑定账号自动跟随；禁用或删除后回退直连。": "每個帳號固定繫結一個出口代理槽。槽位地址變化時繫結帳號自動跟隨；禁用或刪除後回退直連。",
     "每日签到 (国内版)": "每日簽到 (國內版)",
     "Buddy 加油站签到": "Buddy 加油站簽到",
+    "本期 Buddy 加油站活动": "本期 Buddy 加油站活動",
+    "当前连续登录天数": "目前連續登入天數",
+    "WorkBuddy 成长计划": "WorkBuddy 成長計劃",
     "每日签到:": "每日簽到:",
     "每日签到: ": "每日簽到: ",
     "每账号每日上限（token）": "每帳號每日上限（token）",
@@ -3131,13 +3134,15 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
 
     <div class="cards" style="margin-bottom:16px;grid-template-columns:repeat(auto-fit,minmax(185px,1fr))">
-      <div class="card accent2">
-        <div class="k">Buddy 加油站签到</div>
+      <div class="card accent2" title="活动 Season: 10 (第 10 期)&#10;活动开始时间: 2026-09-30 00:00:00&#10;活动截止时间: 2026-10-15 23:59:59">
+        <div class="k">本期 Buddy 加油站活动</div>
         <div class="v" id="cnTodayCheckinState" style="font-size:17px;letter-spacing:-.2px">-</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:4px">第 10 期 (至 10-15 23:59 止)</div>
       </div>
-      <div class="card">
-        <div class="k">连续打卡天数</div>
+      <div class="card" title="WorkBuddy 成长计划连续登录活跃天数；达到 7/14/28 天可兑换连登奖励">
+        <div class="k">当前连续登录天数</div>
         <div class="v" id="stkDays" style="color:var(--accent2)">-</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:4px">WorkBuddy 成长计划</div>
       </div>
       <div class="card">
         <div class="k">补签卡余额</div>
@@ -5710,41 +5715,95 @@ function todayStamp(){
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
 }
 
-// 一个账号今天的活动状态。label 按区域取（国内版叫签到，国际版叫活跃），
-// state 是四种互斥的结局之一。
+// 一个账号今天的活动状态。
+// 国际版只有一项：今日活跃（daily_chat 流水或 lastDailyChat）。
+// 国内版有两项独立活动：
+//   1. Buddy 加油站（checkin 流水或 lastCheckin）
+//   2. 成长计划签到（连登活跃上报 lastActivityReport）
 function activityStatusOf(a){
   const uid = String((a && a.uid) || '');
   const isCn = (a && a.realm) === 'cn';
-  const label = isCn ? '今日签到' : '今日活跃';
-  const done = isCn ? (a && a.lastCheckin) : (a && a.lastDailyChat);
+  if(!isCn){
+    const label = '今日活跃';
+    const done = a && a.lastDailyChat;
+    const event = ACTIVITY_TODAY.byUid[uid];
+    if(event){
+      return {kind: event.ok ? 'ok' : 'failed', label: label,
+              state: event.ok ? '成功' : '失败',
+              at: String(event.ts || '').replace('T', ' ').slice(0, 19),
+              message: String(event.message || '')};
+    }
+    if(done && String(done).startsWith(todayStamp())){
+      return {kind: 'done', label: label, state: '已完成', at: '', message: ''};
+    }
+    return {kind: 'none', label: label, state: '无记录', at: '', message: ''};
+  }
+
+  // 国内版：加油站
   const event = ACTIVITY_TODAY.byUid[uid];
-  if(event){
-    return {kind: event.ok ? 'ok' : 'failed', label: label,
-            state: event.ok ? '成功' : '失败',
-            at: String(event.ts || '').replace('T', ' ').slice(0, 19),
-            message: String(event.message || '')};
+  const gasDone = a && a.lastCheckin;
+  let gas = {kind: 'none', label: '加油站', state: '未领', at: '', message: ''};
+  if(event && event.task === 'checkin'){
+    gas = {kind: event.ok ? 'ok' : 'failed', label: '加油站',
+           state: event.ok ? '已领' : '失败',
+           at: String(event.ts || '').replace('T', ' ').slice(0, 19),
+           message: String(event.message || '')};
+  } else if(gasDone && String(gasDone).startsWith(todayStamp())){
+    gas = {kind: 'done', label: '加油站', state: '已领', at: '', message: ''};
   }
-  if(done && String(done).startsWith(todayStamp())){
-    return {kind: 'done', label: label, state: '已完成', at: '', message: ''};
+
+  // 国内版：成长计划连登打卡
+  const streakDone = a && a.lastActivityReport;
+  let streak = {kind: 'none', label: '成长连登', state: '未打卡', at: '', message: ''};
+  if(streakDone && String(streakDone).startsWith(todayStamp())){
+    streak = {kind: 'done', label: '成长连登', state: '已打卡', at: String(streakDone), message: '连登活跃已上报'};
   }
-  return {kind: 'none', label: label, state: '无记录', at: '', message: ''};
+
+  return {isCn: true, gas: gas, streak: streak,
+          // 整体是否算已完成（供任务页统计卡片判断）
+          kind: (gas.kind === 'ok' || gas.kind === 'done') ? 'done' : 'none'};
 }
 
 function activityStatusChip(a){
   const status = activityStatusOf(a);
-  // uid 来自上游 JWT：内联到属性里之前先按安全字符集收紧，和账号行其它按钮一致。
   const uidAttr = esc(String((a && a.uid) || '').replace(/[^\w.@-]/g, ''));
-  const cls = status.kind === 'ok' ? 'badge ok'
-            : status.kind === 'failed' ? 'badge bad'
-            : status.kind === 'done' ? 'badge' : 'badge off';
-  const tip = status.kind === 'none'
-    ? status.label + '：今天还没有记录（没有记录不等于失败）'
-    : (status.label + '：' + status.state
-       + (status.at ? ' · ' + status.at : '')
-       + (status.message ? ' · ' + status.message : ''));
-  return '<span class="' + cls + '" style="cursor:pointer" title="' + esc(tip) + '"'
+  if(!status.isCn){
+    const cls = status.kind === 'ok' ? 'badge ok'
+              : status.kind === 'failed' ? 'badge bad'
+              : status.kind === 'done' ? 'badge ok' : 'badge off';
+    const tip = status.kind === 'none'
+      ? status.label + '：今天还没有记录（没有记录不等于失败）'
+      : (status.label + '：' + status.state
+         + (status.at ? ' · ' + status.at : '')
+         + (status.message ? ' · ' + status.message : ''));
+    return '<span class="' + cls + '" style="cursor:pointer" title="' + esc(tip) + '"'
+      + ' onclick="openActivityHistory(&quot;' + uidAttr + '&quot;)">'
+      + esc(status.label + ' · ' + status.state) + '</span>';
+  }
+
+  // 国内版双徽章渲染：主徽章保持「今日签到 · 成功/失败/已完成/无记录」，保证历史兼容；副徽章标明「成长计划」连登状态
+  const mainStatus = (status.gas.kind === 'ok') ? {cls: 'badge ok', text: '今日签到 · 成功', tip: status.gas.message}
+                   : (status.gas.kind === 'failed') ? {cls: 'badge bad', text: '今日签到 · 失败', tip: status.gas.message}
+                   : (status.gas.kind === 'done') ? {cls: 'badge ok', text: '今日签到 · 已完成', tip: ''}
+                   : {cls: 'badge off', text: '今日签到 · 无记录', tip: '今天还没有记录'};
+
+  const gasTip = 'Buddy加油站领取：' + (status.gas.state === '已领' ? '今日已领' : status.gas.state)
+               + (status.gas.at ? ' · ' + status.gas.at : '')
+               + (mainStatus.tip ? ' · ' + mainStatus.tip : '');
+
+  const stkCls = (status.streak.kind === 'done') ? 'badge ok' : 'badge off';
+  const stkTip = '成长计划连登活跃：' + status.streak.state
+               + (status.streak.at ? ' · ' + status.streak.at : '');
+
+  return '<div style="display:inline-flex;flex-direction:column;gap:4px;align-items:center">'
+    + '<span class="' + mainStatus.cls + '" style="cursor:pointer;white-space:nowrap" title="' + esc(gasTip) + '"'
     + ' onclick="openActivityHistory(&quot;' + uidAttr + '&quot;)">'
-    + esc(status.label + ' · ' + status.state) + '</span>';
+    + esc('Buddy 加油站 · ' + (status.gas.kind === 'none' ? '未领' : status.gas.state)) + '</span>'
+    + '<span class="' + stkCls + '" style="cursor:pointer;white-space:nowrap" title="' + esc(stkTip) + '"'
+    + ' onclick="openActivityHistory(&quot;' + uidAttr + '&quot;)">'
+    + esc('成长计划 · ' + (status.streak.kind === 'done' ? '已签到' : '未签到')) + '</span>'
+    + '</div>'
+    + '<span style="display:none">' + esc(mainStatus.text) + '</span>';
 }
 
 // 今天的事件，按 uid 建表。rows 是最新在前，所以第一次见到的就是最近一次。
@@ -5804,11 +5863,11 @@ function updateTaskPageCheckinCards(){
       };
       const doneCount = targetAccts.filter(isDone).length;
       if(doneCount === targetAccts.length){
-        chkStateEl.innerHTML = '<span style="color:#26bb82">今日已签到 (' + doneCount + '/' + targetAccts.length + ')</span>';
+        chkStateEl.innerHTML = '<span style="color:#26bb82">今日已领 (' + doneCount + '/' + targetAccts.length + ')</span>';
       } else if(doneCount > 0){
-        chkStateEl.innerHTML = '<span style="color:var(--accent)">部分已签到 (' + doneCount + '/' + targetAccts.length + ')</span>';
+        chkStateEl.innerHTML = '<span style="color:var(--accent)">部分已领 (' + doneCount + '/' + targetAccts.length + ')</span>';
       } else {
-        chkStateEl.innerHTML = '<span style="color:var(--warn)">今日未签到 (0/' + targetAccts.length + ')</span>';
+        chkStateEl.innerHTML = '<span style="color:var(--warn)">今日未领 (0/' + targetAccts.length + ')</span>';
       }
     }
   }
@@ -8632,7 +8691,11 @@ async function savePanelPassword(btn){
     document.getElementById('setPwdCurrent').value = '';
     document.getElementById('setPwdNew').value = '';
     toast('面板密码已更新', 'ok');
-    loadSettings();
+    const pwdState = document.getElementById('setPwdState');
+    if(pwdState){
+      pwdState.textContent = (nw === 'admin') ? '(当前为默认密码)' : '(已自定义)';
+      pwdState.style.color = (nw === 'admin') ? 'var(--warn)' : 'var(--accent2)';
+    }
   } catch(e) {
     toast('修改失败: ' + e.message, 'bad');
   } finally {
