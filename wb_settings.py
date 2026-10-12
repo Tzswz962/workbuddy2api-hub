@@ -40,6 +40,14 @@ MAX_PRICING_REFRESH_MINUTES = 24 * 30 * 60
 DEFAULT_CREDITS_REFRESH_HOURS = 12.0
 MAX_CREDITS_REFRESH_HOURS = 24 * 30
 CREDITS_REFRESH_HOURS_KEY = "credits_refresh_hours"
+# Panel window height cap, in pixels: a dashboard window (section) taller than
+# this scrolls internally with its title row pinned, instead of stretching the
+# whole page. 0 turns the cap off. The default sits just above the log
+# terminal's own 620px so the terminal stays untouched until the user asks for
+# something smaller.
+SECTION_MAX_HEIGHT_KEY = "section_max_height"
+DEFAULT_SECTION_MAX_HEIGHT = 640
+MAX_SECTION_MAX_HEIGHT = 4000
 # Whether a model name may inherit its price from a suffix-stripped base
 # (deepseek-r1-0528-lkeap → deepseek-r1-0528). Missing key reads as on.
 PRICING_VARIANT_INHERIT_KEY = "pricing_variant_inherit"
@@ -874,6 +882,47 @@ def set_credits_refresh_hours(accounts_dir, value):
         data[CREDITS_REFRESH_HOURS_KEY] = hours
         save(accounts_dir, data)
     return hours
+
+
+def section_max_height(accounts_dir):
+    """Panel window height cap in pixels; 0 means no limit.
+
+    Anything that is not a whole number falls back to the default, so a
+    hand-edited settings.json cannot leave the dashboard with windows a pixel
+    tall; a value past MAX_SECTION_MAX_HEIGHT is clamped, not rejected. bool is
+    checked first on purpose: it is an int subclass, and True would otherwise
+    read as a 1px cap.
+    """
+    with _lock:
+        raw = load(accounts_dir).get(SECTION_MAX_HEIGHT_KEY)
+    if isinstance(raw, bool):
+        return DEFAULT_SECTION_MAX_HEIGHT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError is its own case: json.loads turns 1e400 into inf, and
+        # int(inf) raises it - one broken line must not 500 the settings view.
+        return DEFAULT_SECTION_MAX_HEIGHT
+    if value < 0:
+        return DEFAULT_SECTION_MAX_HEIGHT
+    return min(value, MAX_SECTION_MAX_HEIGHT)
+
+
+def set_section_max_height(accounts_dir, value):
+    """Persist the cap. Returns the stored value."""
+    if isinstance(value, bool):
+        number = DEFAULT_SECTION_MAX_HEIGHT
+    else:
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            number = DEFAULT_SECTION_MAX_HEIGHT
+    number = max(0, min(MAX_SECTION_MAX_HEIGHT, number))
+    with _lock:
+        data = load(accounts_dir)
+        data[SECTION_MAX_HEIGHT_KEY] = number
+        save(accounts_dir, data)
+    return number
 
 
 def _clamp_refresh_minutes(value):

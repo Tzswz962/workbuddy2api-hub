@@ -9706,6 +9706,7 @@ def runtime_settings_view():
         "model_daily_token_limit": wb_settings.model_daily_token_limit(ACCOUNTS_DIR),
         "pricing_refresh_minutes": wb_settings.pricing_refresh_minutes(ACCOUNTS_DIR),
         "credits_refresh_hours": wb_settings.credits_refresh_hours(ACCOUNTS_DIR),
+        "section_max_height": wb_settings.section_max_height(ACCOUNTS_DIR),
         "ui_language": wb_settings.ui_language(ACCOUNTS_DIR),
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
@@ -13120,12 +13121,30 @@ def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
 
-def custom_tool_names(tools):
-    """Names of tools declared as freeform/custom in a Responses request."""
+def custom_tool_names(tools, _depth=0):
+    """Names of tools declared as freeform/custom in a Responses request.
+
+    递归进 namespace：新版 Codex Desktop 把自由格式工具嵌在 functions 命名
+    空间里（exec 的 type 就是 "custom"）。漏掉它的后果不是「少一个名字」，
+    而是回程被判成 function_call，客户端按 (name, namespace, kind) 三元组匹
+    配不到执行器，调用不执行、不返回，模型只能无限重试。namespace 只是客户
+    端给工具分组的方式，不是停止查找的理由。
+    """
     names = set()
+    if _depth > NAMESPACE_MAX_DEPTH:
+        return names
     for t in tools or []:
+        if not isinstance(t, dict):
+            continue
         if _is_custom_tool(t) and t.get("name"):
             names.add(str(t["name"]))
+        elif str(t.get("type") or "").lower() == "namespace":
+            subs = t.get("tools")
+            if not isinstance(subs, list):
+                subs = t.get("children")
+            if not isinstance(subs, list):
+                subs = t.get("functions")
+            names |= custom_tool_names(subs, _depth + 1)
     return names
 
 
@@ -13301,6 +13320,24 @@ def apply_namespace_to_calls(output_items, mapping):
             item["namespace"] = ns
             fixed += 1
     return output_items, fixed
+
+
+def additional_tools_from_input(payload):
+    """从 input 数组里收集 additional_tools 条目的 tools。
+
+    新版 Codex Desktop 0.162+ 把工具放在 input 内的
+    {"type": "additional_tools", "tools": [...]} 条目里，顶层 tools 是空的。
+    出站（responses_to_chat）与回程（custom_tool_names / request_meta.tools）
+    的取值都必须走这里，否则两边看到的是不同的工具清单。
+    """
+    collected = []
+    for item in payload.get("input") or []:
+        if isinstance(item, dict) and item.get("type") == "additional_tools":
+            sub_tools = item.get("tools")
+            if isinstance(sub_tools, list):
+                collected.extend(sub_tools)
+    return collected
+
 
 def _tools_for_chat(tools):
     """Downgrade custom tools; leave everything else untouched."""
@@ -13769,11 +13806,7 @@ def responses_to_chat(payload):
     raw_tools = []
     if isinstance(payload.get("tools"), list):
         raw_tools.extend(payload["tools"])
-    for item in payload.get("input") or []:
-        if isinstance(item, dict) and item.get("type") == "additional_tools":
-            sub_tools = item.get("tools")
-            if isinstance(sub_tools, list):
-                raw_tools.extend(sub_tools)
+    raw_tools.extend(additional_tools_from_input(payload))
     if raw_tools:
         flat_tools, ns_map = expand_namespace_tools(raw_tools)
         chat["tools"] = _tools_for_chat(flat_tools)
@@ -13781,8 +13814,9 @@ def responses_to_chat(payload):
     # 客户端宣告 web_search / web_fetch 时，把那份宣告换成我们的
     # function（见 wb_webtools.install_tool_defs）。
     # 看板开关关闭时原样透传，客户端自己的同名工具不受影响。
+    # 用合并后的清单：工具可能整份都在 additional_tools 里，只看顶层会漏。
     if local_web_tools_enabled():
-        wants = wb_webtools.client_wants_web(payload.get("tools"))
+        wants = wb_webtools.client_wants_web(raw_tools)
         if wants["search"] or wants["fetch"]:
             chat["tools"] = wb_webtools.install_tool_defs(chat.get("tools") or [], wants)
             chat["_web_tools"] = True
@@ -16566,6 +16600,32 @@ class Handler(BaseHTTPRequestHandler):
                 wb_settings.set_credits_refresh_hours(ACCOUNTS_DIR, hours)
             if CREDITS_REFRESHER:
                 CREDITS_REFRESHER.wake()
+        if "section_max_height" in payload:
+            # Panel window height cap in pixels; 0 turns the cap off. bool is an
+            # int subclass and must be rejected explicitly - true would
+            # otherwise store 1 and shrink every window to a sliver.
+            raw = payload.get("section_max_height")
+            if isinstance(raw, bool) or raw is None:
+                return self._error(400, "section_max_height must be a whole number",
+                                   "invalid_request_error")
+            try:
+                number = int(raw)
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError: a JSON payload may carry Infinity (1e400),
+                # which int() refuses - answer 400, not a 500.
+                return self._error(400, "section_max_height must be a whole number",
+                                   "invalid_request_error")
+            # A fractional count is refused rather than truncated: int(-0.5) is
+            # 0, which would slip past the negative check and silently turn the
+            # cap off.
+            if float(raw) != number:
+                return self._error(400, "section_max_height must be a whole number",
+                                   "invalid_request_error")
+            if number < 0:
+                return self._error(400, "section_max_height cannot be negative",
+                                   "invalid_request_error")
+            reply["section_max_height"] = \
+                wb_settings.set_section_max_height(ACCOUNTS_DIR, number)
         if "ui_language" in payload:
             # Instance-wide default language. The dashboard overrides this per
             # browser with localStorage; this value is the fallback when no
@@ -17811,12 +17871,19 @@ class Handler(BaseHTTPRequestHandler):
                 "instead, or use a stateless client.",
                 "invalid_request_error")
         session_key = extract_session_key(self.headers, payload)
-        custom_names = custom_tool_names(payload.get("tools"))
+        # 工具可能在顶层，也可能整份在 input 的 additional_tools 条目里。回程
+        # 的两处取值（custom_names 判定条目类型、request_meta 回显工具清单）
+        # 必须和 responses_to_chat() 出站合并后的清单一致，否则两边看到的
+        # 是不同工具集合，回程类型判错 → 客户端匹配不到执行器。
+        all_tools = payload.get("tools")
+        all_tools = list(all_tools) if isinstance(all_tools, list) else []
+        all_tools.extend(additional_tools_from_input(payload))
+        custom_names = custom_tool_names(all_tools)
         chat_req = responses_to_chat(payload)
         ns_map = chat_req.pop("_namespace_map", None)
         # Echo these back on the response object; see chat_to_response.
         request_meta = {
-            "tools": payload.get("tools") or [],
+            "tools": all_tools,
             "tool_choice": payload.get("tool_choice", "auto"),
             "parallel_tool_calls": payload.get("parallel_tool_calls", True),
         }
@@ -17825,9 +17892,10 @@ class Handler(BaseHTTPRequestHandler):
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
         log(
-            "responses: model=%s stream=%s msgs=%d effort=%r custom_tools=%s"
+            "responses: model=%s stream=%s msgs=%d effort=%r tools=%d/%d custom_tools=%s"
             % (model, want_stream, len(chat_req.get("messages") or []),
                chat_req.get("reasoning_effort"),
+               len(chat_req.get("tools") or []), len(all_tools),
                sorted(custom_names) or "-")
         )
         try:

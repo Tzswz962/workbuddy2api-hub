@@ -131,7 +131,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 141 个套件：105 个 Python + 36 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 143 个套件：106 个 Python + 37 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -356,6 +356,11 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
 ### Unreleased
+
+- **修复：命名空间内的自由格式（`type: "custom"`）工具回程被判成 `function_call`，调用发出去却没有返回**（#308 跟进）：`custom_tool_names()` 此前只扫工具清单顶层，于是嵌在 `type: "namespace"` 里的 `exec`（Codex Desktop 的 `functions` 命名空间里它就是 `custom`）从未进入 `custom_names`；`chat_to_response()` 与流式分支用该集合决定回程条目类型，判错后发成 `function_call`，而客户端按 `(name, namespace, kind)` 三元组匹配执行器——类型对不上就找不到执行器，调用既不执行也不返回，模型只能无限重试（现场实测同类会话堆积 42 次调用、0 条结果，agent 反复报「工具被中断」）。现在 `custom_tool_names()` 递归进 namespace 的 `tools` / `children` / `functions` 栏位（深度上限沿用 `NAMESPACE_MAX_DEPTH`）。
+- **修复：工具整份下发在 `input` 的 `additional_tools` 条目里时，回程侧看到的工具清单是空的**（#308 跟进）：出站已合并该条目（v1.7.2 / #308），但 `_handle_responses()` 里 `custom_tool_names()` 与回显的 `request_meta["tools"]` 仍只读顶层 `tools` 字段——新版 Codex Desktop 顶层是空的，于是出站与回程看到两份不同的工具清单。现在两处都走新提取的公共函数 `additional_tools_from_input()`，与 `responses_to_chat()` 用同一份合并清单；请求日志相应扩成 `tools=上游数/合并后数`，便于一眼看出两边是否对齐。`local_web_tools_enabled()` 开启时的 `client_wants_web()` 也改用合并后的清单（该开关默认关，老安装行为不变）。
+- 回归测试：`tests/_test_custom_tools.py` 新增 `[13]`/`[14]`/`[15]` 三节（15 项，套件总数不变）：钉住嵌套 custom 的收集（含 `children` / `functions` 栏位）、嵌套 custom 往返成 `custom_tool_call` 且 `namespace` 正确、同命名空间内的普通 function 仍走 `function_call` 作反面对照，以及工具整份来自 `additional_tools` 时出站合并与回程取值一致。
+- **面板窗口限高：所有窗口（区块 + 日志终端）超高时在窗口内部滚动、标题行吸顶，高度在设置页可调**：面板里最长的区块（真机「签到与活跃记录」6801px）会把整页拉得很长，翻过它要滑很久。现在每个窗口超过限高时改为**窗口内部滚动**：区块挂 `max-height:var(--win-max-h)` + `overflow-y:auto`，标题行吸顶——区块自带的 `padding-top` 归零、挪给吸顶首行（否则吸顶后顶部漏出 18px 滚动内容），首行 `margin` 折成 `padding`（下方那条缝同理），窄屏（≤860px）两处一起缩到 14px；日志终端（自带 620px 高度）也在同一变量之下，限高调得比它小时同样生效。三条规则全部挂在 `body.win-capped` 之下，限高关掉时整条不生效、版式与从前逐像素一致。限高存在服务端 `accounts/settings.json` 的 `section_max_height`（与页签显示、账号折叠同一套通道，不用 localStorage），默认 **640px**、**0 = 不限**、上限 4000，设置页新增「面板窗口限高」区块（输入框 + 保存，附英文/正体词条）。边界口径：字段缺失或存坏回落默认 640px（与页签显示、账号折叠的坏值口径一致）；`true` 是 `int` 子类、显式挡掉——否则存成 1px 把窗口压成一条缝；`1e400` 读成 `inf` 时 `int()` 抛的 `OverflowError` 一并挡掉（否则 `/settings` 直接 500）；负的分数像素（`int(-0.5)` = 0）拒绝而不是静默关掉限高；面板侧空输入框同样拦下（`Number('')` 是 0，放过去就是「清空即关闭」）。新增测试套件 `tests/_test_section_max_height.py` + `tests/_test_section_max_height.js`；README 套件计数 141 → 143。
 
 已发布版本的完整记录（v1.4.5 ~ v1.7.2，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 ## 七、致谢与引用声明 (Credits & References)
