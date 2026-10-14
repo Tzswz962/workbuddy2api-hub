@@ -114,6 +114,26 @@ REMAINING_PRIORITY_ENABLED_KEY = "remaining_priority_enabled"
 # 派发路径上的失败归账与退避尺度，老安装保持原样（传输错误仍喂账号熔断）。
 EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
 
+# 日志落库：把运行日志追加写进 usage/logs.sqlite3，重启后仍能回看，方便事后
+# debug。缺失键读作关 —— 关着的时候日志只留在内存环形缓冲里，与上游一字不差；
+# 只有显式 true 才建库、落盘。
+LOG_DB_ENABLED_KEY = "log_db_enabled"
+# 三条互相独立的保留上限，各自「留空 = 这一维不设限」：
+#   * rows  —— 只留最新的 N 条（空 = 不限条数）
+#   * days  —— 只留最近 N 天（空 = 不限天数；**默认 7 天**）
+#   * bytes —— 库文件超过 N 字节就从最旧的删起，缩回 N 以内（空 = 不限大小）
+# 天数给了 7 天默认值，是因为「无限增长的日志库」才是要防的那件事；条数与
+# 字节数留空（不限），因为单独看任何一个都可能偏严或偏松，交给使用者按需填。
+LOG_DB_MAX_ROWS_KEY = "log_db_max_rows"
+LOG_DB_MAX_DAYS_KEY = "log_db_max_days"
+LOG_DB_MAX_BYTES_KEY = "log_db_max_bytes"
+DEFAULT_LOG_DB_MAX_DAYS = 7
+# 上限只用来挡手滑：手编 settings.json 写个天文数字不该把裁剪循环拖死，也不该
+# 让面板显示一个溢出成科学计数法的值。都远大于任何真实部署会用的量级。
+MAX_LOG_DB_MAX_ROWS = 100_000_000
+MAX_LOG_DB_MAX_DAYS = 36500
+MAX_LOG_DB_MAX_BYTES = 100 * 1024 ** 3
+
 _lock = threading.RLock()
 
 
@@ -1122,6 +1142,56 @@ def set_upstream_config(accounts_dir, cfg):
     return clean
 
 
+USAGE_DEFAULTS = {
+    "hour_keep_hours": 48,
+    "day_keep_days": 32,
+}
+
+# 上限只是防手滑：面板输入框贴错位数会把 checkpoint 撑到几百 MB，而它每推进
+# 一点就要整份重写——路由器上 flash 写入慢且费寿命。两周的小时层、一年的日桶
+# 已经远超任何窗口够得到的范围。
+USAGE_LIMITS = {
+    "hour_keep_hours": 24 * 14,
+    "day_keep_days": 366,
+}
+
+def validate_usage_patch(raw):
+    """Strict validation for a panel-saved aggregate-retention patch."""
+    out = {}
+    for key, value in (raw or {}).items():
+        if key not in USAGE_DEFAULTS:
+            raise ValueError("unknown usage setting %r" % key)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("%s must be a whole number" % key)
+        if value < 1:
+            raise ValueError("%s cannot be less than 1" % key)
+        if value > USAGE_LIMITS[key]:
+            raise ValueError("%s cannot be more than %d" % (key, USAGE_LIMITS[key]))
+        out[key] = value
+    return out
+
+def usage_config(accounts_dir):
+    """聚合保留窗口（小时层 / 日桶）。面板没设过就是内置默认值。"""
+    stored = load(accounts_dir).get("usage")
+    stored = stored if isinstance(stored, dict) else {}
+    out = {}
+    for key, default in USAGE_DEFAULTS.items():
+        value = stored.get(key, default)
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value < 1 or value > USAGE_LIMITS[key]):
+            value = default
+        out[key] = value
+    return out
+
+def set_usage_config(accounts_dir, patch):
+    """Persist a validated aggregate-retention patch."""
+    clean = validate_usage_patch(patch)
+    with _lock:
+        data = load(accounts_dir)
+        data["usage"] = deep_merge(data.get("usage"), clean)
+        save(accounts_dir, data)
+    return clean
+
 PROMPT_DEFAULTS = {
     "mode": "passthrough",
     "file": "",
@@ -1244,6 +1314,142 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
         data[EGRESS_BACKOFF_ENABLED_KEY] = enabled
         save(accounts_dir, data)
     return enabled
+
+
+def log_db_enabled(accounts_dir):
+    """Whether runtime logs are also appended to usage/logs.sqlite3.
+
+    Off unless the operator turns it on: with the switch off the log lives only
+    in the in-memory ring, exactly as it does upstream, and no database file is
+    created. Turning it on starts a durable copy so a crash, a restart or a
+    slow-moving incident can still be read back afterwards.
+    """
+    return load(accounts_dir).get(LOG_DB_ENABLED_KEY) is True
+
+
+def set_log_db_enabled(accounts_dir, enabled):
+    """Persist the log-database switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[LOG_DB_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def _positive_cap(raw, fallback, hard_max):
+    """One retention cap read back: a positive whole number, clamped.
+
+    Anything that is not a usable positive integer (a bool, text, 0, a negative,
+    a hand-edited 1e400) falls back instead of raising - a broken settings.json
+    must not take the log path down with it.
+    """
+    if isinstance(raw, bool):
+        return fallback
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    if value <= 0:
+        return fallback
+    return min(value, hard_max)
+
+
+def _clearable_cap(value, hard_max):
+    """One retention cap on its way to disk: blank or nonsense means "no cap".
+
+    The panel posts an empty string for a field the operator cleared, and 0 is
+    the same intent typed out. Both land as None (JSON null), which is what the
+    getters read back as "unlimited on this axis".
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number <= 0:
+        return None
+    return min(number, hard_max)
+
+
+def log_db_max_rows(accounts_dir):
+    """Newest-N row cap for the log database; None means no row cap.
+
+    Absent key reads as None: a fresh install keeps every row until the days
+    cap trims it, which is what "rows left blank" asks for.
+    """
+    data = load(accounts_dir)
+    if LOG_DB_MAX_ROWS_KEY not in data:
+        return None
+    raw = data.get(LOG_DB_MAX_ROWS_KEY)
+    if raw is None:
+        return None
+    return _positive_cap(raw, None, MAX_LOG_DB_MAX_ROWS)
+
+
+def set_log_db_max_rows(accounts_dir, value):
+    """Persist the row cap (blank clears it). Returns the stored value."""
+    stored = _clearable_cap(value, MAX_LOG_DB_MAX_ROWS)
+    with _lock:
+        data = load(accounts_dir)
+        data[LOG_DB_MAX_ROWS_KEY] = stored
+        save(accounts_dir, data)
+    return stored
+
+
+def log_db_max_days(accounts_dir):
+    """Age cap for the log database, in days; None means no age cap.
+
+    Unlike the other two, an absent key reads as the 7-day default: an install
+    that has never touched the setting still gets a bounded database. Clearing
+    the field on purpose stores None and turns the cap off.
+    """
+    data = load(accounts_dir)
+    if LOG_DB_MAX_DAYS_KEY not in data:
+        return DEFAULT_LOG_DB_MAX_DAYS
+    raw = data.get(LOG_DB_MAX_DAYS_KEY)
+    if raw is None:
+        return None
+    return _positive_cap(raw, DEFAULT_LOG_DB_MAX_DAYS, MAX_LOG_DB_MAX_DAYS)
+
+
+def set_log_db_max_days(accounts_dir, value):
+    """Persist the age cap (blank clears it). Returns the stored value."""
+    stored = _clearable_cap(value, MAX_LOG_DB_MAX_DAYS)
+    with _lock:
+        data = load(accounts_dir)
+        data[LOG_DB_MAX_DAYS_KEY] = stored
+        save(accounts_dir, data)
+    return stored
+
+
+def log_db_max_bytes(accounts_dir):
+    """File-size cap for the log database, in bytes; None means no size cap.
+
+    Absent key reads as None, like the row cap: the days default is what keeps
+    a fresh install bounded, and the size cap is there for a deployment that
+    wants a hard ceiling on the file itself.
+    """
+    data = load(accounts_dir)
+    if LOG_DB_MAX_BYTES_KEY not in data:
+        return None
+    raw = data.get(LOG_DB_MAX_BYTES_KEY)
+    if raw is None:
+        return None
+    return _positive_cap(raw, None, MAX_LOG_DB_MAX_BYTES)
+
+
+def set_log_db_max_bytes(accounts_dir, value):
+    """Persist the size cap (blank clears it). Returns the stored value."""
+    stored = _clearable_cap(value, MAX_LOG_DB_MAX_BYTES)
+    with _lock:
+        data = load(accounts_dir)
+        data[LOG_DB_MAX_BYTES_KEY] = stored
+        save(accounts_dir, data)
+    return stored
 
 
 def daily_chat_web(accounts_dir):

@@ -283,6 +283,13 @@ a:hover{text-decoration:underline}
 .realm-filter{display:inline-flex;gap:6px;margin-left:8px}
 .realm-filter button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:3px 9px;font-size:11px}
 .realm-filter button.active{border-color:var(--accent);color:var(--accent);background:var(--panel)}
+/* 账号页页头的版本视图切换：与顶部主菜单同一套胶囊外观，只是按版本着色——
+   国际版走强调色、国内版走红色，与网关页那两张卡片一眼能对上。 */
+.realm-switch{display:inline-flex;gap:4px;background:var(--panel2);padding:4px;border-radius:10px;border:1px solid var(--line);flex:0 0 auto}
+.realm-switch button{background:transparent;border:1px solid transparent;color:var(--dim);padding:5px 13px;border-radius:7px;font-size:12px;font-weight:500;cursor:pointer;transition:all .15s ease}
+.realm-switch button:hover{color:var(--fg);background:var(--panel)}
+.realm-switch button.active{background:var(--panel);color:var(--accent);border-color:var(--accent);box-shadow:var(--shadow-sm);font-weight:600}
+.realm-switch button.active#accountsRealmCn{color:#dc2626;border-color:#ef4444}
 
 .realm-card{
   background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -381,6 +388,7 @@ a:hover{text-decoration:underline}
 [data-theme="dark"] .cool-pill{color:#fbbf24;background:rgba(245,158,11,.18);border-color:rgba(245,158,11,.38)}
 [data-theme="dark"] .realm-badge-intl{color:#38bdf8;background:rgba(2,132,199,.2);border-color:rgba(2,132,199,.4)}
 [data-theme="dark"] .realm-badge-cn{color:#f87171;background:rgba(220,38,38,.2);border-color:rgba(220,38,38,.4)}
+[data-theme="dark"] .realm-switch button.active#accountsRealmCn{color:#f87171;border-color:#f87171}
 [data-theme="dark"] .modal-mask{background:rgba(0,0,0,.65)}
 /* The page sections are toggled by a class so the inline head script can
    choose one before the body is parsed, avoiding a flash of the wrong
@@ -481,6 +489,16 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 .log-tag.tag-accounts{background:rgba(14,165,233,.18);color:#38bdf8}
 .log-tag.tag-auth{background:rgba(244,63,94,.18);color:#fb7185}
 .log-tag.tag-system{background:rgba(100,116,139,.18);color:#94a3b8}
+/* 细分出来的模块标签各有配色；catalog/auth 早先就被推断出来，只是一直没有
+   自己的颜色，和 system 的灰底混在一起。 */
+.log-tag.tag-catalog{background:rgba(45,212,191,.18);color:#2dd4bf}
+.log-tag.tag-agents{background:rgba(129,140,248,.18);color:#818cf8}
+.log-tag.tag-pricing{background:rgba(251,146,60,.18);color:#fb923c}
+.log-tag.tag-egress{background:rgba(34,211,238,.18);color:#22d3ee}
+.log-tag.tag-upstream{background:rgba(244,114,182,.18);color:#f472b6}
+.log-tag.tag-update{background:rgba(147,197,253,.18);color:#93c5fd}
+.log-tag.tag-usage{background:rgba(94,234,212,.18);color:#5eead4}
+.log-tag.tag-webtools{background:rgba(163,230,53,.18);color:#a3e635}
 .log-msg{color:#cbd5e1;flex:1;word-break:break-all;white-space:pre-wrap}
 .log-empty{padding:48px 24px;text-align:center;color:#64748b;font-size:13px;font-family:inherit}
 /* ===== Phone: ≤640px ===== */
@@ -985,6 +1003,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '回收失败:': 'Recovery failed:',
     '回收失败：': 'Recovery failed:',
     '回收密钥': 'Recover key',
+    '导入密钥': 'Import key',
     '固定国内版出口': 'China exit only',
     '固定国际版出口': 'Global exit only',
     '国内版': 'China',
@@ -1156,6 +1175,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '当前生效': 'In effect',
     '当前系统（': 'Current OS (',
     '当前视图': 'Current view',
+    '版本视图': 'Realm view',
     '当前账号正常': 'The current accounts are healthy',
     '待解码的凭证（加密存储）': 'Credentials to decrypt (stored encrypted)',
     '待领奖': 'Reward pending',
@@ -1327,7 +1347,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '查看 GitHub 项目仓库': 'View the GitHub repository',
     '查询': 'Check',
     '格式。': 'format.',
-    '桌面客户端把 token 加密存储了，需要从正在运行的 WorkBuddy.exe 进程内存里回收静态密钥': 'The desktop client now stores tokens encrypted, so the static key has to be recovered from the memory of a running WorkBuddy.exe process',
+    '桌面客户端把 token 加密存储了，需要从正在运行的客户端进程内存里回收静态密钥': 'The desktop client now stores tokens encrypted, so the static key has to be recovered from the memory of a running client process',
     '档': 'tier',
     '检测到加密凭据': 'Encrypted credentials detected',
     '槽位还没有填写代理地址': 'The slot has no proxy address yet',
@@ -1508,6 +1528,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '估算价格': 'Estimated cost',
     '估算价格（国内版）': 'Estimated cost (China)',
     '估算价格（国际版）': 'Estimated cost (Global)',
+    '积分消耗': 'Credits used',
+    '积分消耗（国内版）': 'Credits used (China)',
+    '积分消耗（国际版）': 'Credits used (Global)',
+    '估算价值: ': 'Est. value: ',
     '估算剩余': 'Estimated left',
     '网关调用量': 'Gateway calls',
     '网关调用量（国内版）': 'Gateway calls (China)',
@@ -1702,6 +1726,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '随时可出发旅行': 'Ready to travel any time',
     '随机生成': 'Random',
     '需要先回收密钥': 'recover the key first',
+    '需要先导入密钥': 'import the key first',
+    '请先粘贴密钥': 'Paste the key first',
+    '校验中…': 'Checking…',
     '非流式': 'Non-streaming',
     '面板 Key': 'Panel key',
     '面板密码': 'Panel password',
@@ -1751,7 +1778,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '（策略早于该字段，按当前映射表推断）': '(the policy predates this field; inferred from the current mapping table)',
     '（继承自': '(inherited from',
     '）· 只读': ') · read-only',
-    '）不支持进程内存回收，请改用「+ 添加账号 (OAuth)」。': ') does not support process-memory recovery; use + Add account (OAuth) instead.',
+    '，手动导入': ', imported manually',
+    '，进程内存回收': ', recovered from process memory',
+    '回收不到时，也可以在下面手动粘贴密钥。': 'If recovery fails, you can also paste the key below.',
+    '可以在下面手动粘贴解码密钥，或改用「+ 添加账号 (OAuth)」走浏览器登录。': 'You can paste the decryption key below, or sign in through the browser with + Add account (OAuth).',
+    '手工导入的密钥只留在网关内存里，不落盘、不写日志；导入时会先用 keyblob 校验，贴错会直接报错。': 'A manually imported key stays in the gateway process memory only - never written to disk or to the logs; it is validated against the keyblob first, so a wrong paste fails immediately.',
+    '密钥必须与桌面客户端 keyblob 里的 protectorKeyId 对得上；贴错或客户端已换钥都会走到这里。': 'The key must match the protectorKeyId in the desktop client keyblob; a wrong paste, or a key rotation on the client, lands here.',
+    '密钥已导入，正在重新扫描': 'Key imported, rescanning',
+    '粘贴解码密钥：64 位 hex，或 44 字符 base64': 'Paste the decryption key: 64-hex, or 44-char base64',
     '）的模型默认按': ') are, by default,',
     '），加密凭据可直接导入。': '); encrypted credentials can be imported directly.',
     '，OpenRouter 原始价，未折算）': ', OpenRouter raw price, unconverted)',
@@ -1945,6 +1979,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "启用自动切换": "啟用自動切換",
     "启用调度": "啟用排程",
     "回收密钥": "回收金鑰",
+    "导入密钥": "匯入金鑰",
     "国际版账号每日打卡时，除桌面端身分的轻量对话外，再走一次网页通道的会话。默认开启。": "國際版帳號每日打卡時，除桌面端身分的輕量對話外，再走一次網頁通道的會話。預設開啟。",
     "在浏览器里打开下方链接并完成登录授权": "在瀏覽器裡開啟下方連結並完成登入授權",
     "备注名称": "備註名稱",
@@ -2045,6 +2080,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "当前范围内最近消耗积分（credit &gt; 0）的请求。": "目前範圍內最近消耗積分（credit &gt; 0）的請求。",
     "当前范围没有请求数据": "目前範圍沒有請求資料",
     "当前视图": "目前檢視",
+    "版本视图": "版本檢視",
     "当前账号正常": "目前帳號正常",
     "待解码的凭证（加密存储）": "待解碼的憑證（加密儲存）",
     "所有已启用账号都已绑定代理出口": "所有已啟用帳號都已繫結代理出口",
@@ -2096,7 +2132,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "权限不足时可以管理员身份运行网关再试一次。": "權限不足時可以管理員身份執行閘道再試一次。",
     "某账号在某模型上被上游限流（429）时，自动在 WB / VSC / CLI 之间换身分重试，每轮最多 4 次。三条身分走不同的配额通道，开启后 429 会少一些。默认关闭。": "某帳號在某模型上被上游限流（429）時，自動在 WB / VSC / CLI 之間換身分重試，每輪最多 4 次。三條身分走不同的配額通道，開啟後 429 會少一些。預設關閉。",
     "查看 GitHub 项目仓库": "檢視 GitHub 專案倉庫",
-    "桌面客户端把 token 加密存储了，需要从正在运行的 WorkBuddy.exe 进程内存里回收静态密钥": "桌面客戶端把 token 加密儲存了，需要從正在執行的 WorkBuddy.exe 程序記憶體裡回收靜態金鑰",
+    "桌面客户端把 token 加密存储了，需要从正在运行的客户端进程内存里回收静态密钥": "桌面客戶端把 token 加密儲存了，需要從正在執行的客戶端程序記憶體裡回收靜態金鑰",
     "模型性能指标与用量一览": "模型效能指標與用量一覽",
     "次日 00:00 刷新": "次日 00:00 重新整理",
     "正在打开文件…": "正在開啟檔案…",
@@ -2274,6 +2310,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "重新生成链接": "重新生成連結",
     "限额已保存": "限額已儲存",
     "需要先回收密钥": "需要先回收金鑰",
+    "需要先导入密钥": "需要先匯入金鑰",
+    "请先粘贴密钥": "請先貼上金鑰",
+    "校验中…": "校驗中…",
     "面板手动停用，该账号不参与轮询": "面板手動停用，該帳號不參與輪詢",
     "顶部页签显示": "頂部頁籤顯示",
     "面板窗口限高": "面板視窗限高",
@@ -2288,7 +2327,14 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "（只读，密钥只留在网关内存里）。通常几秒钟，内存大时要十几秒。": "（只讀，金鑰只留在閘道記憶體裡）。通常幾秒鐘，記憶體大時要十幾秒。",
     "（已导入）": "（已匯入）",
     "（策略早于该字段，按当前映射表推断）": "（策略早於該欄位，按目前對映表推斷）",
-    "）不支持进程内存回收，请改用「+ 添加账号 (OAuth)」。": "）不支援程序記憶體回收，請改用「+ 新增帳號 (OAuth)」。",
+    "，手动导入": "，手動匯入",
+    "，进程内存回收": "，程序記憶體回收",
+    "回收不到时，也可以在下面手动粘贴密钥。": "回收不到時，也可以在下面手動貼上金鑰。",
+    "可以在下面手动粘贴解码密钥，或改用「+ 添加账号 (OAuth)」走浏览器登录。": "可以在下面手動貼上解碼金鑰，或改用「+ 新增帳號 (OAuth)」走瀏覽器登入。",
+    "手工导入的密钥只留在网关内存里，不落盘、不写日志；导入时会先用 keyblob 校验，贴错会直接报错。": "手動匯入的金鑰只留在閘道記憶體裡，不落盤、不寫日誌；匯入時會先用 keyblob 校驗，貼錯會直接報錯。",
+    "密钥必须与桌面客户端 keyblob 里的 protectorKeyId 对得上；贴错或客户端已换钥都会走到这里。": "金鑰必須與桌面客戶端 keyblob 裡的 protectorKeyId 對得上；貼錯或客戶端已換金鑰都會走到這裡。",
+    "密钥已导入，正在重新扫描": "金鑰已匯入，正在重新掃描",
+    "粘贴解码密钥：64 位 hex，或 44 字符 base64": "貼上解碼金鑰：64 位 hex，或 44 字元 base64",
     "）的模型默认按": "）的模型預設按",
     "），加密凭据可直接导入。": "），加密憑據可直接匯入。",
     "，登录后请在「设置」中修改。": "，登入後請在「設定」中修改。",
@@ -3034,10 +3080,22 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   </div><!-- /pageGateway -->
   
   <div id="pageAccounts" class="main-page">
-  <!-- 页面头部：标题 + 一行说明，与其它页面的头部结构保持一致 -->
-  <div style="margin-bottom:16px">
-    <h2 style="margin:0;font-size:16px;color:var(--fg)">账号</h2>
-    <div style="font-size:12px;color:var(--dim);margin-top:4px">管理账号池：添加/导入/导出、启用停用、凭证与积分刷新、代理出口绑定，以及签到与每日活跃记录。</div>
+  <!-- 页面头部：标题 + 一行说明，与其它页面的头部结构保持一致；右侧是本页的
+       版本视图切换（与网关页那两张出口卡片同一份状态，见 updateUI）。 -->
+  <div id="accountsHeader" style="margin-bottom:16px;display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap">
+    <div>
+      <h2 style="margin:0;font-size:16px;color:var(--fg)">账号</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">管理账号池：添加/导入/导出、启用停用、凭证与积分刷新、代理出口绑定，以及签到与每日活跃记录。</div>
+    </div>
+    <!-- 版本视图切换：账号列表、「当前禁用」与签到记录都按当前视图区域取，所以
+         这一页自己得有个入口，不必为了换版本跑回网关页。它切的是视图
+         （window.VIEW_REALM），与网关页两张卡片的点击完全等价；改网关默认出口
+         仍然是网关页那张卡片上的按钮，两者是不同的事。合并模式下账号区块搬到
+         网关页，这个开关跟着搬（见 applyAccountsTabLayout），两种布局都在。 -->
+    <div id="accountsRealmSwitch" class="realm-switch" role="group" aria-label="版本视图">
+      <button type="button" id="accountsRealmIntl" onclick="switchViewRealm('intl')" aria-pressed="false">国际版</button>
+      <button type="button" id="accountsRealmCn" onclick="switchViewRealm('cn')" aria-pressed="false">国内版</button>
+    </div>
   </div>
   <!-- 拆分模式下三个区块的落点（页头之后、原顺序）；合并模式搬走之后这里就空着 -->
   <span id="accountsHomeAnchor" hidden></span>
@@ -3866,6 +3924,33 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <section>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
           <div>
+            <h2 style="margin:0">用量聚合保留窗口 <em id="setUsageKeepState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              用量看板把请求日志按「日桶 + 日桶里的小时子表」预先聚合、落盘成 checkpoint，重启后只读新增的字节。
+              保留窗口决定这些预聚合能覆盖多久：窗口内的自定义区间直接从桶求和（毫秒级），超出的部分退回整段扫日志（结果一样，只是慢）。
+            </div>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              这是「空间换时间」：调大 = checkpoint 变大、写盘更频繁（路由器上 flash 写入慢且费寿命），换更宽的区间走快路径。默认小时层 48 小时、日桶 32 天。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              小时层
+              <input id="setUsageHourKeep" type="number" min="1" step="1" style="width:90px">
+              小时
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              日桶
+              <input id="setUsageDayKeep" type="number" min="1" step="1" style="width:90px">
+              天
+            </label>
+            <button onclick="saveUsageKeep(this)">保存</button>
+          </div>
+        </div>
+      </section>
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
             <h2 style="margin:0">上游响应头超时 <em id="setHeaderTimeoutState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。
@@ -3880,6 +3965,43 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
               秒
             </label>
             <button onclick="saveHeaderTimeout(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">日志落库 <em id="setLogDbState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              默认关闭：日志只留在内存（最新 2000 条，重启即失），与上游一致。开启后每条日志追加写入
+              <span class="mono">usage/logs.sqlite3</span>，重启、崩溃后仍能回看，方便事后 debug。
+              三条保留上限各自独立，留空表示该维度不限制；天数默认 7 天。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setLogDbEnabled" type="checkbox" style="width:16px;height:16px">
+              启用日志落库
+            </label>
+            <button onclick="saveLogDb(this)">保存</button>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+          <div style="flex:1;min-width:150px">
+            <div style="font-size:12px;color:var(--dim);margin-bottom:4px">最多保留条数（留空 = 不限）</div>
+            <input id="setLogDbMaxRows" type="number" min="1" placeholder="不限"
+                   style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+          </div>
+          <div style="flex:1;min-width:150px">
+            <div style="font-size:12px;color:var(--dim);margin-bottom:4px">最多保留天数（留空 = 不限）</div>
+            <input id="setLogDbMaxDays" type="number" min="1" placeholder="7"
+                   style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
+          </div>
+          <div style="flex:1;min-width:150px">
+            <div style="font-size:12px;color:var(--dim);margin-bottom:4px">日志库大小上限 MB（留空 = 不限）</div>
+            <input id="setLogDbMaxMB" type="number" min="1" placeholder="不限"
+                   style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
           </div>
         </div>
       </section>
@@ -4007,7 +4129,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:12px">
       <div>
         <h2 style="margin:0;font-size:16px;color:var(--fg)">网关运行日志</h2>
-        <div style="font-size:12px;color:var(--dim);margin-top:4px">实时捕获反向代理请求、流式转发、调度巡检、任务打卡与异常告警 (内存保留最新 2000 条)</div>
+        <div id="logPageHint" style="font-size:12px;color:var(--dim);margin-top:4px">实时捕获反向代理请求、流式转发、调度巡检、任务打卡与异常告警 (内存保留最新 2000 条)</div>
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span id="logStatsBadge" style="font-size:12px;color:var(--dim);margin-right:6px">加载中...</span>
@@ -4029,13 +4151,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <button class="range-btn" id="btnLogLvlError" onclick="setLogFilterLevel('ERROR')">ERROR</button>
       </div>
 
-      <div style="display:inline-flex;gap:3px;background:var(--panel2);padding:3px;border-radius:8px;border:1px solid var(--line)">
-        <button class="range-btn active" id="btnLogTagAll" onclick="setLogFilterTag('')">全部模块</button>
-        <button class="range-btn" id="btnLogTagChat" onclick="setLogFilterTag('chat')">对话</button>
-        <button class="range-btn" id="btnLogTagTasks" onclick="setLogFilterTag('tasks')">任务福利</button>
-        <button class="range-btn" id="btnLogTagSched" onclick="setLogFilterTag('scheduler')">调度器</button>
-        <button class="range-btn" id="btnLogTagAcct" onclick="setLogFilterTag('accounts')">账号</button>
-        <button class="range-btn" id="btnLogTagSys" onclick="setLogFilterTag('system')">系统</button>
+      <!-- 模块筛选按钮由 renderLogTagFilters() 按当前日志里真正出现过的 tag
+           动态生成：后端细分出新的 tag 时这里自动多一个按钮，不必同步改。 -->
+      <div id="logTagBar" style="display:inline-flex;gap:3px;background:var(--panel2);padding:3px;border-radius:8px;border:1px solid var(--line);flex-wrap:wrap">
+        <button class="range-btn active" data-tag="" onclick="setLogFilterTag('')">全部模块</button>
       </div>
 
       <div style="flex:1;min-width:180px;position:relative">
@@ -4406,6 +4525,19 @@ function updateUI(){
   const vbCn = document.getElementById("tabCnViewBadge");
   if(vbCn) vbCn.style.display = !isIntlView ? "inline-block" : "none";
 
+  // 账号页页头的版本切换与上面两张卡片同一份状态（VIEW_REALM），所以两边永远
+  // 一起亮：在账号页切过去，回网关页看到的就是刚切的那一版，反之亦然。
+  const rsIntl = document.getElementById("accountsRealmIntl");
+  if(rsIntl){
+    rsIntl.classList.toggle("active", isIntlView);
+    rsIntl.setAttribute("aria-pressed", isIntlView ? "true" : "false");
+  }
+  const rsCn = document.getElementById("accountsRealmCn");
+  if(rsCn){
+    rsCn.classList.toggle("active", !isIntlView);
+    rsCn.setAttribute("aria-pressed", !isIntlView ? "true" : "false");
+  }
+
   // 区块标题上的出口标签：这几个区块的内容都按当前视图区域取（账号、禁用汇总、
   // 最近请求、模型清单），标出来免得把国际版的数字看成全局的。用 <em> 承载：
   // 侧栏导航由 h2 生成时会剥掉 <em>，所以标签不会串进导航项。
@@ -4613,6 +4745,9 @@ function renderAvailableModels(){
     const hasVis = m.supports_vision || m.vision || m.multimodal || (m.input_modalities && m.input_modalities.includes('image'));
     if(hasVis){
       caps.push('<span class="badge ok" style="font-size:11px">视觉</span>');
+    } else if(m.id === 'glm-5.3-flash' || m.vision_note){
+      const tip = m.vision_note || '上游配置宣告支持多模态，但实际后端未接入视觉通道，已强制修正为纯文本';
+      caps.push('<span class="badge warn" style="font-size:11px;background:rgba(234,179,8,.15);color:#d97706;border-color:rgba(234,179,8,.3)" title="' + esc(tip) + '">文本 (实测无视觉)</span>');
     } else {
       caps.push('<span class="badge" style="color:var(--dim);font-size:11px">文本</span>');
     }
@@ -7398,24 +7533,66 @@ async function recoverAtrestKey(btn){
   }
 }
 
+/* 手工导入解码密钥：macOS / Linux 上回收不了客户端进程内存（huntSupported
+   为 false），用户可以把保护密钥贴进来。后端会用 keyblob 自检，贴错直接报错。 */
+async function adoptAtrestKey(btn){
+  const input = document.getElementById('adoptKeyInput');
+  const value = (input && input.value || '').trim();
+  if(!value){ toast('请先粘贴密钥', 'err'); return; }
+  const idle = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '校验中…';
+  try{
+    const r = await postJSON('/accounts/import/desktop', {keyText: value});
+    if(!r.ok){ throw new Error(r.msg || '导入失败'); }
+    if(input) input.value = '';
+    toast('密钥已导入，正在重新扫描');
+    await refreshDesktopScan();
+  }catch(e){
+    toast('导入失败: ' + e.message, 'err');
+    btn.disabled = false;
+    btn.textContent = idle;
+    const tip = document.getElementById('atrestTip');
+    if(tip){
+      tip.innerHTML = '导入失败：' + esc(e.message)
+        + '<br><span style="color:var(--dim)">密钥必须与桌面客户端 keyblob 里的 '
+        + 'protectorKeyId 对得上；贴错或客户端已换钥都会走到这里。</span>';
+    }
+  }
+}
+
 function renderAtrestBar(atrest, list){
   if(!atrest) return '';
   if(atrest.keyCached){
+    // 手工导入的密钥会随客户端换钥失效，所以把来路也写出来，便于用户对照。
+    const how = atrest.keySource === 'manual' ? '手动导入' : '进程内存回收';
     return '<div class="hint" style="margin:0 0 12px;color:var(--accent2)">解码密钥已就绪（keyId '
-      + esc(atrest.keyId || '-') + '），加密凭据可直接导入。</div>';
+      + esc(atrest.keyId || '-') + '，' + how + '），加密凭据可直接导入。</div>';
   }
   if(!list.some(d => d.needsKey)) return '';
   let html = '<div style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;'
     + 'padding:12px 14px;margin-bottom:14px;font-size:13px">'
-    + '<b>检测到加密凭据</b><div class="hint" style="margin:6px 0 8px" id="atrestTip">'
-    + '桌面客户端把 token 加密存储了，需要从正在运行的 WorkBuddy.exe 进程内存里回收静态密钥'
-    + '（只读，密钥只留在网关内存里）。通常几秒钟，内存大时要十几秒。</div>';
+    + '<b>检测到加密凭据</b><div class="hint" style="margin:6px 0 8px" id="atrestTip">';
+  if(atrest.huntSupported){
+    html += '桌面客户端把 token 加密存储了，需要从正在运行的客户端进程内存里回收静态密钥'
+      + '（只读，密钥只留在网关内存里）。通常几秒钟，内存大时要十几秒。'
+      + '<br>回收不到时，也可以在下面手动粘贴密钥。';
+  }else{
+    html += esc(atrest.huntHint || '当前系统不支持从进程内存回收密钥。')
+      + '<br>可以在下面手动粘贴解码密钥，或改用「+ 添加账号 (OAuth)」走浏览器登录。';
+  }
+  html += '</div>';
   if(atrest.huntSupported){
     html += '<button class="primary mini" onclick="recoverAtrestKey(this)">回收密钥</button>';
-  }else{
-    html += '<div class="hint" style="color:var(--warn)">当前系统（' + esc(atrest.platform)
-      + '）不支持进程内存回收，请改用「+ 添加账号 (OAuth)」。</div>';
   }
+  html += '<div style="display:flex;gap:8px;align-items:center;margin-top:10px">'
+    + '<input id="adoptKeyInput" class="slot-input" type="password" autocomplete="off"'
+    + ' spellcheck="false" placeholder="粘贴解码密钥：64 位 hex，或 44 字符 base64"'
+    + ' style="flex:1;max-width:460px">'
+    + '<button class="mini" onclick="adoptAtrestKey(this)">导入密钥</button>'
+    + '</div>'
+    + '<div class="hint" style="margin-top:6px">手工导入的密钥只留在网关内存里，'
+    + '不落盘、不写日志；导入时会先用 keyblob 校验，贴错会直接报错。</div>';
   return html + '</div>';
 }
 
@@ -7426,6 +7603,8 @@ function renderDesktopScan(list, atrest){
   const bad = list.filter(d => !d.valid);
   const needKey = bad.filter(d => d.needsKey);
   const broken = bad.filter(d => !d.needsKey);
+  // 回收只在 Windows 上有；其他平台这一列改成「导入」（手工粘贴）。
+  const keyAction = (atrest && atrest.huntSupported) ? '需要先回收密钥' : '需要先导入密钥';
   // Use every account across both realms: the visible list is filtered by the
   // current view, so an earlier import could otherwise look "not imported".
   const already = window.SCAN_POOL && window.SCAN_POOL.size
@@ -7481,7 +7660,7 @@ function renderDesktopScan(list, atrest){
     html += '<table><tbody>';
     needKey.forEach(d => {
       html += '<tr><td class="mono" style="font-size:11px">' + esc(d.file) + '</td>'
-        + '<td style="color:var(--dim);font-size:12px;text-align:right">需要先回收密钥</td></tr>';
+        + '<td style="color:var(--dim);font-size:12px;text-align:right">' + esc(keyAction) + '</td></tr>';
     });
     html += '</tbody></table>';
   }
@@ -7625,7 +7804,7 @@ async function refreshInner(gen){
   const realmTag = '（' + (window.VIEW_REALM === 'cn' ? '国内版' : '国际版') + '）';
   document.getElementById('cards').innerHTML =
     card('网关调用量' + realmTag, fmt(t.requests) + ' <span style="font-size:13px;font-weight:500;color:var(--dim);margin-left:4px">次</span>', '', '') +
-    card('估算价格' + realmTag, fmtCostBoth(t.cost_cny, 22), '', 'warn') +
+    card('积分消耗' + realmTag, (t.credit != null ? Number(t.credit).toFixed(2) : '0.00') + ' <span style="font-size:13px;font-weight:500;color:var(--dim);margin-left:4px">积分</span>', ((PRICING_ON && t.cost_cny != null) ? ('估算价值: ' + fmtCostBoth(t.cost_cny, 12)) : ''), 'warn') +
     card('请求成功率' + realmTag, '<span style="color:' + (perf.errors ? 'var(--warn)' : 'var(--accent2)') + '">' + succStr + '</span>', '', '');
 
   const total = recent.total || 0;
@@ -7926,7 +8105,12 @@ async function startDashboard(){
   // 别让国内版那条约 2 秒的成长任务接口把首屏的用量卡片拖在后面。
   await loadSettings();
   await initRealm();
-  await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks(),
+  // 成长任务那条走上游、约 2 秒，只服务「任务与福利」页，而且它自己渲染。原来
+  // 它在这一批 Promise.all 里，switchMainTab 因此被押到它后面——落在数据看板
+  // 页签时，KPI 要等这两秒过去才开始发 /usage/analytics。这里只把它摘出来让它
+  // 并行跑，其余照旧等待；异常自己收，别变成未处理的拒绝。
+  loadGrowthTasks().catch(() => {});
+  await Promise.all([loadAccounts(), loadModels(),
                      loadSchedulerStatus(), refresh(), loadAgentsAvailability()]);
   updateRecentLimitButtons();
   // The head script already resolved this before first paint; re-apply it
@@ -8539,6 +8723,20 @@ function applyAccountsTabLayout(separate){
   if(!pageGateway || !pageAccounts) return _accountsSeparateTab;
 
   const sections = accountsPageSections();
+  // 版本切换跟着账号区块走：拆分时回到账号页页头右侧，合并时搬到网关页的账号
+  // 区块正上方。合并模式下网关页最上面那两张出口卡片也能切版本，但账号区在页面
+  // 中段，要换一版得先滚回页首——跟着搬一次就不必了。
+  // 先摆它再摆区块：两者都是「插到锚点前面」，谁先插谁在前，顺序才是控件 → 区块。
+  const realmSwitch = document.getElementById('accountsRealmSwitch');
+  if(realmSwitch){
+    if(_accountsSeparateTab){
+      const home = document.getElementById('accountsHeader');
+      if(home && realmSwitch.parentNode !== home) home.appendChild(realmSwitch);
+    } else {
+      insertBeforeAnchor([realmSwitch], document.getElementById('accountsSectionsAnchor'));
+    }
+  }
+
   if(_accountsSeparateTab){
     // 两个页签：区块回账号页的页头之后，按原顺序。
     insertBeforeAnchor(sections, document.getElementById('accountsHomeAnchor'));
@@ -8756,6 +8954,17 @@ async function loadSettings(showToast){
         headerTimeoutState.textContent = headerTimeoutDefault ? '(默认 120 秒)' : '(' + headerTimeout + ' 秒)';
         headerTimeoutState.style.color = headerTimeoutDefault ? 'var(--dim)' : 'var(--accent2)';
       }
+      const logDbEnabled = data.log_db_enabled === true;
+      const logDbEnabledInput = document.getElementById('setLogDbEnabled');
+      if(logDbEnabledInput) logDbEnabledInput.checked = logDbEnabled;
+      const logDbState = document.getElementById('setLogDbState');
+      if(logDbState){
+        logDbState.textContent = logDbEnabled ? '(已启用)' : '(未启用)';
+        logDbState.style.color = logDbEnabled ? 'var(--accent2)' : 'var(--dim)';
+      }
+      fillCapInput('setLogDbMaxRows', data.log_db_max_rows);
+      fillCapInput('setLogDbMaxDays', data.log_db_max_days);
+      fillCapInputMB('setLogDbMaxMB', data.log_db_max_bytes);
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
     API_KEY_ROWS = (data.api_keys || []).map(k => ({
@@ -8791,6 +9000,30 @@ async function loadSettings(showToast){
     // 更新状态来自 /updates 而不是 /settings，单独拉一次；它自带兜底，
     // 失败只写在自己的状态行里，不会把上面这些区块一起带走。
     loadUpdateStatus();
+      // 用量聚合保留窗口：没改过时后端给的就是内置默认（小时层 48 / 日桶 32），
+      // 所以「等于默认」按默认态显示，只有被调过才标出实际值。
+      const usageKeep = data.usage || {};
+      const usageHourKeep = usageKeep.hour_keep_hours;
+      const usageDayKeep = usageKeep.day_keep_days;
+      const usageHourInput = document.getElementById('setUsageHourKeep');
+      if(usageHourInput){
+        usageHourInput.value = (typeof usageHourKeep === 'number') ? usageHourKeep : 48;
+      }
+      const usageDayInput = document.getElementById('setUsageDayKeep');
+      if(usageDayInput){
+        usageDayInput.value = (typeof usageDayKeep === 'number') ? usageDayKeep : 32;
+      }
+      const usageKeepState = document.getElementById('setUsageKeepState');
+      if(usageKeepState){
+        const hourDefault = (typeof usageHourKeep !== 'number') || usageHourKeep === 48;
+        const dayDefault = (typeof usageDayKeep !== 'number') || usageDayKeep === 32;
+        const isDefault = hourDefault && dayDefault;
+        usageKeepState.textContent = isDefault
+          ? '(默认 48 小时 / 32 天)'
+          : '(' + (typeof usageHourKeep === 'number' ? usageHourKeep : 48) + ' 小时 / '
+              + (typeof usageDayKeep === 'number' ? usageDayKeep : 32) + ' 天)';
+        usageKeepState.style.color = isDefault ? 'var(--dim)' : 'var(--accent2)';
+      }
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
@@ -9364,6 +9597,28 @@ async function saveEgressBackoff(btn){
   }
 }
 
+/* 用量聚合保留窗口（空间换时间）。后端只接受 >=1 的整数，且各有上限，所以
+   先把输入收成整数再发；空值/小数/非数字就地拦下，不送上去换 400。 */
+async function saveUsageKeep(btn){
+  const hourEl = document.getElementById('setUsageHourKeep');
+  const dayEl = document.getElementById('setUsageDayKeep');
+  const hours = Math.floor(Number(hourEl && hourEl.value));
+  const days = Math.floor(Number(dayEl && dayEl.value));
+  if(!isFinite(hours) || hours < 1 || !isFinite(days) || days < 1){
+    toast('请输入不小于 1 的整数', 'bad');
+    return;
+  }
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {usage: {hour_keep_hours: hours, day_keep_days: days}});
+    toast('已保存：小时层 ' + hours + ' 小时 / 日桶 ' + days + ' 天', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
 /* 上游响应头超时。后端只接受 >=1 的整数秒，所以先把输入收成整数再发：空值、
    小数、非数字就地拦下，而不是送上去换一个 400 回来。 */
 async function saveHeaderTimeout(btn){
@@ -9377,6 +9632,52 @@ async function saveHeaderTimeout(btn){
   try {
     await postJSON('/settings/save', {upstream: {header_timeout_seconds: value}});
     toast('已保存：上游响应头超时 ' + value + ' 秒', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+/* ---- 日志落库 ----
+   开关与三条保留上限一次提交；上限框留空就发 null，服务端存成「不限」。
+   大小框以 MB 输入，发出去时换算成字节（服务端一律以字节记）。 */
+function capInputValue(id){
+  const el = document.getElementById(id);
+  if(!el) return null;
+  const raw = String(el.value == null ? '' : el.value).trim();
+  if(raw === '') return null;
+  const n = Number(raw);
+  if(!isFinite(n) || n <= 0) return null;
+  return Math.floor(n);
+}
+function fillCapInput(id, value){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.value = (value === null || value === undefined || value === '') ? '' : String(value);
+}
+function fillCapInputMB(id, bytes){
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.value = (bytes === null || bytes === undefined || bytes === '' || bytes <= 0)
+    ? '' : String(Math.max(1, Math.round(bytes / 1048576)));
+}
+async function saveLogDb(btn){
+  const enabledEl = document.getElementById('setLogDbEnabled');
+  const rows = capInputValue('setLogDbMaxRows');
+  const days = capInputValue('setLogDbMaxDays');
+  const mb = capInputValue('setLogDbMaxMB');
+  const payload = {
+    log_db_enabled: !!(enabledEl && enabledEl.checked),
+    log_db_max_rows: rows,
+    log_db_max_days: days,
+    log_db_max_bytes: mb === null ? null : mb * 1048576,
+  };
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', payload);
+    toast(payload.log_db_enabled ? '已启用日志落库' : '已关闭日志落库', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');
@@ -10502,6 +10803,20 @@ function logMatchesFilter(item){
   return true;
 }
 function logFilterKey(){ return logFilterLevel + '|' + logFilterTag + '|' + logSearchText; }
+/* 顶部文案跟着模式走：落库时报告库里累计多少条历史、并指向设置页的上限；纯内存
+   时保持上游原话。data.mode 由 /logs 带回（后端按当前开关判定）。 */
+function updateLogPageHint(data){
+  const hint = document.getElementById('logPageHint');
+  if(!hint) return;
+  if(data && data.mode === 'db'){
+    const stored = (typeof data.stored === 'number') ? data.stored : null;
+    hint.textContent = '实时捕获反向代理请求、流式转发、调度巡检、任务打卡与异常告警'
+      + ' (已落库' + (stored === null ? '' : '，共 ' + stored + ' 条历史')
+      + '，可在设置页调整保留上限)';
+  } else {
+    hint.textContent = '实时捕获反向代理请求、流式转发、调度巡检、任务打卡与异常告警 (内存保留最新 2000 条)';
+  }
+}
 // 单行 HTML 只有这一处定义，整表渲染和增量 append 都用它。
 function logLineHtml(item){
   const lvlCls = 'lvl-' + (item.level || 'INFO');
@@ -10540,6 +10855,7 @@ async function fetchNewLogs(forceReset){
     const limit = forceReset ? 500 : 200;
     const data = await getJSON('/logs?since_id=' + since + '&limit=' + limit);
     if(data && data.logs){
+      updateLogPageHint(data);
       let fresh = null;     // 本轮真正新增的条目（去重后）
       let dropped = null;   // 因超上限被挤出缓冲的最旧条目
       if(forceReset){
@@ -10609,22 +10925,53 @@ function setLogFilterLevel(lvl){
   renderLogs();
 }
 
+/* 模块筛选按钮的固定顺序与中文名。顺序按「排查时最常先看哪个模块」排，未列出
+   的 tag 排到最后并按字母序补上——后端新增 tag 时这里不改也能用。 */
+const LOG_TAG_ORDER = ['chat', 'tasks', 'scheduler', 'accounts', 'agents', 'pricing',
+                       'egress', 'upstream', 'webtools', 'catalog', 'auth', 'settings',
+                       'update', 'usage', 'system'];
+const LOG_TAG_LABELS = {
+  chat: '对话', tasks: '任务福利', scheduler: '调度器', accounts: '账号',
+  agents: '智能体', pricing: '定价', egress: '出口', upstream: '上游',
+  webtools: '网络工具', catalog: '模型', auth: '鉴权', settings: '设置',
+  update: '更新', usage: '用量', system: '系统'
+};
+let logTagBtnKey = null;
+/* 按当前缓冲里真正出现过的 tag 重建按钮组。集合没变就不动 DOM——这个函数每
+   次渲染都会调，重建本身会让正在点的按钮闪一下。 */
+function renderLogTagFilters(){
+  const bar = document.getElementById('logTagBar');
+  if(!bar) return;
+  const seen = new Set();
+  logEntries.forEach(x => { if(x.tag) seen.add(x.tag); });
+  // 当前筛选的 tag 即使暂时没有日志也留在栏里，否则按钮一消失就不知道自己在
+  // 筛什么，也没法一眼切回去。
+  if(logFilterTag) seen.add(logFilterTag);
+  const ordered = LOG_TAG_ORDER.filter(t => seen.has(t))
+    .concat(Array.from(seen).filter(t => LOG_TAG_ORDER.indexOf(t) < 0).sort());
+  const key = ordered.join(',');
+  if(key !== logTagBtnKey){
+    logTagBtnKey = key;
+    bar.innerHTML = '';
+    [{tag: '', label: '全部模块'}]
+      .concat(ordered.map(t => ({tag: t, label: LOG_TAG_LABELS[t] || t})))
+      .forEach(item => {
+        const btn = document.createElement('button');
+        btn.className = 'range-btn';
+        btn.dataset.tag = item.tag;
+        btn.textContent = item.label;
+        btn.onclick = () => setLogFilterTag(item.tag);
+        bar.appendChild(btn);
+      });
+  }
+  bar.querySelectorAll('button').forEach(b => {
+    b.classList.toggle('active', (b.dataset.tag || '') === logFilterTag);
+  });
+}
+
 function setLogFilterTag(tag){
   logFilterTag = tag;
-  const tagMap = {
-    '': 'All',
-    'chat': 'Chat',
-    'tasks': 'Tasks',
-    'scheduler': 'Sched',
-    'accounts': 'Acct',
-    'system': 'Sys'
-  };
-  Object.keys(tagMap).forEach(k => {
-    const btn = document.getElementById('btnLogTag' + tagMap[k]);
-    if(btn){
-      btn.classList.toggle('active', logFilterTag === k);
-    }
-  });
+  renderLogTagFilters();
   renderLogs();
 }
 
@@ -10685,6 +11032,7 @@ function renderLogs(){
   const body = document.getElementById('logTerminalBody');
   if(!body) return;
 
+  renderLogTagFilters();
   const filtered = logEntries.filter(logMatchesFilter);
 
   if(filtered.length === 0){
@@ -10787,7 +11135,7 @@ async function exportLogsFile(){
 }
 
 async function clearServerLogs(){
-  if(!confirm('确定要清空网关日志吗？此操作将清空内存中的全部日志缓冲。')) return;
+  if(!confirm('确定要清空网关日志吗？内存缓冲会被清空；若已启用日志落库，数据库里的历史记录也会一并删除。')) return;
   try {
     await postJSON('/logs/clear', {});
     logEntries = [];

@@ -88,25 +88,70 @@ def _read_text(path):
         raise AgentConfigError("%s is not valid UTF-8: %s" % (path, exc))
 
 
-def _atomic_write_text(path, text):
-    """tmp + os.replace so a crash cannot leave a half-written config."""
+# Every file this module writes carries the gateway API key (inline, or via the
+# env reference that the sibling credentials file resolves), so a fresh one is
+# created owner-only rather than with open()'s 0666 & ~umask - 0644 under the
+# usual umask 022. DSH refuses to start when its credentials file is readable
+# beyond its owner, and the same 0644 would expose every other client's key.
+WRITE_MODE = 0o600
+
+
+def _target_mode(path):
+    """The mode to give `path` on the next write.
+
+    `WRITE_MODE` for a new file, or for one whose current mode is wider than
+    owner-only (or does not even let its owner read it back); otherwise the
+    file's own mode, so a re-apply preserves a stricter permission the user set
+    by hand instead of widening it back - 0600 -> 0600 and 0400 -> 0400, but
+    0644 -> 0600.
+    """
+    try:
+        current = os.stat(path).st_mode & 0o777
+    except OSError:
+        return WRITE_MODE
+    if current & 0o077 or not current & 0o400:
+        return WRITE_MODE
+    return current
+
+
+def _atomic_write(path, data):
+    """tmp + os.replace so a crash cannot leave a half-written config.
+
+    The temp file is created owner-only (see `_target_mode`) rather than with
+    the umask's default, and settled on the resolved mode after writing. Any
+    failure on the way - including the chmod or the replace - removes the temp
+    file, so a retry never trips over a leftover it cannot write to.
+    """
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    mode = _target_mode(path)
+    try:
+        os.unlink(tmp)  # a stale temp from a killed run may not be writable
+    except OSError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp, flags, WRITE_MODE)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _atomic_write_text(path, text):
+    _atomic_write(path, text.encode("utf-8"))
 
 
 def _atomic_write_bytes(path, data):
-    directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "wb") as fh:
-        fh.write(data)
-    os.replace(tmp, path)
+    _atomic_write(path, data)
 
 
 def _prune_empty_parents(path, home=None):

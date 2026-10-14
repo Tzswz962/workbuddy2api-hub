@@ -63,6 +63,7 @@ import wb_atrest
 import wb_catalog
 import wb_egress
 import wb_ipintel
+import wb_logstore
 import wb_pricing
 import wb_settings
 import wb_upstream_pool
@@ -805,7 +806,12 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     row["key"] = key or ""
     _persist_usage(row, "error persist failed")
     dur = f" {elapsed_ms:.0f}ms" if elapsed_ms is not None else ""
-    log(f"request error: model={model}{dur} status={status} msg={str(message)[:180]}", level="ERROR", tag="chat")
+    # 账号与终态也带上看板日志。上面那段本来就把 account 写进了 JSONL，但日志
+    # 行一直没打出来——出错时最想知道的「哪个账号、什么终态」反而要回去翻
+    # usage.jsonl，而 chat done 那条早就有 acct= 了，两侧不对称。
+    acc_tag = f" acct={account[:8]}" if account else ""
+    log(f"request error: model={model}{dur}{acc_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
+        level="ERROR", tag="chat")
     return row
 def _pct(values, q):
     """Nearest-rank percentile (no interpolation) - good enough for latency."""
@@ -6888,29 +6894,55 @@ _USAGE_DAY_SNAPSHOT_FIELDS = tuple(
     if isinstance(v, (int, float)) and not isinstance(v, bool) and k != "started")
 
 
+def _usage_keep_setting(key):
+    """面板设的聚合保留值（没设过 / 读不出来返回 None）。
+
+    环境变量始终优先（现场调、测试里来回切），面板设置只在没有环境变量时
+    生效——与 upstream_timeouts() 读 header_timeout_seconds 同一条路子。
+    """
+    try:
+        cfg = wb_settings.usage_config(ACCOUNTS_DIR)
+    except Exception:
+        return None
+    value = cfg.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
 def _usage_day_keep_days():
-    """日桶保留天数，默认 32；WB_USAGE_DAY_KEEP_DAYS 可调。
+    """日桶保留天数，默认 32；WB_USAGE_DAY_KEEP_DAYS 优先，其次面板设置。
 
     每次调用都读环境变量，理由与 WB_USAGE_CACHE 相同（现场调、测试里来回切）。
     """
-    try:
-        return max(1, int(os.environ.get("WB_USAGE_DAY_KEEP_DAYS",
-                                         _USAGE_DAY_KEEP_DAYS)))
-    except (TypeError, ValueError):
-        return _USAGE_DAY_KEEP_DAYS
+    raw = os.environ.get("WB_USAGE_DAY_KEEP_DAYS")
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return _USAGE_DAY_KEEP_DAYS
+    return _usage_keep_setting("day_keep_days") or _USAGE_DAY_KEEP_DAYS
 
 
 def _usage_hour_keep_days():
-    """小时桶保留天数，默认 2；WB_USAGE_HOUR_KEEP_DAYS 可调。
+    """小时桶保留天数，默认 2；WB_USAGE_HOUR_KEEP_DAYS 优先，其次由面板的
+    「小时层保留」折算（向上取整到整天）。
 
-    同 _usage_day_keep_days：每次调用都读环境变量。取值再小也保留一天
-    （max(1, ...)）：小时层至少要能服务「今天的整点窗口」，否则等于没建。
+    两个状态各有一条小时层保留线（snapshot 按天，analytics 按小时），面板只
+    暴露一个「小时层保留（小时）」，所以这里跟着它走，免得调了一个另一个不动。
+    取值再小也保留一天（max(1, ...)）：小时层至少要能服务「今天的整点窗口」，
+    否则等于没建。
     """
-    try:
-        return max(1, int(os.environ.get("WB_USAGE_HOUR_KEEP_DAYS",
-                                         _USAGE_HOUR_KEEP_DAYS)))
-    except (TypeError, ValueError):
-        return _USAGE_HOUR_KEEP_DAYS
+    raw = os.environ.get("WB_USAGE_HOUR_KEEP_DAYS")
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return _USAGE_HOUR_KEEP_DAYS
+    hours = _usage_keep_setting("hour_keep_hours")
+    if hours:
+        return max(1, (hours + 23) // 24)
+    return _USAGE_HOUR_KEEP_DAYS
 
 
 def _usage_day_buckets_enabled():
@@ -6935,16 +6967,18 @@ _USAGE_HOUR_KEEP_HOURS = 48
 
 
 def _usage_hour_keep_hours():
-    """小时子表保留小时数，默认 48；WB_USAGE_HOUR_KEEP_HOURS 可调。
+    """小时子表保留小时数，默认 48；WB_USAGE_HOUR_KEEP_HOURS 优先，其次面板设置。
 
     每次调用都读环境变量，理由与 WB_USAGE_DAY_KEEP_DAYS 相同（现场调、测试
     里来回切）。
     """
-    try:
-        return max(1, int(os.environ.get("WB_USAGE_HOUR_KEEP_HOURS",
-                                         _USAGE_HOUR_KEEP_HOURS)))
-    except (TypeError, ValueError):
-        return _USAGE_HOUR_KEEP_HOURS
+    raw = os.environ.get("WB_USAGE_HOUR_KEEP_HOURS")
+    if raw is not None:
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return _USAGE_HOUR_KEEP_HOURS
+    return _usage_keep_setting("hour_keep_hours") or _USAGE_HOUR_KEEP_HOURS
 
 
 def _local_day_key(ts):
@@ -8723,18 +8757,27 @@ def _usage_cache_analytics_hours_ok(hours):
 
 
 def _usage_cache_analytics_day_ok(bucket):
-    """analytics 的日桶：窗口形状 maps + at（本地午夜）+ hours 子表。
+    """analytics 的日桶：窗口形状 maps + at（本地午夜）+ 可选的 hours 子表。
 
-    小时层要靠 at 与小时子表回答自定义窗口，两者缺一这份状态就只能服务
-    按日对齐的窗口——旧版本写下的日桶（没有这两个键）因此在这里被拒，
-    升级后 analytics 整体重折一次（一次性代价），小时层立刻就有历史可借；
-    snapshot/series 等其余四份状态照旧采用，不受影响。
+    hours 缺席是合法状态，不是损坏：剪枝线（_prune_day_buckets 的 hours_keep
+    一段）会把保留窗口之外的旧天的小时表摘掉，本地午夜落在不存在的小时里那天
+    也会被摘掉；只折窗口半的日桶在「这天没有小时表」时照旧回答按日对齐的窗口，
+    而整点窗口本来就由求和侧按 hours is None 退回整段扫描
+    （_analytics_window_from_hours），所以采纳仍然正确。与
+    _usage_cache_snapshot_ok / _usage_cache_series_bucket_ok 对 hours 的容忍
+    同一套规矩。
+
+    at 则必须留着：旧版本写下的日桶没有这个键（也就没有小时层），在这里被拒，
+    升级后 analytics 整体重折一次、小时层立刻就有历史可借。只放任 hours 缺席，
+    这次一次性代价就不会被剪枝线反复引燃——否则只要还在折新行，剪枝线天天把旧天
+    的小时表摘掉，整份状态就天天被判废、每次进程启动都要付一次全量重折。
     """
     if not isinstance(bucket, dict):
         return False
     if not _usage_cache_number(bucket.get("at")):
         return False
-    if not _usage_cache_analytics_hours_ok(bucket.get("hours")):
+    hours = bucket.get("hours")
+    if hours is not None and not _usage_cache_analytics_hours_ok(hours):
         return False
     return _usage_cache_analytics_window_ok(bucket)
 
@@ -9719,17 +9762,22 @@ def runtime_settings_view():
             wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
         "egress_backoff_enabled":
             wb_settings.egress_backoff_enabled(ACCOUNTS_DIR),
+        "log_db_enabled": wb_settings.log_db_enabled(ACCOUNTS_DIR),
+        "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
+        "log_db_max_days": wb_settings.log_db_max_days(ACCOUNTS_DIR),
+        "log_db_max_bytes": wb_settings.log_db_max_bytes(ACCOUNTS_DIR),
         "accounts_collapsed": wb_settings.accounts_collapsed(ACCOUNTS_DIR),
         "accounts_separate_tab": wb_settings.accounts_separate_tab(ACCOUNTS_DIR),
         "key_before_hidden": wb_settings.key_before_hidden(ACCOUNTS_DIR),
         "hidden_pages": wb_settings.hidden_pages(ACCOUNTS_DIR),
         "update_check_enabled": wb_settings.update_check_enabled(ACCOUNTS_DIR),
         "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
+        "usage": wb_settings.usage_config(ACCOUNTS_DIR),
         "prompt": wb_settings.prompt_config(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.3",
+        "version": "1.7.4",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -9845,6 +9893,55 @@ LOG_BUFFER = deque(maxlen=2000)
 _LOG_LOCK = threading.Lock()
 _LOG_COUNTER = 0
 
+# 日志级别与模块的自动归类。调用点显式传了 level/tag 就用传的，没传才按内容猜。
+#
+# 级别：早先只认英文关键字，而本仓大量日志是中文——定价侧的「抓取失败，继续用
+# 上一版价格」「首次抓取异常」全被判成 INFO，看板上按 ERROR 筛选根本看不到它们。
+# 中文关键字补上后这些才落到正确的级别。英文侧同样收紧了几个明显的漏网（"fail"
+# 只认 "failed"，"fail:" 这种短标签一直没被认出来）。
+_LOG_ERROR_HINTS = (
+    "error", "exception", "failed", "fail:", "reject", "traceback", "errno", "fatal",
+    "11-128", "11101", "11140",
+    "失败", "异常", "错误", "拒绝", "不可用", "无效",
+)
+_LOG_WARN_HINTS = (
+    "warn", "warning", "retry", "timeout", "throttl",
+    "重试", "超时", "告警", "警告", "降级", "限流",
+)
+# 模块：顺序即优先级，越靠前越先判定。新增的 pricing / egress / upstream /
+# update / usage / webtools 都是从原先那个大杂烩 "system" 里拆出来的——这些
+# 模块本来就在打日志，只是推断规则不认识它们的词，于是一律归到 system，事后
+# 想按模块看某一类问题时筛不出来。原有类别（chat/scheduler/tasks/accounts/
+# catalog/auth/settings）的相对顺序保持不变，避免改变既有日志的归类。
+_LOG_TAG_HINTS = (
+    ("chat", ("chat:", "chat done", "request error", "/v1/chat",
+              "/chat/completions", "responses")),
+    ("scheduler", ("scheduler", "调度器")),
+    ("tasks", ("task", "任务", "打卡", "签到", "猫猫", "travel", "growth")),
+    ("accounts", ("account", "账号", "pool", "imported")),
+    ("pricing", ("pricing", "定价", "取价", "价格", "price", "抓取")),
+    ("egress", ("egress", "出口", "槽位", "proxy slot", "mihomo")),
+    ("upstream", ("upstream", "上游")),
+    ("webtools", ("webtool", "web tool", "本地网络工具")),
+    ("catalog", ("model", "catalog", "模型")),
+    ("auth", ("auth", "token", "oauth")),
+    ("settings", ("settings", "设置")),
+    ("update", ("更新", "release")),
+    ("usage", ("usage", "用量")),
+    ("agents", ("agents", "智能体")),
+)
+
+# 可选的 SQLite 落库（默认关闭）。None = 还没初始化（模块 import 期），启动时按
+# settings 建好，之后由面板开关驱动 wb_logstore.LogStore.configure()。关闭时它
+# 要么是 None、要么 enabled=False，整条日志路径与上游一字不差：只写内存环形
+# 缓冲，不建库、不落盘。
+LOG_STORE = None
+
+
+def _log_db_active():
+    return LOG_STORE is not None and LOG_STORE.enabled
+
+
 def add_log_entry(msg, level=None, tag=None):
     global _LOG_COUNTER
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -9852,28 +9949,18 @@ def add_log_entry(msg, level=None, tag=None):
     msg_str = str(msg).rstrip()
     if not level:
         lower = msg_str.lower()
-        if any(k in lower for k in ("error", "exception", "failed", "11128", "11101", "11140", "traceback", "errno", "fatal")):
+        if any(k in lower for k in _LOG_ERROR_HINTS):
             level = "ERROR"
-        elif any(k in lower for k in ("warn", "warning", "retry", "timeout")):
+        elif any(k in lower for k in _LOG_WARN_HINTS):
             level = "WARN"
         else:
             level = "INFO"
     if not tag:
         lower = msg_str.lower()
-        if "chat:" in lower or "chat done" in lower or "/v1/chat" in lower or "/chat/completions" in lower or "responses" in lower:
-            tag = "chat"
-        elif "scheduler" in lower or "调度器" in lower:
-            tag = "scheduler"
-        elif "task" in lower or "任务" in lower or "打卡" in lower or "猫猫" in lower or "travel" in lower:
-            tag = "tasks"
-        elif "account" in lower or "账号" in lower or "pool" in lower or "imported" in lower:
-            tag = "accounts"
-        elif "model" in lower or "catalog" in lower or "模型" in lower:
-            tag = "catalog"
-        elif "auth" in lower or "token" in lower or "oauth" in lower:
-            tag = "auth"
-        elif "settings" in lower or "设置" in lower:
-            tag = "settings"
+        for candidate, hints in _LOG_TAG_HINTS:
+            if any(k in lower for k in hints):
+                tag = candidate
+                break
         else:
             tag = "system"
     with _LOG_LOCK:
@@ -9887,6 +9974,9 @@ def add_log_entry(msg, level=None, tag=None):
             "msg": msg_str,
         }
         LOG_BUFFER.append(entry)
+    # 落库在锁外：append 只是入队，但没必要把持锁时间拉长到调用 queue.put。
+    if _log_db_active():
+        LOG_STORE.append(entry)
     return entry
 
 def log(msg, level=None, tag=None):
@@ -9898,6 +9988,17 @@ def log(msg, level=None, tag=None):
 wb_webtools.set_logger(log)
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
+    # 落库开启时以数据库为准：它是完整历史（受保留上限约束），而内存环形缓冲
+    # 只留最新 2000 条，拿它回答会看不到刚过去的窗口。查询失败或超时就退回内存，
+    # 面板宁可少看历史，也不能因为日志库出问题而整页空白。
+    if _log_db_active():
+        try:
+            stored = LOG_STORE.query(limit=limit, level=level, tag=tag,
+                                     search=search, since_id=since_id)
+        except Exception:
+            stored = None
+        if stored is not None:
+            return stored
     with _LOG_LOCK:
         items = list(LOG_BUFFER)
     if since_id > 0:
@@ -9918,6 +10019,40 @@ def get_logs(limit=200, level="", tag="", search="", since_id=0):
 def clear_logs():
     with _LOG_LOCK:
         LOG_BUFFER.clear()
+    if _log_db_active():
+        try:
+            LOG_STORE.clear()
+        except Exception:
+            pass
+
+
+def apply_log_db_settings():
+    """Read the panel's log-database settings into the live store.
+
+    Called once at startup (after USAGE_DIR is settled) and again on every
+    settings save, so flipping the switch or editing a cap takes effect at once
+    without a restart. Also pulls the id counter up to whatever the database
+    already holds, so ids stay monotonic across a restart and the panel's
+    `since_id` incremental fetch keeps working.
+    """
+    global _LOG_COUNTER
+    if LOG_STORE is None:
+        return False
+    LOG_STORE.configure(
+        wb_settings.log_db_enabled(ACCOUNTS_DIR),
+        max_rows=wb_settings.log_db_max_rows(ACCOUNTS_DIR),
+        max_days=wb_settings.log_db_max_days(ACCOUNTS_DIR),
+        max_bytes=wb_settings.log_db_max_bytes(ACCOUNTS_DIR),
+    )
+    if LOG_STORE.enabled:
+        try:
+            highest = LOG_STORE.max_id()
+        except Exception:
+            highest = 0
+        with _LOG_LOCK:
+            if highest > _LOG_COUNTER:
+                _LOG_COUNTER = highest
+    return LOG_STORE.enabled
 
 # ---------------------------------------------------------------------------
 # upstream helpers
@@ -10014,10 +10149,11 @@ def merge_catalog(primary, realm=None, extras=False):
         source_static = list(wb_catalog.STATIC_INTL_MODELS) + list(wb_catalog.STATIC_CN_MODELS)
     else:
         source_static = getattr(wb_catalog, "STATIC_CN_MODELS" if r == "cn" else "STATIC_INTL_MODELS", wb_catalog.STATIC_MODELS)
+    primary_ids = set(m for m, _ in (primary or []))
     for item in source_static:
         mid = item.get("id")
-        # First catalog wins for a shared id, so the intl entry is not
-        # overwritten by its cn counterpart when both are merged.
+        if mid == "hy4-preview-f" and "hy4-preview" in primary_ids and "hy4-preview-f" not in primary_ids:
+            continue
         if mid and is_chat_model(mid) and mid not in merged:
             merged[mid] = dict(item)
     for mid, meta in primary or []:
@@ -10033,9 +10169,11 @@ def merge_catalog(primary, realm=None, extras=False):
         elif mid not in merged:
             merged[mid] = {}
     order = CN_UI_ORDER if r == "cn" else INTL_UI_ORDER
-    out = []
     if r == "all":
         order = list(INTL_UI_ORDER) + [m for m in CN_UI_ORDER if m not in INTL_UI_ORDER]
+    if primary_ids:
+        order = [("hy4-preview" if (m == "hy4-preview-f" and "hy4-preview" in primary_ids and "hy4-preview-f" not in primary_ids) else m) for m in order]
+    out = []
     seen = set()
     for mid in order:
         if mid in merged and mid not in seen:
@@ -10048,8 +10186,12 @@ def merge_catalog(primary, realm=None, extras=False):
         # not enough: it also carries legacy entries the picker may not show.
         for mid, _meta in primary or []:
             if mid in merged and mid not in seen:
+                item = merged[mid]
+                # 无倍率模型隐藏：未配置有效 credits（内置表无、远程 meta 也无）不进入对外目录
+                if not item.get("credits"):
+                    continue
                 seen.add(mid)
-                out.append((mid, merged[mid]))
+                out.append((mid, item))
     return out
 _catalog_lock = threading.Lock()
 
@@ -10133,6 +10275,10 @@ def model_entry(mid, meta):
     # ---- modality / capability ----
     # disabledMultimodal explicitly turns image input off; absent means allowed.
     vision = bool(meta.get("supportsImages")) and not meta.get("disabledMultimodal")
+    if mid == "glm-5.3-flash":
+        # 强制修正：上游元数据虽宣告支持多模态，但后端实际未接入视觉通道（见 issue #315）
+        vision = False
+        item["vision_note"] = "上游宣告多模态但实际通道不支持读图，已修正为纯文本" 
     tools = bool(meta.get("supportsToolCall"))
     thinks = bool(meta.get("supportsReasoning"))
     inputs = ["text"] + (["image"] if vision else [])
@@ -10423,9 +10569,9 @@ def curate_remote_catalog(realm, ids, meta=None):
             continue
         if mid.endswith("-f"):
             base = mid[:-2]
-            if base in known and free(base) and not free(mid):
+            if base in ids and free(base) and not free(mid):
                 continue
-        elif (mid + "-f") in known and free(mid + "-f") and not free(mid):
+        elif (mid + "-f") in ids and free(mid + "-f") and not free(mid):
             continue
         out.append(mid)
     return out
@@ -15321,7 +15467,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.3"
+    server_version = "wb-proxy/1.7.4"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -16260,7 +16406,18 @@ class Handler(BaseHTTPRequestHandler):
             since_id = int(query.get("since_id", ["0"])[0])
         except (ValueError, TypeError):
             since_id = 0
-        return self._json(200, get_logs(limit=limit, level=level, tag=tag, search=search, since_id=since_id))
+        result = get_logs(limit=limit, level=level, tag=tag, search=search, since_id=since_id)
+        # 面板要据 mode 决定顶部文案（内存保留 vs 落库保留）与是否显示库容量，
+        # 所以把模式与库统计一并带回；统计失败不该让整个日志请求失败。
+        result["mode"] = "db" if _log_db_active() else "memory"
+        if _log_db_active():
+            try:
+                stats = LOG_STORE.stats() or {}
+            except Exception:
+                stats = {}
+            result["stored"] = stats.get("rows", 0)
+            result["db_bytes"] = stats.get("bytes", 0)
+        return self._json(200, result)
 
     def _get_logs_export(self):
         if not self._authorized():
@@ -16776,6 +16933,28 @@ class Handler(BaseHTTPRequestHandler):
                 # 由下一个请求照常推（此刻就算推也要先折一次剩余估算，没必要
                 # 为一个开关多付这一趟）。
                 POOL.apply_remaining_weights(None)
+        if "log_db_enabled" in payload or "log_db_max_rows" in payload \
+                or "log_db_max_days" in payload or "log_db_max_bytes" in payload:
+            # 日志落库（默认关闭）：开关与三条保留上限一次提交里可以任选子集，
+            # 没带到的键原样保留。上限留空（null / "" / 0）一律存成「不限」。
+            log_db_touched = False
+            if "log_db_enabled" in payload:
+                raw = payload.get("log_db_enabled")
+                if not isinstance(raw, bool):
+                    return self._error(400, "log_db_enabled must be true or false",
+                                       "invalid_request_error")
+                wb_settings.set_log_db_enabled(ACCOUNTS_DIR, raw)
+                reply["log_db_enabled"] = raw
+                log_db_touched = True
+            for key, setter in (
+                    ("log_db_max_rows", wb_settings.set_log_db_max_rows),
+                    ("log_db_max_days", wb_settings.set_log_db_max_days),
+                    ("log_db_max_bytes", wb_settings.set_log_db_max_bytes)):
+                if key in payload:
+                    reply[key] = setter(ACCOUNTS_DIR, payload.get(key))
+                    log_db_touched = True
+            if log_db_touched:
+                apply_log_db_settings()
         if "accounts_collapsed" in payload:
             # A disclosure state, and the only thing this branch may touch: the
             # submission carries just this key, so the settings it does not name
@@ -16842,6 +17021,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_upstream_config(ACCOUNTS_DIR, patch)
             reply["upstream"] = wb_settings.upstream_config(ACCOUNTS_DIR)
+        if "usage" in payload:
+            raw = payload.get("usage")
+            if not isinstance(raw, dict):
+                return self._error(400, "usage must be an object",
+                                   "invalid_request_error")
+            try:
+                patch = wb_settings.validate_usage_patch(raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            wb_settings.set_usage_config(ACCOUNTS_DIR, patch)
+            reply["usage"] = wb_settings.usage_config(ACCOUNTS_DIR)
         if "prompt" in payload:
             raw = payload.get("prompt")
             if not isinstance(raw, dict):
@@ -17090,6 +17280,7 @@ class Handler(BaseHTTPRequestHandler):
         failure message is appended to `warnings` only for the soft-fallback
         case; hard failures raise via the caller's 400 mapping.
         """
+        wb_agents = agents_module()
         key_id = str(payload.get("key_id") or "").strip()
         if key_id == "__global":
             return API_KEY or None
@@ -17676,6 +17867,22 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "keyId": wb_atrest.derive_key_id(key),
                 "msg": "已从桌面客户端进程回收密钥（只留在内存里）",
+                "atrest": wb_atrest.status(),
+            })
+        if payload.get("keyText") is not None:
+            # 手工导入解码密钥：macOS / Linux 上无法回收进程内存，只能让用户贴一次。
+            # 与回收同一道闸——过不了 keyblob 自检就原样报错，不落内存。
+            try:
+                key = wb_atrest.adopt_key(payload.get("keyText"),
+                                          log=lambda m: log(m, tag="accounts"))
+            except Exception as exc:
+                log("at-rest key import rejected: %s" % exc, level="WARN", tag="accounts")
+                return self._json(200, {"ok": False, "msg": str(exc),
+                                        "atrest": wb_atrest.status()})
+            return self._json(200, {
+                "ok": True,
+                "keyId": wb_atrest.derive_key_id(key),
+                "msg": "已导入解码密钥（只留在内存里）",
                 "atrest": wb_atrest.status(),
             })
         if payload.get("forgetKey"):
@@ -18795,12 +19002,17 @@ def _probe_running_instance(args):
 
 def _bootstrap_runtime(args):
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT
-    global API_KEY_FILE_SET, SCHEDULER
+    global API_KEY_FILE_SET, SCHEDULER, LOG_STORE
     api_key_generated = False
     API_KEY = args.api_key
     SYSTEM_PROMPT = args.system_prompt
     if args.accounts_dir:
         ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
+    # 日志落库（默认关闭）：在账号池之前初始化，好让「池加载失败」这类最需要
+    # 事后留档的启动日志也能进库。关闭时这里只造一个 enabled=False 的空壳，
+    # 不建文件、不改日志路径。
+    LOG_STORE = wb_logstore.LogStore(os.path.join(USAGE_DIR, "logs.sqlite3"))
+    apply_log_db_settings()
     # LAN mode must not ship a known key: the gateway spends the account's own
     # upstream quota, so a guessable default lets anyone on the network drain
     # it. Generate one on first use, persist it, and reuse it afterwards.
