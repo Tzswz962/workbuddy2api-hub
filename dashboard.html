@@ -907,6 +907,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '混合': 'mixed',
     '分钟': 'minutes',
     '分钟)': 'min)',
+    '秒': 'seconds',
     '分钟取一次价': 'minutes per price fetch',
     '切换失败:': 'Switch failed:',
     '切换颜色主题': 'Switch color theme',
@@ -1044,7 +1045,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '导出失败:': 'Export failed:',
     '导出日志失败:': 'Exporting logs failed:',
     '导出账号': 'Export accounts',
-    '将为每个已启用的国际版账号各建一个网页端会话。 这会真的起一次任务并消耗该账号少量积分，用于计入官方「每日活跃」。继续？': 'One web-side session will be created for every enabled Global account. This really runs a task and spends a few credits from that account, to count toward the official daily activity. Continue?',
+    '将为每个已启用的国际版账号各建一个网页端会话。 这会真的起一次任务，用于计入官方「每日活跃」；活跃走免费模型（0.00x）。继续？': 'One web-side session will be created for every enabled Global account. This really runs a task, to count toward the official daily activity; the activity now runs on a free model (0.00x). Continue?',
     '将新增': 'Will add',
     '将覆盖': 'Will overwrite',
     '将覆盖同 UID 的现有账号（含其凭证），确定继续？': 'Existing accounts with the same UID, including their credentials, will be overwritten. Continue?',
@@ -1253,6 +1254,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '传输类失败与 502/503/504 改记在「出口」而不是账号上：同一个出口的账号共用一个计数器，退避是秒级（1 秒起、翻倍、封顶 15 秒、带抖动），任一次成功即清零；账号级熔断（30 分钟起、翻倍到 6 小时）不再被一次链路抖动触发。500 与 401/403/429 仍走原路径。默认关闭。': 'Transport failures and 502/503/504 are charged to the egress instead of the account: accounts sharing one egress share one counter, the backoff is seconds-scale (1s, doubling, capped at 15s, jittered) and any success clears it; the account breaker (30 minutes, doubling to 6h) is no longer tripped by a link hiccup. 500 and 401/403/429 keep their old paths. Off by default.',
     '已启用：出口级瞬时失败退避': 'On: egress-level transient backoff',
     '已关闭出口级瞬时失败退避': 'Egress-level transient backoff off',
+    '上游响应头超时': 'Upstream response-header timeout',
+    '单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。': 'How long one attempt may wait for the upstream to send response headers (seconds). Nothing is sent to the client before those headers arrive, so this is exactly how long the client can end up waiting: set it above the client\'s first-byte budget and the client disconnects first (seen as a 499, or a first byte that never comes) while the gateway keeps retrying on the next account under the same limit. Default 120.',
+    '调小的代价：上游偶尔确实算得慢的正常请求会被提前判失败、换账号重试，多消耗一次额度。建议不高于客户端的首字节预算。': 'The cost of lowering it: a normal request the upstream genuinely takes a long time to compute is failed early and retried on another account, spending one more unit of quota. Prefer a value no higher than the client\'s first-byte budget.',
+    '请输入不小于 1 的整数秒': 'Enter a whole number of seconds, at least 1',
     '总剩余积分：全部账号（含停用）之和；「可用」只算启用且未触发限额护栏的账号': 'Total remaining credits: the sum over every account, disabled included; "available" counts only accounts that are enabled and not parked by a limit guard.',
     '总计（全部历史）': 'Total (all time)',
     '权重': 'Weight',
@@ -1639,6 +1644,15 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '账号当日消费的积分达到该值后，只允许请求免费模型（目录中标记为 x0.00 的模型），需要花费积分的模型自动切到其他账号；本地时间 0 点后自动恢复。填 0 表示关闭（默认）。': 'Once the credit spend of an account for the day reaches this, only free models are allowed (those marked x0.00 in the catalog) and models that cost credits switch to other accounts; it recovers after local midnight. 0 turns it off (default).',
     '账号，之后相关请求都会走该账号': 'account; requests will then go through it',
     '走网页通道': 'use the web channel',
+    '活跃使用的模型': 'Model for the daily activity',
+    '(已指定)': '(set)',
+    '（免费 0.00x）': ' (free 0.00x)',
+    '，免费）': ', free)',
+    '（不在当前目录里）': ' (not in the current catalog)',
+    '默认模型（': 'Default model (',
+    '每日活跃改用 ': 'Daily activity now uses ',
+    '每日活跃恢复内置默认模型': 'Daily activity is back on the built-in default model',
+    '清单是国际版目录里的全部模型，标价 0.00x 的标成免费并排在前面。每日活跃只是一次「Hi」的会话，默认用内置的免费模型；换一个是为了把活跃挪出真实流量正在用的那个模型的窗口额度。选到付费模型的话，活跃就会按那个模型花积分。': 'The list holds every model in the Global catalog; the ones priced 0.00x are marked free and come first. The daily activity is a throwaway "Hi" conversation and uses the built-in free model by default; picking another one moves the activity off the window quota of the model your real traffic is using. Pick a paid model and the activity will spend credits at that model\'s rate.',
     '起），更早的请求未纳入这三列。': '), and earlier requests are not included in these three columns.',
     '跟随': 'Follow',
     '跟随 · 混合': 'Follow · mixed',
@@ -1959,8 +1973,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "导出日志失败:": "匯出日誌失敗:",
     "导出日志失败: ": "匯出日誌失敗: ",
     "导出账号": "匯出帳號",
-    "将为每个已启用的国际版账号各建一个网页端会话。 这会真的起一次任务并消耗该账号少量积分，用于计入官方「每日活跃」。继续？": "將為每個已啟用的國際版帳號各建一個網頁端會話。 這會真的起一次任務並消耗該帳號少量積分，用於計入官方「每日活躍」。繼續？",
-    "将为每个已启用的国际版账号各建一个网页端会话。\\n\\n这会真的起一次任务并消耗该账号少量积分，用于计入官方「每日活跃」。继续？": "將為每個已啟用的國際版帳號各建一個網頁端會話。\\n\\n這會真的起一次任務並消耗該帳號少量積分，用於計入官方「每日活躍」。繼續？",
+    "将为每个已启用的国际版账号各建一个网页端会话。 这会真的起一次任务，用于计入官方「每日活跃」；活跃走免费模型（0.00x）。继续？": "將為每個已啟用的國際版帳號各建一個網頁端會話。 這會真的起一次任務，用於計入官方「每日活躍」；活躍預設走免費模型（0.00x）。繼續？",
+    "将为每个已启用的国际版账号各建一个网页端会话。\\n\\n这会真的起一次任务，用于计入官方「每日活跃」；活跃走免费模型（0.00x）。继续？": "將為每個已啟用的國際版帳號各建一個網頁端會話。\\n\\n這會真的起一次任務，用於計入官方「每日活躍」；活躍走免費模型（0.00x）。繼續？",
     "将覆盖同 UID 的现有账号（含其凭证），确定继续？": "將覆蓋同 UID 的現有帳號（含其憑證），確定繼續？",
     "将该账号的出站身份切换为": "將該帳號的出站身份切換為",
     "将该账号的出站身份切换为 ": "將該帳號的出站身份切換為 ",
@@ -2220,6 +2234,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "传输类失败与 502/503/504 改记在「出口」而不是账号上：同一个出口的账号共用一个计数器，退避是秒级（1 秒起、翻倍、封顶 15 秒、带抖动），任一次成功即清零；账号级熔断（30 分钟起、翻倍到 6 小时）不再被一次链路抖动触发。500 与 401/403/429 仍走原路径。默认关闭。": "傳輸類失敗與 502/503/504 改記在「出口」而不是帳號上：同一個出口的帳號共用一個計數器，退避是秒級（1 秒起、翻倍、封頂 15 秒、帶抖動），任一次成功即清零；帳號級熔斷（30 分鐘起、翻倍到 6 小時）不再被一次鏈路抖動觸發。500 與 401/403/429 仍走原路徑。預設關閉。",
     "已启用：出口级瞬时失败退避": "已啟用：出口級瞬時失敗退避",
     "已关闭出口级瞬时失败退避": "已關閉出口級瞬時失敗退避",
+    "上游响应头超时": "上游回應標頭逾時",
+    "单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。": "單次嘗試等上游回傳回應標頭的上限（秒）。拿到回應標頭之前閘道不會向客戶端發出任何位元組，所以這個值就是客戶端要空等的時長：設得比客戶端首位元組預算還大時，客戶端會先斷開（表現為 499 / 首位元組遲遲不返回），而閘道仍會按這個上限繼續換帳號重試。預設 120。",
+    "调小的代价：上游偶尔确实算得慢的正常请求会被提前判失败、换账号重试，多消耗一次额度。建议不高于客户端的首字节预算。": "調小的代價：上游偶爾確實算得慢的正常請求會被提前判失敗、換帳號重試，多消耗一次額度。建議不高於客戶端的首位元組預算。",
+    "请输入不小于 1 的整数秒": "請輸入不小於 1 的整數秒",
     "总剩余积分：全部账号（含停用）之和；「可用」只算启用且未触发限额护栏的账号": "總剩餘積分：全部帳號（含停用）之和；「可用」只算啟用且未觸發限額護欄的帳號",
     "总计（全部历史）": "總計（全部歷史）",
     "权重 >1 的账号优先接单，多个高权重账号按权重比分流量；它们都接不了单时其他账号照常顶上。1 = 不干预，临期积分优先等自动规则照旧。": "權重 >1 的帳號優先接單，多個高權重帳號按權重比分流量；它們都接不了單時其他帳號照常頂上。1 = 不干預，臨期積分優先等自動規則照舊。",
@@ -3774,6 +3792,15 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
             <button onclick="saveDailyChatWeb(this)">保存</button>
           </div>
         </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <label style="font-size:13px;color:var(--dim)">活跃使用的模型</label>
+          <select id="setDailyChatModel" style="min-width:240px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit"></select>
+          <button onclick="saveDailyChatModel(this)">保存</button>
+          <span id="setDailyChatModelState" style="font-size:12px;color:var(--dim)"></span>
+        </div>
+        <div style="font-size:12px;color:var(--dim);margin-top:6px">
+          清单是国际版目录里的全部模型，标价 0.00x 的标成免费并排在前面。每日活跃只是一次「Hi」的会话，默认用内置的免费模型；换一个是为了把活跃挪出真实流量正在用的那个模型的窗口额度。选到付费模型的话，活跃就会按那个模型花积分。
+        </div>
       </section>
 
       <section>
@@ -3832,6 +3859,27 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
               启用出口级退避
             </label>
             <button onclick="saveEgressBackoff(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">上游响应头超时 <em id="setHeaderTimeoutState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。
+            </div>
+            <div style="font-size:12px;color:var(--warn);margin-top:4px">
+              调小的代价：上游偶尔确实算得慢的正常请求会被提前判失败、换账号重试，多消耗一次额度。建议不高于客户端的首字节预算。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setHeaderTimeout" type="number" min="1" step="1" style="width:90px">
+              秒
+            </label>
+            <button onclick="saveHeaderTimeout(this)">保存</button>
           </div>
         </div>
       </section>
@@ -4952,9 +5000,9 @@ async function doDailyChat(btn){
 }
 
 /* 网页通道打卡：只建网页端会话（官方每日活跃只认网页端对话）。
- * 会真的起一次任务、消耗该账号少量积分，所以先确认一次。 */
+ * 会真的起一次任务，所以先确认一次。 */
 async function doDailyChatWeb(btn){
-  if(!confirm('将为每个已启用的国际版账号各建一个网页端会话。\n\n这会真的起一次任务并消耗该账号少量积分，用于计入官方「每日活跃」。继续？')) return;
+  if(!confirm('将为每个已启用的国际版账号各建一个网页端会话。\n\n这会真的起一次任务，用于计入官方「每日活跃」；活跃走免费模型（0.00x）。继续？')) return;
   btn.disabled = true; const ot = btn.textContent; btn.textContent = "打卡中...";
   try {
     const r = await postJSON("/accounts/daily-chat-web", {});
@@ -8670,6 +8718,7 @@ async function loadSettings(showToast){
         dailyWebState.textContent = dailyWeb ? '(已启用)' : '(仅桌面端对话)';
         dailyWebState.style.color = dailyWeb ? 'var(--accent2)' : 'var(--dim)';
       }
+      renderDailyChatModel(data.daily_chat_model || '', data.daily_chat_model_default || '');
       const localWeb = data.local_web_tools === true;
       const localWebInput = document.getElementById('setLocalWebTools');
       if(localWebInput) localWebInput.checked = localWeb;
@@ -8693,6 +8742,19 @@ async function loadSettings(showToast){
       if(egressBackoffState){
         egressBackoffState.textContent = egressBackoff ? '(已启用)' : '(未启用)';
         egressBackoffState.style.color = egressBackoff ? 'var(--accent2)' : 'var(--dim)';
+      }
+      // 上游响应头超时：没改过时后端给的就是默认 120，所以「等于 120」按默认态
+      // 显示，只有被改过才标出实际秒数。
+      const headerTimeout = (data.upstream || {}).header_timeout_seconds;
+      const headerTimeoutInput = document.getElementById('setHeaderTimeout');
+      if(headerTimeoutInput){
+        headerTimeoutInput.value = (typeof headerTimeout === 'number') ? headerTimeout : 120;
+      }
+      const headerTimeoutState = document.getElementById('setHeaderTimeoutState');
+      if(headerTimeoutState){
+        const headerTimeoutDefault = (typeof headerTimeout !== 'number') || headerTimeout === 120;
+        headerTimeoutState.textContent = headerTimeoutDefault ? '(默认 120 秒)' : '(' + headerTimeout + ' 秒)';
+        headerTimeoutState.style.color = headerTimeoutDefault ? 'var(--dim)' : 'var(--accent2)';
       }
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
@@ -9190,6 +9252,73 @@ async function saveDailyChatWeb(btn){
   }
 }
 
+/* 每日活跃模型的候选项：国际版目录里的全部模型，免费（0.00x）的排前面并标出来。
+   面板本来就为「可用模型」取过同一份目录，这里另取一次 intl 的，
+   与当前查看的区域无关（每日活跃只对国际版存在）。 */
+let DAILY_CHAT_MODELS = null;
+async function loadDailyChatModels(){
+  if(DAILY_CHAT_MODELS) return DAILY_CHAT_MODELS;
+  try {
+    const r = await getJSON('/v1/models?realm=intl');
+    const out = [];
+    for(const m of (r.data || [])){
+      if(!m.id) continue;
+      const credits = String(m.credits == null ? '' : m.credits).trim();
+      const raw = credits.toLowerCase().replace(/^x/, '');
+      const free = (raw === '0.00' || raw === '0');
+      out.push({id: m.id, free: free, credits: credits});
+    }
+    // 免费的在前，其余在后，各自按 id 排序；默认模型由「默认」那一项负责。
+    out.sort((a, b) => (a.free === b.free ? a.id.localeCompare(b.id) : (a.free ? -1 : 1)));
+    DAILY_CHAT_MODELS = out;
+  } catch(e) {
+    DAILY_CHAT_MODELS = [];
+  }
+  return DAILY_CHAT_MODELS;
+}
+
+async function renderDailyChatModel(current, def){
+  const sel = document.getElementById('setDailyChatModel');
+  if(!sel) return;
+  const models = await loadDailyChatModels();
+  const label = m => {
+    if(!m.credits) return m.id;
+    const raw = m.credits.replace(/^x/i, '');
+    return m.free ? (m.id + '（免费 0.00x）') : (m.id + '（' + raw + 'x）');
+  };
+  const opts = ['<option value="">' + esc('默认模型（' + (def || '内置免费模型') + '，免费）') + '</option>'];
+  const seen = new Set(['']);
+  for(const m of models){
+    if(m.id === def || seen.has(m.id)) continue;   // 内置默认由「默认」那一项承担
+    seen.add(m.id);
+    opts.push('<option value="' + esc(m.id) + '">' + esc(label(m)) + '</option>');
+  }
+  // 已保存但不在目录里的值（上游下线了、或手工改过 settings.json）也要显示出来，
+  // 否则面板会把操作员的设置悄悄吞掉。
+  if(current && current !== def && !seen.has(current)){
+    opts.push('<option value="' + esc(current) + '">' + esc(current + '（不在当前目录里）') + '</option>');
+  }
+  sel.innerHTML = opts.join('');
+  sel.value = current || '';
+  const state = document.getElementById('setDailyChatModelState');
+  if(state) state.textContent = current ? '(已指定)' : '(默认)';
+}
+
+async function saveDailyChatModel(btn){
+  const sel = document.getElementById('setDailyChatModel');
+  const value = sel ? sel.value : '';
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {daily_chat_model: value});
+    toast(value ? ('每日活跃改用 ' + value) : '每日活跃恢复内置默认模型', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
 async function saveLocalWebTools(btn){
   const el = document.getElementById('setLocalWebTools');
   const value = !!(el && el.checked);
@@ -9227,6 +9356,27 @@ async function saveEgressBackoff(btn){
   try {
     await postJSON('/settings/save', {egress_backoff_enabled: value});
     toast(value ? '已启用：出口级瞬时失败退避' : '已关闭出口级瞬时失败退避', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+/* 上游响应头超时。后端只接受 >=1 的整数秒，所以先把输入收成整数再发：空值、
+   小数、非数字就地拦下，而不是送上去换一个 400 回来。 */
+async function saveHeaderTimeout(btn){
+  const el = document.getElementById('setHeaderTimeout');
+  const value = Math.floor(Number(el && el.value));
+  if(!isFinite(value) || value < 1){
+    toast('请输入不小于 1 的整数秒', 'bad');
+    return;
+  }
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {upstream: {header_timeout_seconds: value}});
+    toast('已保存：上游响应头超时 ' + value + ' 秒', 'ok');
     loadSettings();
   } catch(e) {
     toast('保存失败: ' + e.message, 'bad');

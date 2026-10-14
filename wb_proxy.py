@@ -4933,8 +4933,8 @@ def _recent_index_enabled():
 
     与 WB_USAGE_CACHE 同款：每次调用读环境变量，不在导入时定死。
     """
-    return os.environ.get("WB_RECENT_INDEX", "1").strip().lower() not in (
-        "0", "false", "no", "off")
+    return os.environ.get("WB_RECENT_INDEX", "0").strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def _recent_index_min_bytes():
@@ -9712,6 +9712,8 @@ def runtime_settings_view():
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
+        "daily_chat_model": wb_settings.daily_chat_model(ACCOUNTS_DIR),
+        "daily_chat_model_default": wb_accounts.DAILY_CHAT_MODEL,
         "local_web_tools": wb_settings.local_web_tools(ACCOUNTS_DIR),
         "remaining_priority_enabled":
             wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
@@ -9727,7 +9729,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.2",
+        "version": "1.7.3",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -12208,6 +12210,22 @@ def is_transient(exc):
     )
     return any(m in t for m in markers)
 
+def exc_detail(exc, limit=180):
+    """异常的可读原因（类型 + 底层文本），而不只是类型名。
+
+    这些行原先只插值 `type(exc).__name__`，于是现场只剩一串 `URLError`：事后
+    分不清那一下到底是 SSL 握手中断、连接被重置还是读超时，而这三者指向完全
+    不同的根因——上游边缘在丢连接 / 连接被重置 / 连接池复用了已死的连接。
+    URLError 的真实原因挂在 `.reason` 上（`str(exc)` 会包一层 `<urlopen error
+    ...>`，`.reason` 才是干净的内层文本），所以优先取 `.reason`，空则退回
+    `str(exc)`，再空则退回类型名，保证这一格永远有内容。
+    """
+    reason = getattr(exc, "reason", None)
+    text = str(reason) if reason is not None else str(exc)
+    text = (text or "").strip()
+    if not text:
+        return type(exc).__name__
+    return ("%s: %s" % (type(exc).__name__, text))[:limit]
 
 # The shapes the upstream uses for a rate limit. A body naming one is a soft
 # limit; it still says nothing about scope, so the caller decides that from the
@@ -12730,18 +12748,18 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     wait = charge_egress(chat_url, account.proxy)
                     log("account %s: upstream connection hiccup for '%s' (%s), "
                         "backing off the egress %.1fs"
-                        % (account.uid[:8], model, type(exc).__name__, wait))
+                        % (account.uid[:8], model, exc_detail(exc), wait))
                     last_error = exc
                     time.sleep(min(wait, EGRESS_SLEEP_MAX))
                     continue
-                charge_account(account, "connection: %s" % type(exc).__name__,
+                charge_account(account, "connection: %s" % exc_detail(exc, 120),
                                unknown=True)
                 # 带上 UID：这一行同时是一次扣分（连续 3 次就把账号熔断 30
                 # 分钟），不写清楚是谁挨的这一下，事后只能看着一串 hiccup 猜
                 # 是哪几个账号被关掉、池子为什么突然空了。
                 log("account %s: upstream connection hiccup for '%s' (%s), "
                     "retrying (degrade=%d)"
-                    % (account.uid[:8], model, type(exc).__name__, account.degrade_count))
+                    % (account.uid[:8], model, exc_detail(exc), account.degrade_count))
                 last_error = exc
                 time.sleep(min(0.6 * transient_hits, 2.0))
                 continue
@@ -12851,6 +12869,56 @@ def estimate_tokens(text):
     other = len(text) - cjk
     return cjk + max(1, int(other / 3.6)) if text else 0
 
+# 每次向流式响应要多少字节。64 KiB 远大于一条 SSE 事件（典型几百字节），
+# 又远小于 http.client 单次 read 的上限，按它切块能把「一行一次 syscall」
+# 摊成「一块一次」，同时不会让首字节延迟变差（见 iter_sse_lines）。
+SSE_READ_BLOCK = 64 * 1024
+
+def iter_sse_lines(source, block_size=SSE_READ_BLOCK, before_read=None):
+    """按块读取流式响应并逐行产出，把逐行 read 的 syscall 开销摊掉。
+
+    直接 `for line in resp` 迭代 http.client.HTTPResponse 时，每一行都要走
+    一次 read() syscall，而每次 syscall 都要释放并重新抢回 GIL。一轮流式回复
+    动辄几千条事件，于是进程大部分时间花在二十来个 handler 线程之间来回交接
+    GIL 上，而不是在干活。4 vCPU 真机实测（v1.7.2，15~20 req/s）：10 秒内
+    106 214 次 futex，占全部 syscall 时间的 71%，其中约三分之二来自这条逐行
+    读取路径。
+
+    read1() 每次最多一次底层 syscall，所以按块取回来再在内存里切行，能把
+    syscall 数降一到两个数量级。延迟不变：read1() 一有字节就返回，完整的行
+    立刻产出；只有跨块的那一行需要等下一块。
+
+    产出的行**带换行符**，与直接迭代 response 的形状完全一致，调用方一行都
+    不用改。没有 read1 的对象（列表、文本模式的文件……）退回普通迭代。
+
+    `before_read` 在每个**可能阻塞的 read1 之前**调一次，调用方可以在这里把
+    攒下的写出掉：一个读取块里的事件因此合成一次 write，而下一个字节一到就
+    立刻产出——延迟与逐块写完全一样，只是不再一个 chunk 一次 sendall。
+    """
+    read1 = getattr(source, "read1", None)
+    if read1 is None:
+        for line in source:
+            if before_read is not None:
+                before_read()
+            yield line
+        return
+    buf = b""
+    while True:
+        if before_read is not None:
+            before_read()
+        chunk = read1(block_size)
+        if not chunk:
+            break
+        buf += chunk
+        if b"\n" not in buf:
+            continue
+        head, _, buf = buf.rpartition(b"\n")
+        for line in head.split(b"\n"):
+            yield line + b"\n"
+    if buf:
+        # 上游没以换行收尾时，最后一行照旧要交出去（迭代 response 也是这个形状）。
+        yield buf
+
 def aggregate_stream(raw_iter, model, resp_id):
     """Fold an SSE stream into one non-streaming chat.completion object."""
     content, reasoning, finish = [], [], "stop"
@@ -12859,7 +12927,7 @@ def aggregate_stream(raw_iter, model, resp_id):
     started = time.time()
     first_chunk_at = None
     saw_done = False
-    for line in raw_iter:
+    for line in iter_sse_lines(raw_iter):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
             if data == "[DONE]":
@@ -14398,7 +14466,7 @@ def stream_messages_events(raw_iter, model, holder=None):
             }))
         return frames
 
-    for line in raw_iter:
+    for line in iter_sse_lines(raw_iter):
         if state["done"] or state["failed"]:
             break
         data = strip_data_prefix(line.decode("utf-8", "replace"))
@@ -15253,7 +15321,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.2"
+    server_version = "wb-proxy/1.7.3"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -16669,6 +16737,17 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_daily_chat_web(ACCOUNTS_DIR, raw)
             reply["daily_chat_web"] = raw
+        if "daily_chat_model" in payload:
+            raw = payload.get("daily_chat_model") or ""
+            # Empty clears the override back to the built-in id. Anything else
+            # has to look like a model id; a stray value here would be sent
+            # upstream on every daily run.
+            if not isinstance(raw, str) or len(raw) > 64 or \
+                    (raw and not re.match(r"^[A-Za-z0-9._:-]+$", raw)):
+                return self._error(400, "daily_chat_model must be a model id or empty",
+                                   "invalid_request_error")
+            wb_settings.set_daily_chat_model(ACCOUNTS_DIR, raw)
+            reply["daily_chat_model"] = raw
         if "local_web_tools" in payload:
             raw = payload.get("local_web_tools")
             if not isinstance(raw, bool):
@@ -18454,14 +18533,26 @@ class Handler(BaseHTTPRequestHandler):
             leak_filter = LeakedToolCallStreamFilter()
             synthesized_calls = False
             pending_finish = None
+            # 写出缓冲：一个读取块里的事件合成一次 write。
+            # wfile 是 wbufsize=0 的**无缓冲**文件（StreamRequestHandler 默认），
+            # 每个 chunk 直接落成一次 sendall —— 一次 syscall 加一次 GIL 交还。
+            # 真机 10 秒 5043 次 sendto，对应约一万次 futex，占全部 futex 的一成。
+            # 攒到「下一个可能阻塞的读之前」再写，不改变任何延迟：块边界就是
+            # socket 里当前已经有的全部字节（见 iter_sse_lines 的 before_read）。
+            out_buf = []
+
+            def flush_out():
+                if out_buf:
+                    self.wfile.write(b"".join(out_buf))
+                    self.wfile.flush()
+                    del out_buf[:]
 
             def write_chunk(payload):
                 nonlocal emitted, first_ms
                 if first_ms is None:
                     first_ms = int((time.time() - t_start) * 1000)
                 emitted = True
-                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-                self.wfile.flush()
+                out_buf.append(f"data: {payload}\n\n".encode("utf-8"))
 
             def release(actions):
                 nonlocal synthesized_calls
@@ -18475,7 +18566,7 @@ class Handler(BaseHTTPRequestHandler):
                             write_chunk(payload)
 
             try:
-                for line in upstream:
+                for line in iter_sse_lines(upstream, before_read=flush_out):
                     data = strip_data_prefix(line.decode("utf-8", "replace"))
                     if not data or data == "[DONE]" or data.startswith(":"):
                         continue
@@ -18538,11 +18629,13 @@ class Handler(BaseHTTPRequestHandler):
                             gen_ms=(wall - first_ms) if first_ms is not None else None,
                              fp=fp, outcome="upstream_aborted", key=self._key_id())
                 try:
+                    flush_out()
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 except Exception:
                     pass
                 return
+            flush_out()
             if not emitted:
                 err = json.dumps({"error": {"message": "empty upstream stream", "type": "server_error"}})
                 self.wfile.write(f"data: {err}\n\n".encode("utf-8"))

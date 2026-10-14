@@ -219,8 +219,8 @@ class WebChannelTests(unittest.TestCase):
         self.assertFalse(any("/console/as/" in r.full_url for r in calls),
                          [r.full_url for r in calls])
 
-    def test_a_failed_web_step_leaves_the_day_open_for_retry(self):
-        """网页腿失败不能写 lastDailyChat：那天还得接着重试，否则 30 积分静默丢掉。"""
+    def test_a_failed_web_step_is_reported_and_leaves_the_day_open(self):
+        """网页腿失败要如实报失败，也不能写 lastDailyChat：否则 30 积分静默丢掉。"""
         acc = self.account()
         _calls, fake = self.stub()
         self.stub_turn({"ok": False, "status": "working", "chunks": 0,
@@ -231,10 +231,11 @@ class WebChannelTests(unittest.TestCase):
             res = acc.daily_chat(web=True)
         finally:
             wb_accounts.urlopen = old
-        self.assertTrue(res.get("ok"), res)          # 桌面腿成功，返回形状不变
+        self.assertFalse(res.get("ok"), res)         # 只有网页腿算数，它失败就是失败
         self.assertFalse(res.get("web", {}).get("ok"), res)
         self.assertIn("网页通道失败", res.get("msg", ""))
-        self.assertIsNone(acc.last_daily_chat)       # 但今天不算做过
+        self.assertIn("网页通道失败", res.get("error", ""))
+        self.assertIsNone(acc.last_daily_chat)       # 今天不算做过
         self.assertTrue(acc.can_daily_chat())        # 下一次巡检还会重试
 
     def test_a_finished_web_step_marks_the_day_done(self):

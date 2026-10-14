@@ -1268,6 +1268,32 @@ def set_daily_chat_web(accounts_dir, enabled):
         data["daily_chat_web"] = enabled
         save(accounts_dir, data)
     return enabled
+
+
+def daily_chat_model(accounts_dir):
+    """Which model the intl daily activity runs on; "" keeps the built-in one.
+
+    The activity is two throwaway conversations ("Hi") whose only job is to
+    register the day, so it has no reason to spend credits. The built-in
+    default is already a free catalogue model, and this lets a deployment move
+    the activity onto a different free model - useful when the default one is
+    the same model the real traffic hammers, so the daily run does not eat its
+    window quota. Empty means "unset": the caller falls back to the built-in id.
+    """
+    value = load(accounts_dir).get("daily_chat_model")
+    return str(value or "").strip()
+
+
+def set_daily_chat_model(accounts_dir, model):
+    """Persist the daily-activity model id. Returns the stored string."""
+    model = str(model or "").strip()
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_model"] = model
+        save(accounts_dir, data)
+    return model
+
+
 def local_web_tools(accounts_dir):
     """Whether the gateway runs web_search / web_fetch calls itself.
 
