@@ -397,6 +397,16 @@ def login_rate_limit_key(peer_ip, headers):
         return via_chain
     return peer_ip
 _models_cache = {"intl": {"at": 0.0, "data": None}, "cn": {"at": 0.0, "data": None}}
+#: 目录来源追踪（面板展示用）：每个 realm 最近一次构建/刷新清单的出处。
+#: source 取值见 catalog_meta()；fetched_at 是网关拿到这批数据的时刻；
+#: file_mtime 是桌面缓存文件自己的写入时刻（仅配置文件来源，可能远早于
+#: fetched_at——那正是「清单是不是新鲜」的证据）。与 _models_cache 同批更新。
+_catalog_meta = {}
+#: 目录落盘存档：每次成功从上游 /v3/config 拉到清单就写一份响应体副本，纯留档
+#: （网关自己不读它）。与 usage 一样运行时产生、在 .gitignore 里，不参与提交
+#: 与更新；覆盖目录用 WB_PROXY_CATALOG_DIR。
+CATALOG_CACHE_DIR = os.environ.get("WB_PROXY_CATALOG_DIR") \
+    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "catalog")
 # Usage accounting: every upstream response carries a usage block, and the
 # proxy also records one JSONL line per request. Defaults to a folder next to
 # this script; override with --usage-dir or WB_PROXY_USAGE_DIR.
@@ -9777,7 +9787,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.4",
+        "version": "1.7.5",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -10227,6 +10237,20 @@ def note_bundled_reasoning(realm, live, entries):
     shown = ", ".join(missing[:6]) + (" ..." if len(missing) > 6 else "")
     log("catalog    : bundled table fills in reasoning controls the live "
         "catalogue omits for %d model(s): %s" % (len(missing), shown))
+def catalog_meta(realm=None):
+    """The provenance of the last list built for a realm, for the panel.
+
+    {"source": "remote" | "endpoint" | "cache" | "legacy" | "bundled",
+     "fetched_at": unix seconds when the gateway obtained the batch,
+     "file_mtime": unix seconds of the desktop cache file's own write
+                   (only for the config-file sources), else None}
+    """
+    r = realm or CURRENT_REALM
+    with _lock:
+        meta = _catalog_meta.get(r)
+        return dict(meta) if meta else None
+
+
 def fetch_models(realm=None):
     r = realm or CURRENT_REALM
     with _lock:
@@ -10241,16 +10265,33 @@ def fetch_models(realm=None):
             c = _models_cache.get(r) or {"at": 0.0, "data": None}
             if c["data"] and time.time() - c["at"] < 300:
                 return c["data"]
-        live, extras = curated_live_sources(r)
+        live, extras, source = curated_live_sources(r)
         if not live and r in ("intl", "all"):
             # The narrow endpoint is not the desktop catalogue, so it keeps the
             # old whitelist behaviour: only names the order table knows.
             live = [(m, {}) for m in fetch_endpoint_models()]
             extras = False
+            if live:
+                source = "endpoint"
         entries = merge_catalog(live, realm=r, extras=extras)
         note_bundled_reasoning(r, live, entries)
+        if not live:
+            # 没有任何活数据：清单完全来自内置快照（硬编码兜底）。
+            source = "bundled"
+        elif source in ("remote", "endpoint"):
+            # 记下「这个 realm 今天已经从 API 拿到过目录」，每日兜底循环据此
+            # 跳过（见 catalog_daily_pass）。
+            note_remote_catalog(r)
+        file_mtime = None
+        if source in ("cache", "legacy") and r in ("intl", "cn"):
+            try:
+                file_mtime = os.path.getmtime(product_config_path(r))
+            except OSError:
+                file_mtime = None
         with _lock:
             _models_cache[r] = {"at": time.time(), "data": entries}
+            _catalog_meta[r] = {"source": source, "fetched_at": time.time(),
+                                "file_mtime": file_mtime}
         return entries
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
@@ -10610,10 +10651,131 @@ def fetch_remote_product_config(realm):
             continue
         parsed = parse_remote_catalog(payload)
         if parsed:
+            # 成功副本落盘留档（catalog/，纯存档；见 persist_remote_catalog）。
+            persist_remote_catalog(realm, payload)
             return parsed
         last = "empty catalogue"
     log("remote catalog: %s fetch failed (%s)" % (realm, last))
     return None
+
+
+#: 面板「刷新模型清单」按钮的服务端冷却：同一 realm 两次手动强制拉取的最短
+#: 间隔。自动链本来就有 300s 缓存与桌面 UA 双尝试（最多两次请求），这个冷却
+#: 再拦一层误连点，别让面板把 /v3/config 点成高频请求——上游有 WAF，连接被丢
+#: 是常态，节制本身就是不触发风控的一部分。
+CATALOG_REFRESH_COOLDOWN = 30.0
+_catalog_refresh_at = {}
+
+
+def refresh_catalog(realm):
+    """手动刷新：立即向上游拉一次该 realm 的目录并发布到 /v1/models。
+
+    与自动链（fetch_models 缓存过期后）共用同一条取数管线：
+    fetch_remote_product_config 只挑该 realm 的代表账号、只打该 realm 的
+    端点（realm 隔离由它内部的 POOL.representative(realm=realm) 保证，
+    绝无跨区取数）；_catalog_lock 与自动链互斥，不会并发打到上游；失败
+    时不清旧缓存——清单保持可用，等用户或自动链下次再拉。与自动链的一个
+    差别：这里不读桌面缓存文件，拉不到就说拉不到（手动按钮要的是「这次
+    真的从上游 API 取到了」的如实反馈）。
+
+    返回面板可直接展示的 dict（任何情况都不抛异常）：
+      {"ok": bool, "realm": str|None, "source": "remote"|None,
+       "count": int, "cooldown": bool?, "retry_after": float?, "msg": str}
+    """
+    if realm not in ("intl", "cn"):
+        return {"ok": False, "realm": None, "source": None, "count": 0,
+                "msg": "realm 必须是 intl 或 cn"}
+    now = time.time()
+    with _lock:
+        wait = CATALOG_REFRESH_COOLDOWN - (now - _catalog_refresh_at.get(realm, 0.0))
+        if wait > 0:
+            return {"ok": False, "realm": realm, "source": None, "count": 0,
+                    "cooldown": True, "retry_after": round(wait, 1),
+                    "msg": "刷新太频繁：约 %d 秒后可再试" % max(1, int(wait + 0.5))}
+        # 先登记再拉取：失败也进冷却，连点的高频重试在这里就被拦住。
+        _catalog_refresh_at[realm] = now
+    with _catalog_lock:
+        try:
+            remote = fetch_remote_product_config(realm)
+        except Exception as exc:
+            log("catalog refresh: %s failed (%s)" % (realm, exc))
+            remote = None
+        if not remote:
+            log("catalog refresh: %s kept the previous list (upstream gave none)" % realm)
+            return {"ok": False, "realm": realm, "source": None, "count": 0,
+                    "msg": "上游未返回可用目录（账号不可用或网络异常），已保留现有清单"}
+        ids, meta = remote
+        live = [(mid, meta.get(mid) or {})
+                for mid in curate_remote_catalog(realm, ids, meta)]
+        entries = merge_catalog(live, realm=realm, extras=True)
+        note_bundled_reasoning(realm, live, entries)
+        with _lock:
+            _models_cache[realm] = {"at": time.time(), "data": entries}
+            _catalog_meta[realm] = {"source": "remote", "fetched_at": time.time(),
+                                    "file_mtime": None}
+    log("catalog refresh: %s updated from the product-config endpoint (%d models)"
+        % (realm, len(entries)))
+    note_remote_catalog(realm)
+    return {"ok": True, "realm": realm, "source": "remote", "count": len(entries),
+            "msg": "已从上游 API 更新清单，共 %d 个模型" % len(entries)}
+
+
+#: 目录的「每天至少从上游 API 取一次」兜底。活跃使用的部署里 fetch_models
+#: 的 300s 缓存把数据刷得比这更新；这个后台循环只兜两种情况：长时间没人
+#: 访问，或自动链一直回退到缓存文件/内置快照。上游有 WAF，频率上限就是
+#: 每天每个 realm 一次——成功即打点（距上次成功满 24h 才再次触发）；失败
+#: 不打扰成功记录，随循环每小时再试（拿不到新鲜数据时快一点重试是对的）。
+CATALOG_DAILY_INTERVAL = 24 * 3600
+_catalog_last_remote = {}
+
+
+def note_remote_catalog(realm, when=None):
+    """记下该 realm 最近一次成功从上游 API 拿到目录的时刻。"""
+    if realm not in ("intl", "cn"):
+        return
+    with _lock:
+        _catalog_last_remote[realm] = when if when is not None else time.time()
+
+
+def catalog_daily_due(now=None):
+    """到期的 realm 列表：距上次成功 API 获取 ≥ 24h（从未成功过也算到期）。"""
+    now = now if now is not None else time.time()
+    with _lock:
+        return [r for r in ("intl", "cn")
+                if now - _catalog_last_remote.get(r, 0.0) >= CATALOG_DAILY_INTERVAL]
+
+
+def catalog_daily_pass(now=None):
+    """每日兜底的一轮：只为到期的 realm 触发一次刷新。
+
+    与手动刷新共用 refresh_catalog（同一把 _catalog_lock、同一个 30s 冷却、
+    同样的 realm 隔离），失败保留旧数据。没有可用账号的 realm 静默跳过——
+    不是错误，等有账号了下一轮再看，也不留日志噪声。
+    """
+    done = []
+    for realm in catalog_daily_due(now):
+        if POOL is None or POOL.representative(realm=realm) is None:
+            continue
+        out = refresh_catalog(realm)
+        log("catalog daily: %s -> %s" % (realm, out.get("msg")))
+        done.append((realm, out))
+    return done
+
+
+def catalog_daily_loop():
+    # 先等启动流程跑完（账号池、服务就位），之后每小时看一眼。
+    time.sleep(60)
+    while True:
+        try:
+            catalog_daily_pass()
+        except Exception as exc:
+            log("catalog daily: pass failed (%s)" % exc)
+        time.sleep(3600)
+
+
+def start_catalog_daily():
+    threading.Thread(target=catalog_daily_loop, name="catalog-daily",
+                     daemon=True).start()
 
 
 def product_config_path(realm):
@@ -10621,6 +10783,28 @@ def product_config_path(realm):
     home = os.path.expanduser("~")
     cache_dir = ".workbuddy-ai" if realm == "intl" else ".workbuddy"
     return os.path.join(home, cache_dir, "cache", "acc-product-config-v3.json")
+
+
+def catalog_cache_path(realm):
+    """网关自己的落盘副本：最近一次成功拉取的 /v3/config 响应体。"""
+    return os.path.join(CATALOG_CACHE_DIR, "product-config-%s.json" % realm)
+
+
+def persist_remote_catalog(realm, payload):
+    """把刚成功拉取的 /v3/config 响应体原样落盘一份（原子写；失败静默）。
+
+    纯存档：网关自己不读它，只为留一份「最近一次 API 拿到的原始目录」——
+    重启或排查时可直接查看文件。写盘失败不是取数失败，绝不能影响本次结果。
+    """
+    try:
+        os.makedirs(CATALOG_CACHE_DIR, exist_ok=True)
+        path = catalog_cache_path(realm)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception as exc:
+        log("catalog cache: %s persist failed (%s)" % (realm, exc))
 
 
 def read_cached_remote_catalog(realm):
@@ -10645,31 +10829,38 @@ def read_cached_remote_catalog(realm):
 
 
 def curated_live_sources(realm):
-    """(entries, extras) for the realm's live catalogue, already curated.
+    """(entries, extras, source) for the realm's live catalogue, already curated.
 
     Remote first, then the desktop cache file - the cache is this very
     response written to disk, so both go through the same parser and the same
     rules. `extras` says the entries came from the desktop catalogue, whose
     membership may add a model the curated tables have never seen; the legacy
-    readers keep the old whitelist behaviour.
+    readers keep the old whitelist behaviour. `source` names where the batch
+    came from ("remote" = 上游 /v3/config，"cache" = 同机的桌面缓存文件，
+    "legacy" = 同一文件的宽松解析)，面板据此把「通过 API 获取」与「读取
+    配置文件」分开说；None = 哪里都没拿到。
     """
     remote = None
     try:
         remote = fetch_remote_product_config(realm)
     except Exception as exc:
         log("remote catalog: %s failed (%s)" % (realm, exc))
-    source = remote or read_cached_remote_catalog(realm)
-    if source:
-        ids, meta = source
+    if remote:
+        ids, meta = remote
         return ([(mid, meta.get(mid) or {})
-                for mid in curate_remote_catalog(realm, ids, meta)], True)
+                for mid in curate_remote_catalog(realm, ids, meta)], True, "remote")
+    cached = read_cached_remote_catalog(realm)
+    if cached:
+        ids, meta = cached
+        return ([(mid, meta.get(mid) or {})
+                for mid in curate_remote_catalog(realm, ids, meta)], True, "cache")
     legacy = read_product_config_models(realm=realm)
     if legacy:
         ids = [mid for mid, _ in legacy]
         meta = dict((mid, m) for mid, m in legacy if isinstance(m, dict))
         keep = set(curate_remote_catalog(realm, ids, meta))
-        return ([(mid, m) for mid, m in legacy if mid in keep], False)
-    return [], False
+        return ([(mid, m) for mid, m in legacy if mid in keep], False, "legacy")
+    return [], False, None
 
 
 def fetch_endpoint_models():
@@ -15467,7 +15658,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.4"
+    server_version = "wb-proxy/1.7.5"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -16097,7 +16288,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         data = [model_entry(mid, meta) for mid, meta in entries]
-        return self._json(200, {"object": "list", "data": data, "realm": req_realm or CURRENT_REALM})
+        payload = {"object": "list", "data": data,
+                   "realm": req_realm or CURRENT_REALM}
+        # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的
+        # 本机桌面缓存文件/内置快照，以及各自的时间戳。
+        meta = catalog_meta(req_realm)
+        if meta:
+            payload["catalog"] = meta
+        return self._json(200, payload)
 
     def _get_v1_usage(self, query):
         if not self._authorized():
@@ -17721,6 +17919,18 @@ class Handler(BaseHTTPRequestHandler):
         out["msg"] = "已开始抓取，稍候刷新查看结果"
         return self._json(200, out)
 
+    def _route_catalog_refresh(self, payload):
+        """面板「刷新模型清单」：强制向上游拉一次指定版本的目录。
+
+        版本（realm）由面板显式传当前视图的 intl/cn：每个版本只用自己的
+        代表账号与该版本的端点，绝不跨区。拉取同步执行（通常 1~3 秒；
+        上游丢包时两次 10s 尝试封顶），同一版本有 30s 冷却；无论成败都
+        以 200 + ok 标志回答，msg 给面板直接展示（与 /pricing/refresh
+        同一条面板惯例）。
+        """
+        realm = str((payload or {}).get("realm") or "").strip().lower()
+        return self._json(200, refresh_catalog(realm))
+
     def _route_logs_clear(self, payload):
         clear_logs()
         return self._json(200, {"ok": True})
@@ -18557,6 +18767,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/pricing/mapping":
                 return self._route_pricing_mapping(payload)
             return self._route_pricing_refresh(payload)
+        if path == "/catalog/refresh":
+            # Panel-only management write, like the pricing ones: it spends
+            # one upstream /v3/config call and republishes that realm's
+            # catalogue, so it answers to the panel session rather than to
+            # an API key.
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            return self._route_catalog_refresh(payload)
         if path.startswith("/proxy/"):
             if not self._panel_ok():
                 return self._error(
@@ -19045,6 +19266,9 @@ def _bootstrap_runtime(args):
     from wb_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()
+    # 目录兜底：每天至少从上游 API 取一次（活跃使用的部署里 300s 缓存早就
+    # 刷得更新，这个线程只兜长时间没人访问 / 一直吃缓存文件或内置快照）。
+    start_catalog_daily()
     global PRICING
     # The policy table and its timeline live beside the usage log, so one
     # volume carries both and the request references resolve locally.
