@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.8-2496ED?style=flat-square" alt="Version 1.6.20"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.10-2496ED?style=flat-square" alt="Version 1.6.20"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -414,7 +414,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 - 国际版 `deepseek-v4.1-flash` 免费模型支持额度耗尽后回退到 `deepseek-v4.1-flash-sg` 积分版。默认关闭；仅当所有已启用账号都收到带重置时间的 6004 限额记录时才回退。设置网关环境变量 `WB_ENABLE_FREE_MODEL_CREDIT_FALLBACK=1` 启用，可能产生积分费用；用量记录会显示实际计费模型，并保留客户端请求模型字段。
 
-已发布版本的完整记录（v1.4.5 ~ v1.7.8，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+已发布版本的完整记录（v1.4.5 ~ v1.7.10，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
 ## 七、致谢与引用声明 (Credits & References)
 

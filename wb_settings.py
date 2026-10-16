@@ -1253,6 +1253,21 @@ def set_prompt_config(accounts_dir, cfg):
     return clean
 
 
+def enable_anthropic_messages(accounts_dir):
+    """Whether Anthropic Messages compatibility layer is enabled via panel settings."""
+    return load(accounts_dir).get("enable_anthropic_messages") is True
+
+
+def set_enable_anthropic_messages(accounts_dir, enabled):
+    """Persist the Anthropic Messages toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["enable_anthropic_messages"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def free_model_credit_fallback(accounts_dir):
     """Whether exhausted free models (deepseek-v4.1-flash) can fall back to credit siblings."""
     return load(accounts_dir).get("free_model_credit_fallback") is True

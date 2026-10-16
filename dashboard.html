@@ -4232,6 +4232,27 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <section>
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
             <div>
+        <section>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+            <div>
+              <h2 style="margin:0">启用 Anthropic Messages 接口 (Claude) <em id="setAnthropicMessagesState"></em></h2>
+              <div style="font-size:12px;color:var(--dim);margin-top:4px">
+                允许 Claude Code / Anthropic SDK 访问网关 /v1/messages。网关对内将其转换为 OpenAI Chat Completions 协议转发。
+              </div>
+              <div style="font-size:12px;color:var(--warn);margin-top:4px">
+                注意：转换层目前未保留 cache_control 语义，在长会话中可能因缓存命中率降低而导致积分消耗偏高。请知晓风险后再开启。默认关闭。
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+                <input id="setAnthropicMessages" type="checkbox" style="width:16px;height:16px">
+                启用 Messages 接口
+              </label>
+              <button onclick="saveAnthropicMessages(this)">保存</button>
+            </div>
+          </div>
+        </section>
+
               <h2 style="margin:0">免费额度耗尽回退积分版 <em id="setCreditFallbackState"></em></h2>
               <div style="font-size:12px;color:var(--dim);margin-top:4px">
                 国际版 deepseek-v4.1-flash 免费额度在所有账号均耗尽（6004 撞线）后，自动回退到 deepseek-v4.1-flash-sg 付费通道。默认关闭。
@@ -9661,6 +9682,14 @@ async function loadSettings(showToast){
       }
       const autoSwitch = data.auto_switch_product === true;
       const creditFallback = data.free_model_credit_fallback === true;
+      const anthropicMsg = data.enable_anthropic_messages === true;
+      const anthropicMsgInput = document.getElementById('setAnthropicMessages');
+      if(anthropicMsgInput) anthropicMsgInput.checked = anthropicMsg;
+      const anthropicMsgState = document.getElementById('setAnthropicMessagesState');
+      if(anthropicMsgState){
+        anthropicMsgState.textContent = anthropicMsg ? '(已启用)' : '(未启用)';
+        anthropicMsgState.style.color = anthropicMsg ? 'var(--accent2)' : 'var(--dim)';
+      }
       const creditFallbackInput = document.getElementById('setCreditFallback');
       if(creditFallbackInput) creditFallbackInput.checked = creditFallback;
       const creditFallbackState = document.getElementById('setCreditFallbackState');
@@ -10245,6 +10274,21 @@ async function refreshPricingNow(btn){
     setTimeout(loadPricingStatus, 15000);
   } catch(e) {
     toast('触发失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
+async function saveAnthropicMessages(btn){
+  const el = document.getElementById('setAnthropicMessages');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {enable_anthropic_messages: value});
+    toast(value ? '已启用：Anthropic Messages 接口' : '已关闭：Anthropic Messages 接口', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
   } finally {
     if(btn) btn.disabled = false;
   }

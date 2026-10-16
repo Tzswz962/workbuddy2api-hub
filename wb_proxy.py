@@ -9842,6 +9842,7 @@ def runtime_settings_view():
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "free_model_credit_fallback": wb_settings.free_model_credit_fallback(ACCOUNTS_DIR),
+        "enable_anthropic_messages": wb_settings.enable_anthropic_messages(ACCOUNTS_DIR),
         "daily_chat_web": wb_settings.daily_chat_web(ACCOUNTS_DIR),
         "daily_chat_web_retry": wb_settings.daily_chat_web_retry(ACCOUNTS_DIR),
         "daily_chat_web_attempts":
@@ -9876,7 +9877,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.8",
+        "version": "1.7.10",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -15906,6 +15907,52 @@ def _cache_etag(kind, key, built_at):
     return '"%s-%s"' % (stamp, digest)
 
 
+def _anthropic_messages_enabled():
+    if wb_settings.enable_anthropic_messages(ACCOUNTS_DIR):
+        return True
+    return os.environ.get("WB_ENABLE_ANTHROPIC_MESSAGES", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+# ---------------------------------------------------------------------------
+# Per-key concurrency tracking (#359)
+# ---------------------------------------------------------------------------
+_key_active_concurrency = {}
+_key_concurrency_lock = threading.Lock()
+
+def _acquire_key_slot(key_entry):
+    """Try to acquire a concurrency slot for key_entry. Returns (ok, current, limit)."""
+    if not isinstance(key_entry, dict):
+        return True, 0, 0
+    k_id = key_entry.get("id")
+    if not k_id:
+        return True, 0, 0
+    limit = int(key_entry.get("concurrency_limit") or 0)
+    if limit <= 0:
+        return True, 0, 0
+    with _key_concurrency_lock:
+        current = _key_active_concurrency.get(k_id, 0)
+        if current >= limit:
+            return False, current, limit
+        _key_active_concurrency[k_id] = current + 1
+        return True, current + 1, limit
+
+def _release_key_slot(key_entry):
+    """Release a concurrency slot for key_entry."""
+    if not isinstance(key_entry, dict):
+        return
+    k_id = key_entry.get("id")
+    if not k_id:
+        return
+    limit = int(key_entry.get("concurrency_limit") or 0)
+    if limit <= 0:
+        return
+    with _key_concurrency_lock:
+        current = _key_active_concurrency.get(k_id, 0)
+        if current > 1:
+            _key_active_concurrency[k_id] = current - 1
+        else:
+            _key_active_concurrency.pop(k_id, None)
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # 关掉 Nagle（对连接设 TCP_NODELAY）：响应头和响应体是两次独立 write，Nagle
@@ -15987,7 +16034,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.8"
+    server_version = "wb-proxy/1.7.10"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -17404,6 +17451,12 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=PRICING.run_once, daemon=True,
                                  name="price-refresh-inherit").start()
                 reply["pricing_refresh_started"] = True
+        if "enable_anthropic_messages" in payload:
+            raw = payload.get("enable_anthropic_messages")
+            if not isinstance(raw, bool):
+                return self._error(400, "enable_anthropic_messages must be true or false", "invalid_request_error")
+            wb_settings.set_enable_anthropic_messages(ACCOUNTS_DIR, raw)
+            reply["enable_anthropic_messages"] = raw
         if "free_model_credit_fallback" in payload:
             raw = payload.get("free_model_credit_fallback")
             if not isinstance(raw, bool):
@@ -19248,16 +19301,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Fail closed until the Anthropic-to-Chat bridge has verified prompt-cache
         # parity. Reject before forwarding or recording any paid usage.
-        if is_messages_route and os.environ.get(
-                "WB_ENABLE_ANTHROPIC_MESSAGES", "").strip().lower() not in (
-                "1", "true", "yes", "on"):
+        if is_messages_route and not _anthropic_messages_enabled():
             return self._anthropic_error(
                 400,
                 "Anthropic Messages is disabled by default: this gateway "
                 "translates requests to Chat Completions and ignores "
                 "cache_control. This can cause excessive credit consumption. "
-                "Set WB_ENABLE_ANTHROPIC_MESSAGES=1 to opt in at your own risk "
-                "(see issue #367).",
+                "Enable it in the Settings panel or set WB_ENABLE_ANTHROPIC_MESSAGES=1 "
+                "to opt in at your own risk (see issue #367).",
                 "invalid_request_error")
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
         if payload is None:
@@ -19305,45 +19356,7 @@ class Handler(BaseHTTPRequestHandler):
             _release_key_slot(self.key_entry)
 
     
-# ---------------------------------------------------------------------------
-# Per-key concurrency tracking (#359)
-# ---------------------------------------------------------------------------
-_key_active_concurrency = {}
-_key_concurrency_lock = threading.Lock()
 
-def _acquire_key_slot(key_entry):
-    """Try to acquire a concurrency slot for key_entry. Returns (ok, current, limit)."""
-    if not isinstance(key_entry, dict):
-        return True, 0, 0
-    k_id = key_entry.get("id")
-    if not k_id:
-        return True, 0, 0
-    limit = int(key_entry.get("concurrency_limit") or 0)
-    if limit <= 0:
-        return True, 0, 0
-    with _key_concurrency_lock:
-        current = _key_active_concurrency.get(k_id, 0)
-        if current >= limit:
-            return False, current, limit
-        _key_active_concurrency[k_id] = current + 1
-        return True, current + 1, limit
-
-def _release_key_slot(key_entry):
-    """Release a concurrency slot for key_entry."""
-    if not isinstance(key_entry, dict):
-        return
-    k_id = key_entry.get("id")
-    if not k_id:
-        return
-    limit = int(key_entry.get("concurrency_limit") or 0)
-    if limit <= 0:
-        return
-    with _key_concurrency_lock:
-        current = _key_active_concurrency.get(k_id, 0)
-        if current > 1:
-            _key_active_concurrency[k_id] = current - 1
-        else:
-            _key_active_concurrency.pop(k_id, None)
 
 
     def _dispatch_chat_post(self, path, payload):
