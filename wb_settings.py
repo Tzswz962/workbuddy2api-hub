@@ -368,12 +368,18 @@ def _clean_key_entry(entry):
     realm = str(entry.get("realm") or "").strip().lower()
     if realm not in REALMS:
         realm = ""
+    try:
+        concurrency = int(entry.get("concurrency_limit") or entry.get("max_concurrency") or 0)
+    except (TypeError, ValueError):
+        concurrency = 0
+    concurrency = max(0, concurrency)
     return {
         "id": str(entry.get("id") or secrets.token_hex(6)),
         "name": str(entry.get("name") or "").strip() or "未命名",
         "key": key,
         "realm": realm,
         "models": _clean_model_patterns(entry.get("models")),
+        "concurrency_limit": concurrency,
         "enabled": False if deleted_at else entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
         "deleted_at": deleted_at,
@@ -1245,6 +1251,21 @@ def set_prompt_config(accounts_dir, cfg):
         data["prompt"] = clean
         save(accounts_dir, data)
     return clean
+
+
+def free_model_credit_fallback(accounts_dir):
+    """Whether exhausted free models (deepseek-v4.1-flash) can fall back to credit siblings."""
+    return load(accounts_dir).get("free_model_credit_fallback") is True
+
+
+def set_free_model_credit_fallback(accounts_dir, enabled):
+    """Persist the free model credit fallback toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["free_model_credit_fallback"] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 
 def auto_switch_product(accounts_dir):

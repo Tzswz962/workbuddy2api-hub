@@ -526,5 +526,14 @@ class CnCheckinTests(unittest.TestCase):
             wb_accounts.http_json = real_http_json
 
 
+
+    def test_daily_chat_model_falls_back_when_preferred_is_cooling(self):
+        acc = wb_accounts.Account({"uid": "u-fallback", "access_token": "t-fb", "realm": "intl"})
+        acc.model_cooldowns["deepseek-v4.1-flash"] = time.time() + 600
+        picked = acc.daily_chat_model()
+        self.assertNotEqual(picked, "deepseek-v4.1-flash")
+        self.assertIn(picked, ["hy3", "hy4-preview-f", "hy4-preview", "glm-5.3-flash"])
+
+
 if __name__ == "__main__":
     unittest.main()

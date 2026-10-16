@@ -701,6 +701,8 @@ def _apply_dsh(paths, ctx):
         levels = dsh_reasoning_levels(entry.get("reasoning_efforts"))
         if levels:
             item["reasoningEfforts"] = levels
+        if entry.get("supports_vision") or entry.get("supportsVision"):
+            item["supportsVision"] = True
         models.append(item)
     provider = {
         "displayName": PROVIDER_NAME,

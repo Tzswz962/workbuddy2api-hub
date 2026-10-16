@@ -1355,11 +1355,26 @@ class Account(object):
         legs (the desktop-identity completion and the web conversation) read
         this, so one setting moves the whole activity.
         """
+        candidates = []
         if self.path:
             picked = wb_settings.daily_chat_model(os.path.dirname(self.path))
             if picked:
-                return picked
-        return DAILY_CHAT_MODEL
+                candidates.append(picked)
+        candidates.append(DAILY_CHAT_MODEL)
+        # Add fallback free models for the account's realm if preferred model is cooling down
+        if self.realm == "intl":
+            candidates.extend(["hy3", "hy4-preview-f", "hy4-preview", "glm-5.3-flash"])
+        else:
+            candidates.extend(["hy3", "hy4-preview-f", "hy4-preview"])
+
+        now = time.time()
+        with self._throttle_lock:
+            for cand in candidates:
+                # Check model-level cooldown or cap directly
+                cooldown_until = self.model_cooldowns.get(cand, 0.0)
+                if cooldown_until <= now and self.cap_until(cand, now) <= 0.0:
+                    return cand
+        return candidates[0]
 
     def daily_chat_web(self, prompt=None, trigger="unknown"):
         """网页通道的每日活跃会话（issue #75 / #59 / #90）。

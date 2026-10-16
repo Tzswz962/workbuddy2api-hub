@@ -4229,6 +4229,27 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <section>
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
           <div>
+        <section>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+            <div>
+              <h2 style="margin:0">免费额度耗尽回退积分版 <em id="setCreditFallbackState"></em></h2>
+              <div style="font-size:12px;color:var(--dim);margin-top:4px">
+                国际版 deepseek-v4.1-flash 免费额度在所有账号均耗尽（6004 撞线）后，自动回退到 deepseek-v4.1-flash-sg 付费通道。默认关闭。
+              </div>
+              <div style="font-size:12px;color:var(--warn);margin-top:4px">
+                注意：回退后将消耗账户中的真实积分（x0.03 倍率），请确认知晓积分成本后再开启。
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+                <input id="setCreditFallback" type="checkbox" style="width:16px;height:16px">
+                启用积分回退
+              </label>
+              <button onclick="saveCreditFallback(this)">保存</button>
+            </div>
+          </div>
+        </section>
+
             <h2 style="margin:0">自动切换出站身份 <em id="setAutoSwitchState"></em></h2>
             <div style="font-size:12px;color:var(--dim);margin-top:4px">
               某账号在某模型上被上游限流（429）时，自动在 WB / VSC / CLI 之间换身分重试，每轮最多 4 次。三条身分走不同的配额通道，开启后 429 会少一些。默认关闭。
@@ -9639,6 +9660,14 @@ async function loadSettings(showToast){
         if(gaps) gaps.innerHTML = '';
       }
       const autoSwitch = data.auto_switch_product === true;
+      const creditFallback = data.free_model_credit_fallback === true;
+      const creditFallbackInput = document.getElementById('setCreditFallback');
+      if(creditFallbackInput) creditFallbackInput.checked = creditFallback;
+      const creditFallbackState = document.getElementById('setCreditFallbackState');
+      if(creditFallbackState){
+        creditFallbackState.textContent = creditFallback ? '(已启用)' : '(未启用)';
+        creditFallbackState.style.color = creditFallback ? 'var(--accent2)' : 'var(--dim)';
+      }
       const autoSwitchInput = document.getElementById('setAutoSwitch');
       if(autoSwitchInput) autoSwitchInput.checked = autoSwitch;
       const autoSwitchState = document.getElementById('setAutoSwitchState');
@@ -9742,6 +9771,7 @@ async function loadSettings(showToast){
       masked: k.masked || '',
       realm: k.realm || '',
       models: Array.isArray(k.models) ? k.models.slice() : [],
+      concurrency_limit: parseInt(k.concurrency_limit || 0, 10) || 0,
       enabled: k.enabled !== false,
       created_at: k.created_at || '',
       _editing: false,
@@ -10220,6 +10250,21 @@ async function refreshPricingNow(btn){
   }
 }
 
+async function saveCreditFallback(btn){
+  const el = document.getElementById('setCreditFallback');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {free_model_credit_fallback: value});
+    toast(value ? '已启用：免费额度耗尽自动回退付费积分版' : '已关闭自动回退付费积分版', 'ok');
+    loadSettings();
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
 async function saveAutoSwitchProduct(btn){
   const el = document.getElementById('setAutoSwitch');
   const value = !!(el && el.checked);
@@ -10678,7 +10723,12 @@ function renderKeyRows(){
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">出口绑定</div>'
         +     '<select id="editKeyRealm_' + i + '" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
         +       options
-        +     '</select>'
+        +       '</select>'
+        +   '</div>'
+        +   '<div>'
+        +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">最大并发限制 <span style="color:var(--dim-light)">(选填，0 = 不限)</span></div>'
+        +     '<input type="number" min="0" max="1000" id="editKeyConc_' + i + '" value="' + (row.concurrency_limit || '') + '" placeholder="0 代表不限制" '
+        +       'style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">模型限制 <span style="color:var(--dim-light)">(选填，留空 = 不限制)</span></div>'
@@ -10711,6 +10761,9 @@ function renderKeyRows(){
       ? '<span class="realm-badge-cn" style="font-size:11px">固定国内版出口</span>'
       : '<span class="badge s" style="font-size:11px">跟随面板切换</span>';
 
+    const concBadge = (row.concurrency_limit && row.concurrency_limit > 0)
+      ? '<span class="badge s mini" style="font-size:11px">并发上限 ' + row.concurrency_limit + '</span>'
+      : '';
     const modelBadge = (Array.isArray(row.models) && row.models.length)
       ? '<span class="badge s" style="font-size:11px">限 ' + esc(modelPatternsText(row.models)) + '</span>'
       : '';
@@ -10726,6 +10779,7 @@ function renderKeyRows(){
       +       statusBadge
       +       realmBadge
       +       modelBadge
+        +       concBadge
       +     '</div>'
       +     '<div style="font-size:12px;color:var(--dim);display:flex;align-items:center;gap:16px;flex-wrap:wrap">'
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
@@ -10773,6 +10827,7 @@ async function saveSingleKey(index, btn){
   const realmSelect = document.getElementById('editKeyRealm_' + index);
   const keyInput = document.getElementById('editKeyValue_' + index);
   const modelsInput = document.getElementById('editKeyModels_' + index);
+    const concInput = document.getElementById('editKeyConc_' + index);
 
   const name = nameInput ? nameInput.value.trim() : (row.name || '');
   const realm = realmSelect ? realmSelect.value : (row.realm || '');
@@ -10786,6 +10841,7 @@ async function saveSingleKey(index, btn){
   row.name = name || '未命名';
   row.realm = realm;
   row.models = parseModelPatterns(modelsInput ? modelsInput.value : modelPatternsText(row.models));
+    row.concurrency_limit = Math.max(0, parseInt((concInput ? concInput.value : row.concurrency_limit) || 0, 10) || 0);
   if(keyVal) row.key = keyVal;
   row._editing = false;
 
@@ -10844,6 +10900,7 @@ function addApiKeyRow(){
     key: randomKeyValue(),
     realm: '',
     models: [],
+      concurrency_limit: 0,
     enabled: true,
     masked: '',
     _editing: true
@@ -10916,6 +10973,7 @@ async function saveApiKeys(btn){
       name: row.name || '',
       realm: row.realm || '',
       models: row.models || [],
+        concurrency_limit: parseInt(row.concurrency_limit || 0, 10) || 0,
       enabled: row.enabled !== false,
       // Blank means "keep the stored key", which the server honours per row.
       key: (row.key || '').trim(),
