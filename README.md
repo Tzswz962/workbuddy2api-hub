@@ -1,7 +1,7 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.5-2496ED?style=flat-square" alt="Version 1.6.20"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.6-2496ED?style=flat-square" alt="Version 1.6.20"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -9,11 +9,11 @@
   <img src="https://img.shields.io/badge/Vibe_Coding-100%25-ff69b4?style=flat-square" alt="Vibe Coding">
 </p>
 
-把腾讯 **[www.workbuddy.ai](https://www.workbuddy.ai)**（国际版）与 **[codebuddy.cn](https://www.codebuddy.cn)**（国内版）的原生服务封装成标准 OpenAI 兼容接口（Chat Completions / Responses）与原生 Anthropic Messages 接口，并补齐多账号调度与运维能力：
+把腾讯 **[www.workbuddy.ai](https://www.workbuddy.ai)**（国际版）与 **[codebuddy.cn](https://www.codebuddy.cn)**（国内版）的原生服务封装成标准 OpenAI 兼容接口（Chat Completions / Responses），并提供默认关闭的实验性 Anthropic Messages 适配；同时补齐多账号调度与运维能力：
 
 - **开箱即用**：绿色包自带精简 Python（Windows），双击脚本即启；
 - **双区域独立路由**：国际版 / 国内版各自配置与调度，看板一键切换，状态落盘；
-- **三协议**：Chat Completions、Responses API（Codex）、原生 Anthropic Messages（Claude Code / Anthropic SDK）；
+- **协议与风险**：默认支持 Chat Completions、Responses API（Codex）；Anthropic Messages（Claude Code / Anthropic SDK）经协议转换且缓存兼容性尚未验证，默认禁用，仅可显式选择启用；
 - **模型目录对齐官方桌面端**：剔除补全通道与专线变体，能力与规格按桌面端宣告，上游新模型无需发版即进 `/v1/models`；
 - **设备指纹隔离 (`derive_id`)**：以账号 UID 稳定派生机器码与会话标识，同一账号不漂移、不同账号互不关联；
 - **账号接入**：看板点链接走浏览器 OAuth；Windows 上还能直接从运行中的桌面客户端导入（加密 token 就地解密），macOS / Linux 可手动粘贴解码密钥后导入；
@@ -133,7 +133,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 148 个套件：109 个 Python + 39 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 152 个套件：112 个 Python + 40 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -270,6 +270,27 @@ python wb_agents.py restore --client codex                 # 随时字节级还�
 - **来源**：上游自带的发放原因原样显示（如「Buddy 加油站签到」「成长计划奖励」「官方活动发放」）；国际版的 Bonus Pack 30/50 没有原因字段，按官方规则推断为「每日活跃奖励」（悬停里注明这是推断）。我们自己的**签到 / 每日活跃**记录也会按时间关联上去（取发放前 2 小时内最近的一次尝试，带成功 / 失败），悬停即可对上「本机动作：每日签到 10-10 00:07 成功」——一次发放到底由哪次动作带来，一眼可见；
 - 摘要行给出笔数、合计面额、合计剩余与**快照时刻**。接口 `GET /accounts/credits/grants` 只读内存里的积分快照、**不发上游请求**——数字的新鲜度取决于最近一次「一键刷新积分」（签到与每日活跃打卡也会顺带刷新它），所以要看最新的包先点账号页那个按钮。
 
+### 12. 单请求体体积限制（`WB_MAX_PAYLOAD_BYTES`）
+
+针对携带超长历史、大内联附件或高分辨率图片的请求，网关默认对单次请求体做上限保护（默认 16MB = `16777216` 字节），以防止异常巨大的请求挤占内存。若请求体超过上限，网关在解析前即直接返回 HTTP 413（`payload too large` 并附带 `gateway_hint` 说明）。
+
+如需调整上限（例如提升至 32MB）：
+- 设置环境变量 `WB_MAX_PAYLOAD_BYTES=33554432`（单位为字节）；
+- 此环境变量仅在进程启动时读取一次，修改后重启 `wb-proxy` 即可生效。
+
+---
+
+### 11. 后台模型重定向（`WB_BACKGROUND_MODEL_NAMES` / `WB_BACKGROUND_MODEL_TARGET`）
+
+桌面客户端（Codex 等）的模型选择器**只管主对话线程**。客户端内置的「模型路由配置」会把后台工作——记忆生成、环境建议、临时内容生成、自动化任务——送到自己硬编码的模型上，UI 里选什么免费模型都改不掉。这些请求带着同一把 Key 打到网关，于是在共享 Key 的部署里悄悄烧付费积分。
+
+网关在唯一的 POST 分发点（选账号之前）把这类模型名改写成免费目标：
+
+- `WB_BACKGROUND_MODEL_NAMES`：要拦截的模型名清单（逗号分隔，大小写不敏感），默认 `gpt-5.6-terra,gpt-5.6-luna,gpt-5.3-codex`；
+- `WB_BACKGROUND_MODEL_TARGET`：改写目标，默认 `deepseek-v4.1-flash`。
+
+改写只动 `model` 字段，请求体其余部分原样透传；命中与改写都会记一条 `alias: background model X -> Y` 日志，方便核对。OpenAI 形状的两个路由（`/v1/chat/completions`、`/v1/responses`）与 Anthropic 形状的 `/v1/messages` 都覆盖。不需要时把名单设为空即可关闭。
+
 ---
 
 ## 三、账号添加与管理
@@ -309,16 +330,20 @@ export OPENAI_BASE_URL="http://127.0.0.1:8788/v1"
 export OPENAI_API_KEY="你在看板设置中添加并绑定的API_Key"
 ```
 
-**Claude Code / Anthropic SDK（原生 Anthropic Messages API）**
+**Claude Code / Anthropic SDK（实验性 Anthropic Messages 适配，默认禁用）**
+
+> ⚠️ **积分风险：默认拒绝调用。** 网关对外接受 Anthropic Messages，但对内将请求转换为 WorkBuddy 的 `/v2/chat/completions`；`cache_control` 被忽略。已有 [#367](https://github.com/ardeyouxipianyi/workbuddy2api-hub/issues/367) 报告长会话缓存命中率仅约 11%，单次消耗超过 100 积分。该问题的因果机制仍待定位，故暂时默认禁用整个 Anthropic Messages 入口，而不假装完全兼容。禁用时 `/v1/messages`、`/messages` 及对应 `count_tokens` 入口返回 Anthropic 格式的 HTTP 400（`invalid_request_error`），请求不会转发至上游。
+
+只有确认理解风险后，才在**网关服务端**显式设置 `WB_ENABLE_ANTHROPIC_MESSAGES=1` 并重启。Docker Compose 可在 `wb-proxy.environment` 中加入 `- WB_ENABLE_ANTHROPIC_MESSAGES=1`；其他环境则在启动网关前设置此环境变量。客户端配置示例：
 
 ```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8788"
 export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 ```
 
-网关原生实现 `/v1/messages`（流式与非流式）：`system`（字符串或文本块数组）、`text` / `image` / `document` / `tool_use` / `tool_result` 内容块双向转换，`tools` + `tool_choice`、`stop_sequences`、`metadata.user_id`、`thinking` / `output_config.effort` 全部映射到上游；流式输出是原生事件序列（`message_start` → `content_block_start` / `content_block_delta` → `content_block_stop` → `message_delta` → `message_stop`）；鉴权接受 `x-api-key` 或 `Authorization: Bearer`，错误一律用 Anthropic 的错误信封。
+实验性适配包含 `system`、`text`、`image`、`document`、`tool_use`、`tool_result`、`tools` 与 `tool_choice` 等字段转换，并将响应包装为 Anthropic 的流式事件序列或非流式消息。这不是向上游的原生 Anthropic 透传。
 
-边界：服务端工具（`web_search` 等）上游不支持，会被丢弃并在 system 里注明，不会伪造调用；`thinking` / `redacted_thinking` 块不回放（上游不提供可验证签名）；`top_k`、`cache_control`、`context_management` 与 `betas` 忽略；`/v1/messages/count_tokens` 返回的是网关的 CJK 感知估算值（与用量统计同一套估算器），**不是**官方分词器的精确值。
+已知边界：服务端工具（`web_search` 等）上游不支持，会被丢弃并在 system 里注明；`thinking` / `redacted_thinking` 历史块不回放；`top_k`、`cache_control`、`context_management` 与 `betas` 被忽略；`/v1/messages/count_tokens` 在显式启用后只提供网关的 CJK 感知估算值，**不是**官方分词器的精确值。
 
 ---
 
@@ -335,8 +360,8 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 | GET | / | Web 用量与任务监控看板 |
 | POST | /v1/chat/completions | 标准 Chat Completions 接口 |
 | POST | /v1/responses | Responses API 协议接口 |
-| POST | /v1/messages | 原生 Anthropic Messages 协议接口（流式 / 非流式，`x-api-key` 或 `Authorization` 鉴权） |
-| POST | /v1/messages/count_tokens | Anthropic 计数接口（CJK 感知估算值，非官方分词器） |
+| POST | /v1/messages | 实验性 Anthropic Messages 适配，默认禁用（HTTP 400）；需显式启用并承担缓存风险 |
+| POST | /v1/messages/count_tokens | 实验性 Anthropic 计数估算接口，随 Messages 入口默认禁用 |
 | GET | /v1/models | 官方对齐模型列表（含能力与规格宣告） |
 | GET | /pricing | 定价状态：当前生效策略、上次/下次取价时间、未定价清单（分类 + 候选） |
 | POST | /pricing/refresh | 立即取一次价（需面板会话） |
@@ -363,7 +388,14 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 ### Unreleased
 
-已发布版本的完整记录（v1.4.5 ~ v1.7.5，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+- **熔断不再乱开：连续失败要有时间窗，本机断网也不算账号的账**。两个现象同源——账号治理只看次数、不看间隔，也不区分「这是谁的问题」：
+  - `fails` 以前只加不减（只有成功才归零）：几小时前的一次 502 + 昨天的一次超时 + 刚才一次抖动就能凑成「连续 3 次」，把账号关 30 分钟；下一个窗口还按 1800 → 3600 → 7200… 翻倍，于是越关越久——「明明测了能用，它还熔断」就是这么来的。现在两次失败间隔超过 `WB_FAIL_WINDOW`（默认 600 秒，设 0 关闭）就重新从 1 数起，成功照旧清零。
+  - DNS 解析不了、路由不可达这类**本机没网**的失败，以前也逐账号记一笔并冷却 60 秒；断网那一分钟里整个池子被走一遍，等网络恢复，账号全在冷却里。现在这类失败先被认出来（`looks_like_local_network()`），一个账号都不记，按「本机网络不可用」上报并给出 `gateway_hint`；`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三条链路都走这个分支。
+  - 账号行与禁用总览新增可解释字段：连续失败次数、窗口长度与最近一次失败距今（`fails` / `failWindow` / `lastFailFor`），「还差几次熔断」一眼可见。
+- **新增「一键测试」**：工具栏按钮一次测完当前区域所有已启用账号，并同时给出「本机 ↔ 上游」的连通性（DNS 与 TCP 耗时）。结果表逐账号显示通过 / 失败、耗时与原因（失败行附带「连续失败 N 次」），**本机断网的行单独标成「本机网络」**，不会和账号真失败混在一起。测试通过会清掉该账号的熔断 / 降权 / 软限流计数（沿用 `/accounts/test` 的成功路径）；测试失败只记录原因、不冷却账号——诊断动作不该改变账号状态。后端不带 `uid` 即为整池测试：`POST /accounts/test {"realm": "cn"}`。
+- 新增 `tests/_test_breaker_fairness.py`（19 项）与 `tests/_test_account_test_all.js`（27 项）；看板套件新增共享的 `tests/_dashboard_sandbox.js`（把页面脚本装进显式沙箱再跑，本套件用它；其它看板套件仍各自 `new Function`，可后续统一）。
+
+已发布版本的完整记录（v1.4.5 ~ v1.7.6，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
 ## 七、致谢与引用声明 (Credits & References)
 

@@ -3491,6 +3491,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <div class="tb-group">
     <button class="sec" onclick="fetchCredits(this)">一键刷新积分</button>
     <button class="sec" onclick="refreshAccounts(this)" title="逐个刷新所有账号的上游访问凭证（相当于对每个账号点一次「刷新凭证」）">一键刷新凭证</button>
+    <button class="sec" onclick="testAccounts(this)" title="逐个真发一条最小请求，并同时检查本机到上游的网络：能分清「账号坏了」和「本机断网了」，测试通过还会清掉该账号的熔断/降权计数">一键测试</button>
     </div>
     <div class="tb-group">
     <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">Buddy 加油站签到</button>
@@ -4581,6 +4582,26 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <div class="modal-ft">
       <button class="sec" onclick="closeLogin()">关闭</button>
       <button onclick="restartLogin()">重新生成链接</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="testAllModal">
+  <div class="modal" role="dialog" aria-modal="true" style="width:min(820px,100%)">
+    <div class="modal-hd">
+      <h2>一键测试结果</h2>
+      <button class="modal-x" onclick="closeTestAll()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <p class="hint" style="margin-top:0">
+        每个已启用账号各发一条最小请求（真实调用上游，会消耗极少量额度）。
+        测试通过会顺手清掉该账号的熔断 / 降权 / 软限流计数，所以不会出现「测完还是冷却」。
+      </p>
+      <div id="testAllBody"><p class="hint">正在测试…</p></div>
+    </div>
+    <div class="modal-ft">
+      <button class="sec" onclick="testAccounts(null)">重新测试</button>
+      <button class="sec" onclick="closeTestAll()">关闭</button>
     </div>
   </div>
 </div>
@@ -7319,6 +7340,9 @@ async function testAccount(uid, btn){
     const r = await postJSON('/accounts/test', {uid: uid});
     if(r.ok){
       toast('测试通过 (' + r.elapsed_ms + 'ms) [' + r.model + ']: ' + (r.reply || '正常'), 'ok');
+    } else if(r.network){
+      // 本机断网时上游一个字节都没收到：说清是网络问题，别让人以为账号坏了。
+      toast('本机网络不可用: ' + (r.error || 'DNS/路由失败'), 'bad');
     } else {
       toast('测试失败: ' + (r.error || r.status || '异常'), 'bad');
     }
@@ -7328,6 +7352,95 @@ async function testAccount(uid, btn){
   }finally{
     if(btn){ btn.disabled = false; btn.textContent = '测试'; }
   }
+}
+
+/* 一键测试：区域内每个已启用账号 + 本机连通性一次看全。
+   池子出问题时最需要分辨的就是「账号真不行」与「本机没网 / 只是被本地窗口关着」，
+   红点一屏的时候，逐个点测出来的结论往往是错的。 */
+function openTestAll(){
+  const m = document.getElementById('testAllModal');
+  const body = document.getElementById('testAllBody');
+  if(body) body.innerHTML = '<p class="hint">正在测试…</p>';
+  if(m) m.classList.add('show');
+}
+function closeTestAll(){
+  const m = document.getElementById('testAllModal');
+  if(m) m.classList.remove('show');
+}
+
+async function testAccounts(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  openTestAll();
+  try{
+    const r = await postJSON('/accounts/test', {realm: window.VIEW_REALM});
+    renderTestAll(r);
+    const s = r.summary || {};
+    if(s.networkDown){
+      toast('本机网络不通：' + ((r.network || {}).error || 'DNS/路由失败') + '（账号未被计入熔断）', 'bad');
+    } else {
+      toast('一键测试: ' + (s.passed || 0) + '/' + (s.tested || 0) + ' 通过 (' + (s.elapsed_ms || 0) + 'ms)',
+            (s.failed ? 'warn' : 'ok'));
+    }
+    await loadAccounts();
+  }catch(e){
+    const body = document.getElementById('testAllBody');
+    if(body) body.innerHTML = '<p class="hint" style="color:var(--warn)">测试请求失败: ' + esc(e.message) + '</p>';
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '一键测试'; }
+  }
+}
+
+function renderTestAll(r){
+  const body = document.getElementById('testAllBody');
+  if(!body) return;
+  const net = r.network || {};
+  const s = r.summary || {};
+  const rows = r.results || [];
+  let html = '';
+  // 本机连通性单独一行放最前面：它不通的话，下面的红点一个都不能算账号的账。
+  html += '<div style="background:' + (net.ok ? 'var(--accent2-soft)' : 'var(--bad-soft)')
+    + ';border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:12px;font-size:13px">'
+    + '<b>' + (net.ok ? '本机网络正常' : '本机网络不通') + '</b>'
+    + '<span class="hint" style="margin-left:8px">' + esc(net.host || '')
+    + (net.ip ? ' → ' + esc(net.ip) : '')
+    + (net.dns_ms !== null && net.dns_ms !== undefined ? ' · DNS ' + net.dns_ms + 'ms' : '')
+    + (net.tcp_ms !== null && net.tcp_ms !== undefined ? ' · TCP ' + net.tcp_ms + 'ms' : '')
+    + (net.ok ? '' : ' · ' + esc(net.error || ''))
+    + '</span></div>';
+  html += '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;font-size:13px">'
+    + '<span>共测 <b>' + esc(String(s.tested || 0)) + '</b></span>'
+    + '<span>通过 <b style="color:var(--accent2)">' + esc(String(s.passed || 0)) + '</b></span>'
+    + '<span>失败 <b style="color:var(--warn)">' + esc(String(s.failed || 0)) + '</b></span>'
+    + '<span class="hint">模型 ' + esc(s.model || '') + ' · 耗时 ' + esc(String(s.elapsed_ms || 0)) + 'ms</span>'
+    + '</div>';
+  if(!rows.length){
+    html += '<p class="hint">该区域没有已启用的账号。</p>';
+  } else {
+    html += '<div class="table-wrap"><table class="data-cards"><thead><tr>'
+      + '<th style="text-align:left">账号</th><th style="text-align:center">结果</th>'
+      + '<th style="text-align:center;width:90px">耗时</th>'
+      + '<th style="text-align:left">回复 / 原因</th></tr></thead><tbody>';
+    rows.forEach(row => {
+      // 本机断网的行单独标出来：这不是账号的问题，不该跟真失败画成一个颜色。
+      const badge = row.ok ? '<span class="badge ok">通过</span>'
+                  : row.network ? '<span class="badge warn">本机网络</span>'
+                  : '<span class="badge bad">失败</span>';
+      const detail = row.ok ? (row.reply || '正常') : (row.error || '');
+      // 失败行带上「连续失败 N 次」：这是熔断的唯一依据，看得见才知道离熔断还有多远。
+      const ladder = (!row.ok && Number(row.fails || 0) > 0)
+        ? '（连续失败 ' + Number(row.fails) + ' 次）' : '';
+      html += '<tr>'
+        + '<td style="text-align:left"><b>' + esc(row.nickname || (row.uid || '').slice(0, 8)) + '</b>'
+        + '<div class="mono" style="font-size:11px;color:var(--dim)">'
+        + esc((row.uid || '').slice(0, 8)) + ' · ' + esc(row.realm === 'cn' ? '国内版' : '国际版') + '</div></td>'
+        + '<td style="text-align:center">' + badge + '</td>'
+        + '<td style="text-align:center">' + esc(String(row.elapsed_ms || 0)) + 'ms</td>'
+        + '<td style="text-align:left;font-size:12px">' + esc(detail + ladder) + '</td>'
+        + '</tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+  body.innerHTML = html;
 }
 async function refreshAccounts(btn){
   if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }

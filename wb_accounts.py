@@ -424,6 +424,16 @@ SOFT_RATE_UNVERIFIED_MAX = 600.0
 BREAKER_THRESHOLD = 3           # consecutive hard failures before the breaker
 BREAKER_COOLDOWN = 1800.0       # first breaker window: 30 minutes
 BREAKER_COOLDOWN_MAX = 21600.0  # ... doubling up to 6 hours
+# 上面那个「连续」必须有时间含义：老实现只认次数、不认间隔，fails 只有成功才
+# 归零，于是同一条凭据几小时前的一次 502 + 几天前的一次超时 + 刚才一次抖动就凑成
+# 「连续 3 次」，把账号关 30 分钟——而且关得越久下次越容易再凑满（1800 → 3600 →
+# 7200…）。生产上的表现就是「明明测了能用，它还熔断」。现在两次失败间隔超过这个
+# 窗口就重新从 1 数起，连续才真的是连续。可用 WB_FAIL_WINDOW 覆盖，设 0 关闭衰减
+# （回到旧的累计行为）。
+try:
+    FAIL_WINDOW = max(0.0, float(os.environ.get("WB_FAIL_WINDOW") or 600.0))
+except (TypeError, ValueError):
+    FAIL_WINDOW = 600.0
 DEGRADE_THRESHOLD = 5           # consecutive unknown failures before degrading
 DEGRADE_COOLDOWN = 600.0        # first degrade window: 10 minutes
 DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
@@ -553,6 +563,8 @@ class Account(object):
         self.degrade_count = 0
         self.breaker_until = 0.0
         self.degrade_until = 0.0
+        # 最近一次记失败的时刻：FAIL_WINDOW 用它判断「连续」是否还成立。
+        self.last_fail_at = 0.0
         self.credits = data.get("credits") or None
         self.last_checkin = data.get("lastCheckin") or None
         self.last_daily_chat = data.get("lastDailyChat") or None
@@ -724,6 +736,11 @@ class Account(object):
             "unscopedStreak": int(self.unscoped_streak),
             "breakerFor": round(max(0.0, self.breaker_until - now)) or None,
             "degradeFor": round(max(0.0, self.degrade_until - now)) or None,
+            # 连续失败计数（离熔断还差几次）与最近一次失败的时间：面板用它解释
+            # 「为什么这个账号被关了」，也是「一键测试」判定成功/失败的依据。
+            "fails": int(self.fails),
+            "failWindow": int(FAIL_WINDOW),
+            "lastFailFor": (round(max(0.0, now - self.last_fail_at)) if self.last_fail_at else None),
             "addedAt": self.added_at,
             "file": os.path.basename(self.path) if self.path else None,
             "credits": self.credits,
@@ -2071,16 +2088,29 @@ class Account(object):
         """5xx / transport failure: feed the breaker counter."""
         with self._throttle_lock:
             self.last_error = str(message)[:200]
+            self._decay_strikes()
             self.fails += 1
             if self.fails >= BREAKER_THRESHOLD:
                 wait = breaker_backoff(self.fails)
                 self.breaker_until = max(self.breaker_until, time.time() + wait)
         return self.breaker_until
 
+    def _decay_strikes(self):
+        """两次失败隔得太久就不再算「连续」，从头计数。
+
+        调用方必须已持有 _throttle_lock。窗口设 0 时保持旧的累计语义。
+        """
+        now = time.time()
+        if FAIL_WINDOW and self.last_fail_at and now - self.last_fail_at > FAIL_WINDOW:
+            self.fails = 0
+            self.degrade_count = 0
+        self.last_fail_at = now
+
     def note_unknown_failure(self, message):
         """Unknown error: degrade counter plus the shared breaker counter."""
         with self._throttle_lock:
             self.last_error = str(message)[:200]
+            self._decay_strikes()
             self.degrade_count += 1
             self.fails += 1
             now = time.time()
@@ -2101,6 +2131,7 @@ class Account(object):
             self.unscoped_streak = 0
             self.fails = 0
             self.degrade_count = 0
+            self.last_fail_at = 0.0
             self.breaker_until = 0.0
             self.degrade_until = 0.0
             self.last_error = ""
