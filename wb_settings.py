@@ -1500,6 +1500,108 @@ def set_daily_chat_model(accounts_dir, model):
     return model
 
 
+#: 网页通道一轮等多久（秒）的默认值。与 wb_accounts.WEB_TURN_TIMEOUT 同值：
+#: 没配过的部署保持既有行为，改过的部署按自己配的来。
+DAILY_CHAT_WEB_TIMEOUT_DEFAULT = 120
+#: 上限只是防手滑。每轮等待时间翻倍，配成几百秒会让单账号最坏情况跑到小时级。
+DAILY_CHAT_WEB_TIMEOUT_MAX = 3600
+#: 网页通道总共试几次（含第一轮）的默认值，与 wb_accounts.WEB_TURN_ATTEMPTS 同值。
+DAILY_CHAT_WEB_ATTEMPTS_DEFAULT = 3
+#: 上限同样只是防手滑：最坏等待是 base×(2^次数−1) 秒，5 次已经接近一小时。
+DAILY_CHAT_WEB_ATTEMPTS_MAX = 5
+
+
+def daily_chat_web_retry(accounts_dir):
+    """Whether a failed web-channel turn is tried again.
+
+    On unless the operator turns it off. The usual failure is a session that is
+    still ``working`` when the first wait runs out - slow, not broken - and the
+    daily activity is the only thing that earns the 30/50 credits, so giving up
+    on the first timeout silently loses the day. Off restores the old
+    single-attempt behaviour.
+    """
+    value = load(accounts_dir).get("daily_chat_web_retry")
+    return True if value is None else value is True
+
+
+def set_daily_chat_web_retry(accounts_dir, enabled):
+    """Persist the web-channel retry toggle. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_retry"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def daily_chat_web_attempts(accounts_dir, default=None):
+    """How many times the web channel is tried in total, the first one included.
+
+    ``default`` is what an unset install gets, so a caller with its own
+    built-in default keeps it. Out-of-range or non-integer values fall back to
+    it too, so a hand-edited settings.json cannot park the sweep on one
+    account.
+    """
+    if default is None:
+        default = DAILY_CHAT_WEB_ATTEMPTS_DEFAULT
+    value = load(accounts_dir).get("daily_chat_web_attempts")
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 1 or value > DAILY_CHAT_WEB_ATTEMPTS_MAX):
+        return default
+    return value
+
+
+def set_daily_chat_web_attempts(accounts_dir, attempts):
+    """Persist the total number of tries. Returns the stored whole number."""
+    if isinstance(attempts, bool) or not isinstance(attempts, int):
+        raise ValueError("daily_chat_web_attempts must be a whole number")
+    if attempts < 1:
+        raise ValueError("daily_chat_web_attempts cannot be less than 1")
+    if attempts > DAILY_CHAT_WEB_ATTEMPTS_MAX:
+        raise ValueError("daily_chat_web_attempts cannot be more than %d"
+                         % DAILY_CHAT_WEB_ATTEMPTS_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_attempts"] = attempts
+        save(accounts_dir, data)
+    return attempts
+
+
+def daily_chat_web_timeout(accounts_dir, default=None):
+    """Seconds to wait for the first web-channel turn; later tries double it.
+
+    ``default`` is what an unset install gets, so a caller that has its own
+    built-in default (the env-overridable ``WB_WEB_TURN_TIMEOUT``) keeps it
+    instead of being silently reset to 120 by this setting's existence.
+    Anything that is not a whole number in range also falls back to it, so a
+    hand-edited settings.json cannot make the scheduler hang on a huge value
+    or trip over a string.
+    """
+    if default is None:
+        default = DAILY_CHAT_WEB_TIMEOUT_DEFAULT
+    value = load(accounts_dir).get("daily_chat_web_timeout")
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 1 or value > DAILY_CHAT_WEB_TIMEOUT_MAX):
+        return default
+    return value
+
+
+def set_daily_chat_web_timeout(accounts_dir, seconds):
+    """Persist the per-attempt wait. Returns the stored whole number of seconds."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError("daily_chat_web_timeout must be a whole number of seconds")
+    if seconds < 1:
+        raise ValueError("daily_chat_web_timeout cannot be less than 1")
+    if seconds > DAILY_CHAT_WEB_TIMEOUT_MAX:
+        raise ValueError("daily_chat_web_timeout cannot be more than %d"
+                         % DAILY_CHAT_WEB_TIMEOUT_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_timeout"] = seconds
+        save(accounts_dir, data)
+    return seconds
+
+
 def local_web_tools(accounts_dir):
     """Whether the gateway runs web_search / web_fetch calls itself.
 
