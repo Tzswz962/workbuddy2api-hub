@@ -922,9 +922,8 @@ class RemainingUsageTests(unittest.TestCase):
         self.assertTrue(find_row(data, "acct-A")["cooling"])
 
     def test_live_event_dedupes_against_the_log_row(self):
-        reset = time.time() + 30 * 60
-        _, detail = reset_epoch(time.strftime("%Y-%m-%d %H:%M:%S",
-                                              time.localtime(reset)))
+        reset = int(time.time()) + 30 * 60
+        detail = cap_detail(reset)
         write_log([
             usage_row(reset - 2 * HOUR, "acct-A", 900),
             # The 429 row the log keeps for this same cap (the last account of

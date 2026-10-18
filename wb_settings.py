@@ -1304,6 +1304,47 @@ def set_auto_switch_product(accounts_dir, enabled):
     return enabled
 
 
+#: 出站身份自动切换允许落在哪些身份上（默认三条都允许，保持旧行为）。
+AUTO_SWITCH_PRODUCTS = ("workbuddy", "vscode", "cli")
+
+
+def auto_switch_products(accounts_dir):
+    """Allowed target identities for the 429 auto-switch.
+
+    Defaults to all three so an install that predates this setting keeps the
+    old behaviour. Unknown entries are dropped rather than failing the read.
+    """
+    raw = load(accounts_dir).get("auto_switch_products")
+    if not isinstance(raw, list):
+        return list(AUTO_SWITCH_PRODUCTS)
+    out = []
+    for item in raw:
+        if isinstance(item, str) and item in AUTO_SWITCH_PRODUCTS and item not in out:
+            out.append(item)
+    return out
+
+
+def set_auto_switch_products(accounts_dir, products):
+    """Persist the allowed auto-switch identities. Returns the stored list.
+
+    Raises ValueError for anything that is not a list of known product ids, so
+    the panel gets a readable 400 instead of silently storing garbage.
+    """
+    if not isinstance(products, list):
+        raise ValueError("auto_switch_products must be a list")
+    clean = []
+    for item in products:
+        if not isinstance(item, str) or item not in AUTO_SWITCH_PRODUCTS:
+            raise ValueError("unknown auto-switch product: %r" % (item,))
+        if item not in clean:
+            clean.append(item)
+    with _lock:
+        data = load(accounts_dir)
+        data["auto_switch_products"] = clean
+        save(accounts_dir, data)
+    return clean
+
+
 def remaining_priority_enabled(accounts_dir):
     """Whether pairs close to their estimated remaining quota are served first.
 
@@ -1791,6 +1832,28 @@ def set_update_check_enabled(accounts_dir, enabled):
     return enabled
 
 
+def window_probe(accounts_dir):
+    """是否在模型额度窗口重置时刻主动发探针请求，抢占新一轮计时。
+
+    上游的免费额度窗口按「首次请求」起算，打满后 429 会给出 `reset at`。
+    到点若无人请求，新一轮窗口就不会开始，额度一直空转。默认开启：这是
+    本网关把窗口起点钉在重置那一刻的唯一手段。关掉它的部署回到旧行为——
+    429 只记冷却，等真实请求自己撞上重置点。
+    """
+    value = load(accounts_dir).get("window_probe")
+    return True if value is None else value is True
+
+
+def set_window_probe(accounts_dir, enabled):
+    """Persist the window-probe switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["window_probe"] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def update_check_state(accounts_dir):
     """The last-check bookkeeping: when it ran, and the version it saw.
 
@@ -1833,6 +1896,49 @@ def record_update_check(accounts_dir, at=None, success=False, latest_version="")
         data[UPDATE_CHECK_STATE_KEY] = state
         save(accounts_dir, data)
     return update_check_state(accounts_dir)
+
+
+def _clean_quota_scan_models(value):
+    """Normalize the watch list into model ids in the order given.
+
+    Ids are kept verbatim (they are sent upstream as `model`), only trimmed and
+    de-duplicated; a hand-edited settings.json usually holds a comma-separated
+    string, so both shapes are accepted.
+    """
+    if isinstance(value, str):
+        raw = re.split(r"[,;\n]", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def quota_scan_models(accounts_dir):
+    """Model ids the operator asked to watch, whether throttled or not.
+
+    The window probe only knows about a quota line once something hit its 429;
+    this list is how a line can be checked *before* it is exhausted, so hitting
+    the limit is discovered on an idle timer instead of mid-request. Empty means
+    the feature is off, which is what an install that predates the setting reads
+    back as.
+    """
+    return _clean_quota_scan_models(load(accounts_dir).get("quota_scan_models"))
+
+
+def set_quota_scan_models(accounts_dir, models):
+    """Replace the watch list. Returns the stored list."""
+    cleaned = _clean_quota_scan_models(models)
+    with _lock:
+        data = load(accounts_dir)
+        data["quota_scan_models"] = cleaned
+        save(accounts_dir, data)
+    return cleaned
 
 
 _SLOT_ID_RE = re.compile(r"^slot-(\d+)$")

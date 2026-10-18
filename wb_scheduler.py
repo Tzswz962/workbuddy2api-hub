@@ -11,6 +11,7 @@ import threading
 import time
 import random
 import wb_tasks
+import wb_quota_scan
 from wb_tasks import do_cat_travel
 
 
@@ -26,6 +27,8 @@ class Scheduler:
         self.enabled = True
         self._stop_event = threading.Event()
         self._thread = None
+        self._probe_thread = None
+        self._scan_thread = None
         self.last_run_time = None
         self.next_run_time = None
         self.logs = []
@@ -76,6 +79,9 @@ class Scheduler:
             self._execute_cycle("启动初次初始化巡检")
         except Exception as exc:
             self.log(f"初次巡检异常: {exc}")
+        # 进程停过一段时间的话，重置时刻可能已经过去：启动就补一次窗口探针，
+        # 把新一轮窗口的起点尽量抢回来。
+        self._run_window_probes()
 
         while not self._stop_event.is_set():
             self._calc_next_fire()
@@ -92,7 +98,66 @@ class Scheduler:
                     except Exception as exc:
                         self.log(f"排程执行异常: {exc}")
                     time.sleep(65) # 避开当前这一分钟重复触发
-            self._stop_event.wait(30)
+            # 模型额度窗口探针：不受 enabled 影响。窗口是按首次请求起算的，
+            # 到点没人请求就不会开始新一轮，这件事跟签到/保活开关无关。
+            self._run_window_probes()
+            # 模型额度定时主动查询：同样不受 enabled 影响——它是「哪些配额线
+            # 已经打满」的唯一主动信息源，跟签到/保活不是一回事。
+            self._run_quota_scans()
+            self._stop_event.wait(self._next_wait())
+
+    def _run_window_probes(self):
+        """在独立线程里执行到点的窗口探针。
+
+        一次探针最长可能等上游几十秒，跑在巡检循环里会把整点排程的节奏带偏；
+        wb_window_probe 自带防重入锁，重叠启动是无害的。
+        """
+        if self._probe_thread and self._probe_thread.is_alive():
+            return
+        self._probe_thread = threading.Thread(target=self._probe_worker, daemon=True)
+        self._probe_thread.start()
+
+    def _probe_worker(self):
+        try:
+            import wb_window_probe
+            wb_window_probe.run_due(self.pool, self.log)
+        except Exception as exc:
+            self.log(f"窗口探针异常: {exc}")
+
+    def _run_quota_scans(self):
+        """到点的模型额度主动查询，同样跑在独立线程里。
+
+        一次查询要等上游几十秒，塞进巡检循环会把整点排程的节奏带偏；
+        wb_quota_scan 自带防重入锁，重叠启动是无害的。
+        """
+        if self._scan_thread and self._scan_thread.is_alive():
+            return
+        self._scan_thread = threading.Thread(target=self._scan_worker, daemon=True)
+        self._scan_thread.start()
+
+    def _scan_worker(self):
+        try:
+            import wb_quota_scan
+            wb_quota_scan.run_due(self.pool, self.log)
+        except Exception as exc:
+            self.log(f"额度查询异常: {exc}")
+
+    def _next_wait(self):
+        """下一轮巡检的等待时间：常规 30 秒，有窗口即将到点时提前醒来。
+
+        探针的价值在于「到点立刻发」——晚一个巡检周期，新一轮窗口的起点就
+        往后推 30 秒，所以这里按最近的窗口到期时间收敛等待。
+        """
+        wait = 30.0
+        try:
+            import wb_window_probe
+            accounts_dir = getattr(self.pool, "dir", "") or ""
+            secs = wb_window_probe.seconds_until_due(accounts_dir)
+            if secs is not None:
+                wait = min(wait, max(1.0, secs))
+        except Exception:
+            pass
+        return wait
 
     def _calc_next_fire(self):
         now = time.localtime()
@@ -147,6 +212,22 @@ class Scheduler:
                 # 账号间随机错峰防并发风控（2~5秒浮动延时，issue #394）
                 time.sleep(random.uniform(2.0, 5.0))
             uid8 = acc.uid[:8] if acc.uid else "?"
+            # 上游账号级风控限制（403 / code 11140）中的账号一律跳过：无人值守
+            # 的巡检/打卡再去「试探」一次，只会让同一台设备上的其他账号连坐。
+            # 限制期限是持久化的（wb_accounts.note_restricted），重启后仍然有效。
+            if getattr(acc, "restricted_until", 0.0) > time.time():
+                self.log(f"跳过受限账号 [{uid8}]：上游风控限制剩余 "
+                         f"{int(acc.restricted_until - time.time())}s")
+                continue
+            # 区域级连坐暂停期间（同一窗口内多个账号被限制）整轮都不碰上游。
+            try:
+                import wb_proxy
+                hold = wb_proxy.restriction_hold_remaining(acc.realm)
+            except Exception:
+                hold = 0.0
+            if hold > 0:
+                self.log(f"跳过 [{uid8}]：{acc.realm} 区域风控暂停剩余 {int(hold)}s")
+                continue
             # 1. 检查 Token 剩余寿命 (小于 2 小时自动刷新保活)
             exp = acc.expires_at or 0
             if exp and (exp - time.time()) < 7200:
@@ -218,12 +299,31 @@ class Scheduler:
         self.log(f"巡检完成：Token保活 {refreshed_count} 个，国内签到 {checkin_count} 个，活跃上报 {report_count} 个，猫猫日常 {travel_count} 个，国际活跃 {daily_chat_count} 个")
 
     def status(self):
+        # 待触发的模型额度窗口：面板上要能看见「下一次到点是什么时候」，
+        # 否则自动请求是个黑盒。读不到就当作没有，不影响状态接口本身。
+        windows = []
+        try:
+            import wb_window_probe
+            accounts_dir = getattr(self.pool, "dir", "") or ""
+            windows = wb_window_probe.snapshot(accounts_dir)[:10]
+        except Exception:
+            windows = []
+        # 主动查询队列：同样要让 periodicity 可见（下一次查哪个模型、还有多久）。
+        scans = []
+        try:
+            import wb_quota_scan
+            accounts_dir = getattr(self.pool, "dir", "") or ""
+            scans = wb_quota_scan.snapshot(accounts_dir, limit=6)
+        except Exception:
+            scans = []
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫)",
-            "mode_cn": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫)",
-            "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)",
+            "mode": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫) + 模型额度窗口探针",
+            "mode_cn": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫) + 模型额度窗口探针",
+            "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检) + 模型额度窗口探针",
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
+            "windows": windows,
+            "quota_scans": scans,
             "logs": self.logs[-20:],
         }
