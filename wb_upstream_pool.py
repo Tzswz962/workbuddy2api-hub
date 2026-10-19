@@ -90,8 +90,40 @@ def _idle_ttl():
 
 
 _SSL_CONTEXT = None
-_SSL_CONTEXT_FACTORY = None
+_SSL_CONTEXT_KEY = None
 _SSL_CONTEXT_LOCK = threading.Lock()
+
+
+def ca_bundle_path():
+    """Optional PEM bundle for a private or self-signed TLS chain.
+
+    WB_CA_BUNDLE wins over SSL_CERT_FILE. Both are read on every call, so a
+    file that appears after startup is picked up without a restart. A path that
+    was explicitly set but does not exist is a configuration error, not a
+    silent fallback: otherwise every request keeps failing with the same
+    opaque certificate message and the user never learns which file is wrong.
+    """
+    for name in ("WB_CA_BUNDLE", "SSL_CERT_FILE"):
+        raw = os.environ.get(name)
+        if not raw or not str(raw).strip():
+            continue
+        path = os.path.abspath(os.path.expanduser(str(raw).strip()))
+        if os.path.isfile(path):
+            return path
+        if name == "WB_CA_BUNDLE":
+            raise RuntimeError("%s points to a missing file: %s" % (name, path))
+        # OpenSSL silently ignores a missing SSL_CERT_FILE; keep that behaviour
+        # instead of turning an OS-level leftover into a startup failure.
+    return ""
+
+
+# The pooled path builds its own context, but urllib is still used for
+# non-HTTP proxies and redirects. Exporting the bundle through the variable
+# OpenSSL already understands keeps those fallbacks on the same trust set.
+if os.environ.get("WB_CA_BUNDLE"):
+    _ca = ca_bundle_path()
+    if _ca:
+        os.environ["SSL_CERT_FILE"] = _ca
 
 
 def _resolve_ssl_factory():
@@ -131,14 +163,23 @@ def shared_ssl_context():
 
     懒建而不是导入时建：测试与只跑面板的进程根本不出站，不该为它们白付 20ms。
     """
-    global _SSL_CONTEXT, _SSL_CONTEXT_FACTORY
+    global _SSL_CONTEXT, _SSL_CONTEXT_KEY
     ident, build = _resolve_ssl_factory()
-    if _SSL_CONTEXT is None or _SSL_CONTEXT_FACTORY is not ident:
+    key = (ident, ca_bundle_path())
+    if _SSL_CONTEXT is None or _SSL_CONTEXT_KEY != key:
         with _SSL_CONTEXT_LOCK:
             ident, build = _resolve_ssl_factory()
-            if _SSL_CONTEXT is None or _SSL_CONTEXT_FACTORY is not ident:
-                _SSL_CONTEXT = build()
-                _SSL_CONTEXT_FACTORY = ident
+            key = (ident, ca_bundle_path())
+            if _SSL_CONTEXT is None or _SSL_CONTEXT_KEY != key:
+                if key[1]:
+                    # Keep the system roots and add the private bundle on top:
+                    # a gateway that talks to both a normal CDN and a local
+                    # TLS-inspecting proxy must not lose either trust set.
+                    _SSL_CONTEXT = ssl.create_default_context()
+                    _SSL_CONTEXT.load_verify_locations(cafile=key[1])
+                else:
+                    _SSL_CONTEXT = build()
+                _SSL_CONTEXT_KEY = key
     return _SSL_CONTEXT
 
 

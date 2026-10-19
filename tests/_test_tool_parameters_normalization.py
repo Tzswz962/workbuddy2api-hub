@@ -152,5 +152,117 @@ check("int arguments converted to JSON string", res[4]["function"]["arguments"] 
 check("bool arguments converted to JSON string", res[5]["function"]["arguments"] == 'true', res[5]["function"]["arguments"])
 
 print()
+print("[9] Deep recursive normalization: python type aliases mapped to json schema types")
+fn = {
+    "name": "calc",
+    "parameters": {
+        "type": "dict",
+        "properties": {
+            "a": {"type": "int"},
+            "b": {"type": "float"},
+            "c": {"type": "str"},
+            "d": {"type": "bool"},
+            "items": {"type": "list", "items": {"type": "str"}}
+        }
+    }
+}
+P._normalize_tool_parameters(fn)
+p = fn["parameters"]
+check("dict mapped to object", p.get("type") == "object", p)
+check("int mapped to integer", p["properties"]["a"].get("type") == "integer", p)
+check("float mapped to number", p["properties"]["b"].get("type") == "number", p)
+check("str mapped to string", p["properties"]["c"].get("type") == "string", p)
+check("bool mapped to boolean", p["properties"]["d"].get("type") == "boolean", p)
+check("list mapped to array and inner str to string", p["properties"]["items"].get("type") == "array" and p["properties"]["items"]["items"].get("type") == "string", p)
+
+print()
+print("[10] Deep recursive normalization: null description / title / format stripped")
+fn = {
+    "name": "nested_clean",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "top_val": {"type": "string", "description": None, "title": None},
+            "sub": {
+                "type": "object",
+                "properties": {
+                    "inner": {"type": "string", "description": None}
+                }
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string", "description": None}
+            }
+        }
+    }
+}
+P._normalize_tool_parameters(fn)
+p = fn["parameters"]
+check("top_val description stripped", "description" not in p["properties"]["top_val"], p)
+check("top_val title stripped", "title" not in p["properties"]["top_val"], p)
+check("sub.inner description stripped", "description" not in p["properties"]["sub"]["properties"]["inner"], p)
+check("tags items description stripped", "description" not in p["properties"]["tags"]["items"], p)
+
+print()
+print("[11] Tuple items array unpacked into single dictionary")
+fn = {
+    "name": "tuple_tool",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "coords": {
+                "type": "array",
+                "items": [{"type": "number", "description": None}, {"type": "number"}]
+            }
+        }
+    }
+}
+P._normalize_tool_parameters(fn)
+p = fn["parameters"]
+check("items converted to dict", isinstance(p["properties"]["coords"]["items"], dict), p)
+check("items type preserved", p["properties"]["coords"]["items"].get("type") == "number", p)
+check("items inner null description stripped", "description" not in p["properties"]["coords"]["items"], p)
+
+print()
+print("[12] Definitions / $defs and anyOf / oneOf recursively normalized")
+fn = {
+    "name": "defs_tool",
+    "parameters": {
+        "type": "object",
+        "$defs": {
+            "Config": {"type": "dict", "properties": {"timeout": {"type": "int", "description": None}}}
+        },
+        "properties": {
+            "mode": {
+                "anyOf": [
+                    {"type": "str", "description": None},
+                    {"type": "int"}
+                ]
+            }
+        }
+    }
+}
+P._normalize_tool_parameters(fn)
+p = fn["parameters"]
+check("$defs Config type mapped to object", p["$defs"]["Config"].get("type") == "object", p)
+check("$defs timeout type mapped to integer", p["$defs"]["Config"]["properties"]["timeout"].get("type") == "integer", p)
+check("$defs timeout null description stripped", "description" not in p["$defs"]["Config"]["properties"]["timeout"], p)
+check("anyOf branch 0 mapped to string", p["properties"]["mode"]["anyOf"][0].get("type") == "string", p)
+check("anyOf branch 0 null description stripped", "description" not in p["properties"]["mode"]["anyOf"][0], p)
+check("anyOf branch 1 mapped to integer", p["properties"]["mode"]["anyOf"][1].get("type") == "integer", p)
+
+print()
+print("[13] Tools wrapping without type='function'")
+obj = {
+    "tools": [
+        {"name": "bare_tool", "parameters": {"type": "object"}}
+    ]
+}
+P.normalize_tools(obj)
+check("bare_tool wrapped with function", "function" in obj["tools"][0], obj)
+check("bare_tool type set to function", obj["tools"][0].get("type") == "function", obj)
+check("bare_tool parameters normalized", obj["tools"][0]["function"]["parameters"].get("properties") == {}, obj)
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

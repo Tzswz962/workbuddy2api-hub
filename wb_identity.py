@@ -194,6 +194,35 @@ def normalize_product(value):
     return PRODUCT_DESKTOP
 
 
+#: 国内版对话侧上游的默认 base。
+CN_CHAT_BASE_DEFAULT = "https://copilot.tencent.com"
+
+
+def _cn_chat_base_from_env():
+    """读环境变量 WB_CN_CHAT_UPSTREAM（只在导入时读一次，改了要重启）。
+
+    返回 (生效的 base, 被忽略的原始值)。没设或设成空串 = 默认地址，老部署行为不变；
+    不是 http(s) 地址时忽略并回落默认，由启动日志提示（见 wb_proxy main）。
+
+    为什么需要：copilot.tencent.com 从海外出口（如代理软件的全局模式）连接时 TLS 握手
+    会被复位，国内版的对话、刷新 token、模型目录全部失败；www.workbuddy.cn 提供同一套
+    接口且海外可达（官方桌面端当前即以它为 endpoint，VSCode 身分本来也走它）。
+    """
+    raw = (os.environ.get("WB_CN_CHAT_UPSTREAM") or "").strip()
+    if not raw:
+        return CN_CHAT_BASE_DEFAULT, ""
+    base = raw.rstrip("/")
+    scheme, sep, host = base.partition("://")
+    if scheme not in ("http", "https") or not sep or not host:
+        return CN_CHAT_BASE_DEFAULT, raw
+    return base, ""
+
+
+#: 国内版对话侧上游的生效 base；wb_accounts.REALM_CONFIGS["cn"] 与 wb_tasks.CHAT_BASE 都取它。
+CN_CHAT_BASE, CN_CHAT_BASE_IGNORED = _cn_chat_base_from_env()
+
+# 覆盖国内版 base 时 X-Domain（第二项）不跟着改：请求头优先用账号登录时记下的 domain，
+# 这里只是兜底；换的只是"往哪发"。
 _ENDPOINTS = {
     ("intl", PRODUCT_DESKTOP): ("https://www.workbuddy.ai", "www.workbuddy.ai"),
     ("intl", PRODUCT_VSCODE): ("https://www.workbuddy.ai", "www.workbuddy.ai"),
@@ -202,9 +231,9 @@ _ENDPOINTS = {
     # so the international CLI identity rides the workbuddy.ai edge, which
     # accepts CLI headers and answers normally.
     ("intl", PRODUCT_CLI): ("https://www.workbuddy.ai", "www.workbuddy.ai"),
-    ("cn", PRODUCT_DESKTOP): ("https://copilot.tencent.com", "copilot.tencent.com"),
+    ("cn", PRODUCT_DESKTOP): (CN_CHAT_BASE, "copilot.tencent.com"),
     ("cn", PRODUCT_VSCODE): ("https://www.workbuddy.cn", "www.workbuddy.cn"),
-    ("cn", PRODUCT_CLI): ("https://copilot.tencent.com", "copilot.tencent.com"),
+    ("cn", PRODUCT_CLI): (CN_CHAT_BASE, "copilot.tencent.com"),
 }
 
 

@@ -167,6 +167,16 @@ check("result order is preserved",
 check("the intruder is kept, only moved",
       any(m.get("content") == "<image_resize_notice>" for m in fixed))
 
+before_first = [{"role": "user", "content": "go"},
+                assistant_with_calls("c0"),
+                {"role": "developer", "content": "<notice>"},
+                tool_result("c0")]
+fixed_bf, changed_bf = P.repack_tool_result_blocks(copy.deepcopy(before_first))
+check("an intruder before the first result is moved", changed_bf)
+check("the result becomes adjacent in that case too",
+      [m.get("role") for m in fixed_bf[1:4]] == ["assistant", "tool", "developer"],
+      [m.get("role") for m in fixed_bf[1:4]])
+
 adjacent = [{"role": "user", "content": "go"},
             assistant_with_calls("c0"),
             tool_result("c0")]

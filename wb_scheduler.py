@@ -12,13 +12,15 @@ import time
 import random
 import wb_tasks
 import wb_quota_scan
+import wb_settings
 from wb_tasks import do_cat_travel
 
 
 class Scheduler:
     def __init__(self, pool):
         self.pool = pool
-        # 对齐 Sliverkiss/workbuddy2api 官方默认排程 (CST 24小时制)
+        # 默认排程对齐 Sliverkiss/workbuddy2api (CST 24小时制)；实际值从
+        # settings.json 的 schedule 段读取，缺省 / 非法回落这些默认值。
         self.checkin_hours = [9, 21]     # 每日 09:00、21:00 签到
         self.travel_hours = [9, 21]      # 每日 09:00 派出、21:00 领奖闭环
         self.keepalive_hours = [22]      # 每日 22:00 集中 Token 保活检查
@@ -35,6 +37,7 @@ class Scheduler:
         # Guards against overlapping runs: trigger_now() spawns a thread per
         # click, and a manual trigger can also land on top of the hourly job.
         self._run_lock = threading.Lock()
+        self._reload_schedule()
         self._calc_next_fire()
         # Surface task-level failures (dead endpoints, upstream shape changes)
         # in the same log the panel shows.
@@ -84,6 +87,7 @@ class Scheduler:
         self._run_window_probes()
 
         while not self._stop_event.is_set():
+            self._reload_schedule()
             self._calc_next_fire()
             # 每 30 秒检查一次当前整点
             now = time.localtime()
@@ -158,6 +162,35 @@ class Scheduler:
         except Exception:
             pass
         return wait
+
+    def _reload_schedule(self):
+        """Re-read the configurable hours; keep the current grid on failure.
+
+        wb_settings.load() is cached by (path, mtime, size), so calling this
+        every loop tick is a stat, not a parse. A changed grid recomputes the
+        next fire time immediately, which is what makes an edit take effect
+        without restarting the gateway.
+        """
+        directory = getattr(self.pool, "dir", "") or ""
+        if not directory:
+            return False
+        try:
+            hours = wb_settings.schedule_hours(directory)
+        except Exception:
+            return False
+        changed = (hours["checkin"] != self.checkin_hours
+                   or hours["travel"] != self.travel_hours
+                   or hours["keepalive"] != self.keepalive_hours
+                   or hours["cat"] != self.cat_hours)
+        self.checkin_hours = hours["checkin"]
+        self.travel_hours = hours["travel"]
+        self.keepalive_hours = hours["keepalive"]
+        self.cat_hours = hours["cat"]
+        self.all_hours = sorted(set(self.checkin_hours + self.travel_hours
+                                    + self.keepalive_hours + self.cat_hours))
+        if changed:
+            self._calc_next_fire()
+        return changed
 
     def _calc_next_fire(self):
         now = time.localtime()
@@ -316,11 +349,25 @@ class Scheduler:
             scans = wb_quota_scan.snapshot(accounts_dir, limit=6)
         except Exception:
             scans = []
+        self._reload_schedule()
+
+        def _hhmm(hours):
+            return "/".join("%02d:00" % h for h in hours)
+
+        checkin = _hhmm(self.checkin_hours)
+        travel = _hhmm(self.travel_hours)
+        keepalive = _hhmm(self.keepalive_hours)
+        cat = _hhmm(self.cat_hours)
+        mode_cn = ("整点排程 (签到 %s · 猫猫旅行 %s · 每日活跃上报 · "
+                   "Token保活 %s · 夜猫 %s) + 模型额度窗口探针"
+                   % (checkin, travel, keepalive, cat))
+        mode_intl = ("账号 Token 自动保活与凭证常驻 (每日 %s 集中巡检) "
+                     "+ 模型额度窗口探针" % keepalive)
         return {
             "enabled": self.enabled,
-            "mode": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫) + 模型额度窗口探针",
-            "mode_cn": "整点排程 (09:00/21:00 签到旅行 · 每日活跃上报 · 22:00 保活 · 01:00 夜猫) + 模型额度窗口探针",
-            "mode_intl": "账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检) + 模型额度窗口探针",
+            "mode": mode_cn,
+            "mode_cn": mode_cn,
+            "mode_intl": mode_intl,
             "last_run_time": self.last_run_time or "尚未运行",
             "next_run_time": self.next_run_time or "待调度",
             "windows": windows,

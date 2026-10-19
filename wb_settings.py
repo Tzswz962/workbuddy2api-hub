@@ -910,6 +910,83 @@ def set_credits_refresh_hours(accounts_dir, value):
     return hours
 
 
+#: 后台排程时段（CST 24 小时制）。默认值与旧版硬编码完全一致，老安装行为不变。
+DEFAULT_SCHEDULE_HOURS = {
+    "checkin": [9, 21],
+    "travel": [9, 21],
+    "keepalive": [22],
+    "cat": [1],
+}
+SCHEDULE_KEYS = ("checkin", "travel", "keepalive", "cat")
+
+
+def _normalize_hours(value):
+    """Coerce a list / comma string into sorted unique hours 0-23, or None."""
+    if isinstance(value, str):
+        raw = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        raw = list(value)
+    else:
+        return None
+    out = set()
+    for item in raw:
+        if isinstance(item, bool):
+            continue
+        try:
+            hour = int(str(item).strip())
+        except (TypeError, ValueError):
+            continue
+        if 0 <= hour <= 23:
+            out.add(hour)
+    return sorted(out) if out else None
+
+
+def schedule_hours(accounts_dir):
+    """Background schedule hours, falling back per key to the legacy defaults.
+
+    Missing / invalid / out-of-range / empty entries fall back to the default
+    for that key, so a hand-edited settings.json cannot stop the scheduler.
+    Comma-separated strings are accepted like the other settings readers.
+    """
+    raw = load(accounts_dir).get("schedule")
+    if not isinstance(raw, dict):
+        raw = {}
+    out = {}
+    for key in SCHEDULE_KEYS:
+        hours = _normalize_hours(raw.get(key))
+        out[key] = hours if hours is not None else list(DEFAULT_SCHEDULE_HOURS[key])
+    return out
+
+
+def set_schedule_hours(accounts_dir, value):
+    """Persist a partial schedule update; returns the normalized full schedule.
+
+    Unknown keys are ignored. A supplied key must contain at least one valid
+    hour, otherwise ValueError is raised so the caller can return a readable
+    400 instead of storing a schedule that silently does nothing.
+    """
+    if not isinstance(value, dict):
+        raise ValueError("schedule must be an object")
+    with _lock:
+        data = load(accounts_dir)
+        current = data.get("schedule")
+        if not isinstance(current, dict):
+            current = {}
+        merged = {}
+        for key in SCHEDULE_KEYS:
+            if key in value:
+                hours = _normalize_hours(value.get(key))
+                if hours is None:
+                    raise ValueError("schedule.%s must contain hours 0-23" % key)
+                merged[key] = hours
+            else:
+                hours = _normalize_hours(current.get(key))
+                merged[key] = hours if hours is not None else list(DEFAULT_SCHEDULE_HOURS[key])
+        data["schedule"] = merged
+        save(accounts_dir, data)
+    return merged
+
+
 def section_max_height(accounts_dir):
     """Panel window height cap in pixels; 0 means no limit.
 

@@ -309,6 +309,38 @@ button.mini{padding:3px 9px;font-size:11px}
 table.account-cards td[data-label="账号"]{padding-top:6px;padding-bottom:6px}
 table.account-cards td[data-label="账号"] .cool-list{max-width:100%;}
 table.account-cards td[data-label="账号"] .cool-pill{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+/* 冷却 / 达日限额的整行（coolRow / limitRow）：跨满表头列数，文本完整可见，
+   不再有省略号，所以也不再需要 title 兜底。桌面下表格用 table-layout:fixed，
+   td 是普通单元格，只要去掉 ::before 的 data-label 装饰即可；窄屏走
+   data-cards 的 grid，td[colspan] 已跨满 6 栏。
+   这一行是账号行的续行（同一块内容），所以两行之间不能有分割线：
+   ① 这里不画 border-top；② 账号行让出 td 默认的 border-bottom（见 has-alert）。
+   间距也收紧到 1px，让胶囊贴住它所属的账号，而不是飘在下一块区域里；
+   左右留 12px 与首列文字对齐（归零会让胶囊比账号名更靠左，看着歪）。 */
+table.account-cards tr.cool-row td{border-top:none;padding:1px 12px 3px}
+table.account-cards tr.cool-row td::before{content:none}
+/* 有续行的账号行：交出底边框，否则 th,td 的默认 border-bottom 会在账号行与
+   胶囊行之间留一条实线，把同一块内容切成两块。 */
+table.account-cards tr.has-alert td{border-bottom:none}
+/* 悬停账号行时续行一起亮：视觉上它们是一块，不该只有上半截响应鼠标。
+   用相邻选择器而不是 ~：~ 会一路匹配到后面别的账号的续行，鼠标停在 A 号上
+   却把 B 号的胶囊也点亮。续行最多两条（冷却 + 达限），所以写两段就够。 */
+table.account-cards tr.has-alert:hover + tr.cool-row,
+table.account-cards tr.has-alert:hover + tr.cool-row + tr.cool-row{background:var(--panel2)}
+/* 整行放得下完整文案，胶囊恢复成自然宽度、不再截断。 */
+table.account-cards tr.cool-row .cool-list{flex-direction:row;flex-wrap:wrap;gap:4px 8px;max-width:none}
+table.account-cards tr.cool-row .cool-pill{display:inline-block;width:auto;max-width:none;overflow:visible;text-overflow:clip;white-space:nowrap;cursor:default}
+@media (max-width:640px){
+  /* 窄屏每个 tr 是一张独立卡片（border + 圆角 + 10px 外边距）。续行要跟账号
+     卡片拼成一块：负 margin 抵消上一张的 margin-bottom 并让边框重叠，自己只
+     留底部圆角、去掉上边框，就不会出现「两张卡片叠在一起」的割裂感。 */
+  table.account-cards tr.cool-row{margin-top:-11px;border-top:none;
+    border-radius:0 0 12px 12px;padding-top:8px;padding-bottom:8px}
+  table.account-cards tr.has-alert{margin-bottom:10px;border-bottom:none;
+    border-radius:12px 12px 0 0}
+  /* 窄屏 6 栏也够放一条，但一条放不下时允许换行而不是横向溢出卡片。 */
+  table.account-cards tr.cool-row .cool-pill{white-space:normal}
+}
 
 .acct-actions-col{display:flex;flex-direction:column;gap:5px;align-items:center;justify-content:center}
 .acct-actions-row{display:flex;gap:4px;justify-content:center}
@@ -665,6 +697,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   table.limits-cards td.limit-name{display:block;padding-bottom:6px}
   table.data-cards td[colspan]{grid-column:span 6;justify-content:center;text-align:center!important}
   table.data-cards td[colspan]::before{content:none}
+  /* 冷却 / 达限整行走左对齐：它属于账号卡片的一部分，跟账号名对齐才像同一块
+     内容；居中会让它看起来是表格的一条汇总横幅。 */
+  table.account-cards tr.cool-row td{justify-content:flex-start;text-align:left!important}
   /* Account card: grouped layout */
   table.account-cards td:nth-child(1){order:1;grid-column:span 3;justify-content:flex-start}
   table.account-cards td:nth-child(1)::before,
@@ -1547,6 +1582,12 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '国内版 (China) · copilot.tencent.com': 'China · copilot.tencent.com',
     '国内版成长任务与日常福利': 'China growth tasks and daily perks',
     '国内版任务与福利': 'China tasks and perks',
+    // 页签名与区块标题：词级词典缺了「福利」，整体只能拼出「Taskand福利」。
+    '任务与福利': 'Tasks & rewards',
+    '国际版每日活跃福利': 'Daily activity rewards (Global)',
+    '已获取福利总积分': 'Total reward credits earned',
+    '每日活跃打卡、Buddy 加油站、成长任务与福利积分总览。': 'Daily check-in, Buddy refuel and an overview of growth tasks plus reward credits.',
+    '福利': 'rewards',
     '国内版签到': 'China check-in',
     '国家未知': 'Country unknown',
     '国际版': 'Global',
@@ -1565,6 +1606,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '复制登录链接': 'Copy sign-in link',
     '复制当前视图显示的日志': 'Copy the log lines shown in the current view',
     '多个账号按会话粘性 + 轮询使用；某个账号被上游拒绝时自动切到下一个': 'Accounts are used with session stickiness plus round-robin; when one is rejected upstream it switches to the next',
+    '天有活动': 'days active',
     '天': 'days',
     '天 (即将到期)': 'days (expiring soon)',
     '天)': 'days)',
@@ -1811,6 +1853,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '暂无账号用量数据': 'No account usage data yet',
     '暂无数据（需要账号先有用量或撞线记录）': 'No data yet (needs usage or a cap on record)',
     '暂无预算样本：等某个账号把某个模型的窗口用满（撞线）后自动出现。': 'No budget samples yet: they appear once an account fills a model\'s window (hits the cap).',
+    '撞线样本': 'Cap samples',
+    '逐个窗口的原始值（先按账号，再跨账号汇总）': 'Raw values per window (averaged per account first, then across accounts)',
+    '复制为征集格式': 'Copy as collection format',
+    '暂无撞线样本。': 'No cap samples yet.',
     '更新时间:': 'Updated:',
     '更新时间: -': 'Updated: -',
     '最低保留积分': 'Minimum reserved credits',
@@ -1835,6 +1881,16 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '点击添加备注，比如「批量」/「自用」': 'Click to add a note, e.g. "batch" / "personal"',
     '最近将过期': 'Expiring soonest',
     '最近请求': 'Recent requests',
+    // 数据看板（B 版）的区块标题与指标名：此前整条回落中文，实测 en 界面残留。
+    'Token 时序': 'Token timeline',
+    '工作回溯': 'Activity lookback',
+    '吞吐量': 'Throughput',
+    '峰值吞吐': 'Peak throughput',
+    '实时活动流': 'Live activity stream',
+    '近一年每日活动': 'Daily activity over the last year',
+    '用量明细': 'Usage detail',
+    '积分扣减历史': 'Credit deduction history',
+    '模型性能分位': 'Model performance percentiles',
     '有': '',
     '有剩余': 'Left',
     '有效期': 'Valid until',
@@ -1863,6 +1919,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '本周请求数': 'Requests this week',
     '本地网络工具': 'Local web tools',
     '更新': 'Update',
+    // 「更新于 HH:MM:SS」是 B 版页头的动态拼接串，只有「更新」有词条会拼出「Update于」。
+    '更新于': 'Updated at',
     '立即检查更新': 'Check now',
     '安装更新': 'Install update',
     '网关检查自有 GitHub Release。发现稳定版后可手动安装；安装会短暂重启网关，账号与用量数据会保留。': 'The gateway checks its configured GitHub Releases. Stable updates can be installed manually; installation briefly restarts the gateway and preserves accounts and usage data.',
@@ -1937,6 +1995,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '模型能力': 'Capabilities',
     '模型限制': 'Model restriction',
     '模式': 'Mode',
+    // 「N 次请求」是页头/热力图/模型表的动态拼接串：只有「次」「请求」两个单词条时
+    // 会拼成「N callsRequests」，短语条目靠长度降序先命中。
+    '次请求': 'requests',
     '次': 'calls',
     '次 ·': 'calls ·',
     '次异常拦截': 'errors blocked',
@@ -2209,11 +2270,30 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     // 所以片段键必须带前后空格，避免误命中其它文案。
     ' · 撞线 ': ' · hit at ',
     ' · 恢复 ': ' · back at ',
+    ' · 恢复时刻 ': ' · back at ',
+    // 模型冷却 / 达日限额的整行胶囊（coolRow / limitRow）：胶囊现在是**可见文本**
+    // （不再是 title），所以这些片段会被 i18n 的文本节点路径翻译，条目必须齐。
+    // 缺一条的后果不只是漏译：逐字/逐片段硬拼会出「TodayUsed」「上cap」这种
+    // 半英半中的怪译文（实测过），所以每个片段都要逐条核对。
+    ' 今日已用 ': ' used today ',
+    ' / 上限 ': ' / cap ',
+    ' token 已达限额（本地 0 点恢复）': ' token, which reaches the daily limit (resets at local midnight)',
+    '（时间为本地时间）': '(times are local)',
+    // 胶囊的悬停提示（TIP_COOL_HIT / TIP_COOL_PLAIN / TIP_LIMIT）：只讲可见文本
+    // 没说的「原因 + 影响范围」，不重复模型名与时刻。整句键——这三条是常量、
+    // 不含动态值，所以能精确命中，不必像上面的片段那样带前后空格。
+    '上游判定该模型额度用满（code 6004）；仅此模型受限，同账号其他模型照常接单':
+      "The upstream declared this model's quota exhausted (code 6004); only this model is restricted, the account's other models still take traffic",
+    '上游临时限流（429），到点自动恢复；仅此模型受限，同账号其他模型照常接单':
+      "Temporarily rate-limited upstream (429) and it recovers on its own; only this model is restricted, the account's other models still take traffic",
+    '该模型今日 token 用量达到「按模型每日 Token 限额」；仅此模型受限，同账号其他模型照常接单':
+      'This model reached the daily token limit set by "Daily token limit per model"; only this model is restricted, the account\'s other models still take traffic',
+    // 「禁用的模型」行的悬停提示：只留操作提示（名单已在可见文本里换行显示）。
+    '点击编辑该账号禁用的模型（逗号分隔；留空 = 不限制）':
+      'Click to edit the models disabled for this account (comma separated; empty = no restriction)',
     // 禁用总览的「开始时间」列：模型级限流两类都有真实起始时刻（6004 撞线 /
     // 临时 429 限流），列头用中性措辞，两类性质由「原因」列区分。
     '开始时间': 'Started',
-    '该账号仅此模型受限（上游判定额度用满）；撞线时间与恢复时间均为本地时间': 'only this model is restricted for this account (the upstream declared its quota exhausted); cap and reset times are local',
-    '该账号仅此模型受限；时间为本地时间': 'only this model is restricted for this account; times are local',
     '该账号属于': 'This account belongs to the',
     '说明': 'Description',
     '请先登录或导入一个': 'Sign in or import a',
@@ -2421,11 +2501,26 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   };
   var HANT_PHRASES = {
     " · 周期已过": " · 週期已過",
-    // 撞线（6004）相关：pill 的动态片段 + 禁用总览的列头 + pill 悬停标题。
+    // 撞线（6004）相关：pill 的动态片段 + 禁用总览的列头。
     " · 撞线 ": " · 撞線 ",
     " · 恢复 ": " · 恢復 ",
+    " · 恢复时刻 ": " · 恢復時刻 ",
+    " （时间为本地时间）": " （時間為本地時間）",
+    "（时间为本地时间）": "（時間為本地時間）",
     "开始时间": "開始時間",
-    "该账号仅此模型受限（上游判定额度用满）；撞线时间与恢复时间均为本地时间": "該帳號僅此模型受限（上游判定額度用滿）；撞線時間與恢復時間均為本地時間",
+    " token 已达限额（本地 0 点恢复）": " token 已達限額（本地 0 點恢復）",
+    " · 今日已用 ": " · 今日已用 ",
+    " / 上限 ": " / 上限 ",
+    // 胶囊的悬停提示（TIP_COOL_HIT / TIP_COOL_PLAIN / TIP_LIMIT）：整句条目，
+    // 逐字转换会把「账」转成「賬」，站内惯用「帳號」，所以必须整句覆盖。
+    "上游判定该模型额度用满（code 6004）；仅此模型受限，同账号其他模型照常接单":
+      "上游判定該模型額度用滿（code 6004）；僅此模型受限，同帳號其他模型照常接單",
+    "上游临时限流（429），到点自动恢复；仅此模型受限，同账号其他模型照常接单":
+      "上游臨時限流（429），到點自動恢復；僅此模型受限，同帳號其他模型照常接單",
+    "该模型今日 token 用量达到「按模型每日 Token 限额」；仅此模型受限，同账号其他模型照常接单":
+      "該模型今日 token 用量達到「按模型每日 Token 限額」；僅此模型受限，同帳號其他模型照常接單",
+    "点击编辑该账号禁用的模型（逗号分隔；留空 = 不限制）":
+      "點擊編輯該帳號停用的模型（逗號分隔；留空 = 不限制）",
     " 个未绑定账号分配代理出口": " 個未繫結帳號分配代理出口",
     " 个槽位，记得点「保存槽位」": " 個槽位，記得點「儲存槽位」",
     " 个账号 → ": " 個帳號 → ",
@@ -2844,7 +2939,6 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "该模型暂无定价数据": "該模型暫無定價資料",
     "该模型被上游临时限流（429），仅此模型受限，到点自动恢复": "該模型被上游臨時限流（429），僅此模型受限，到點自動恢復",
     "该模型配额耗尽（code 6004），同账号其他模型不受影响": "該模型配額耗盡（code 6004），同帳號其他模型不受影響",
-    "该账号仅此模型受限；时间为本地时间": "該帳號僅此模型受限；時間為本地時間",
     "该账号属于": "該帳號屬於",
     "请先登录或导入一个": "請先登入或匯入一個",
     "请先登录或导入一个 ": "請先登入或匯入一個 ",
@@ -2893,6 +2987,10 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "点击编辑备注": "點擊編輯備註",
     "点击添加备注，比如「批量」/「自用」": "點擊新增備註，例如「批量」/「自用」",
     "按「剩余用量估算」优先调度：某 (账号 × 模型) 的估计剩余越接近耗尽，分到的请求越多——先把快用完的额度用掉，等它到点重置。剩余不到 30% 开始加权、5% 以内权重最高；没有预算样本、或剩余为 0 / 冷却中的组合不参与。默认关闭。": "按「剩餘用量估算」優先排程：某 (帳號 × 模型) 的估計剩餘越接近耗盡，分到的請求越多——先把快用完的額度用掉，等它到點重置。剩餘不到 30% 開始加權、5% 以內權重最高；沒有預算樣本、或剩餘為 0 / 冷卻中的組合不參與。預設關閉。",
+    "撞线样本": "撞線樣本",
+    "逐个窗口的原始值（先按账号，再跨账号汇总）": "逐個視窗的原始值（先按帳號，再跨帳號彙總）",
+    "复制为征集格式": "複製為徵集格式",
+    "暂无撞线样本。": "暫無撞線樣本。",
     "注意：估算由撞线样本反推的预算与本地用量得出，本身有误差；开启后接近耗尽的账号会明显多接流量，也可能更早撞到上游限额（撞线后该模型停用到上游给出的恢复时刻）。": "注意：估算由撞線樣本反推的預算與本地用量得出，本身有誤差；開啟後接近耗盡的帳號會明顯多接流量，也可能更早撞到上游限額（撞線後該模型停用到上游給出的恢復時刻）。",
     "启用优先调度": "啟用優先排程",
     "已启用：剩余用量接近耗尽的组合优先调度": "已啟用：剩餘用量接近耗盡的組合優先排程",
@@ -4160,6 +4258,13 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
               <tbody id="remainingTbodyCn"></tbody>
             </table>
           </div>
+        </div>
+        <div id="remainingSamplesBlock" style="margin-top:18px">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+            <div><b>撞线样本</b><span style="font-size:12px;color:var(--dim);margin-left:6px">逐个窗口的原始值（先按账号，再跨账号汇总）</span></div>
+            <button class="sec mini" onclick="copyRemainingSamples()">复制为征集格式</button>
+          </div>
+          <div id="remainingSamplesBody" style="font-size:12px;color:var(--dim)">暂无撞线样本。</div>
         </div>
       </div>
       </div>
@@ -6941,34 +7046,54 @@ function fmtLeft(seconds){
   if(m < 60) return m + 'm';
   return Math.floor(m / 60) + 'h' + String(m % 60).padStart(2, '0') + 'm';
 }
-function coolPills(a){
+// 模型冷却 / 达日限额的胶囊：从账号列里拆出来，单独占一整行（colspan 跨满表头
+// 列数），文本完整可见、不再被 180px 的账号列切掉。
+//
+// 胶囊的悬停提示只补「可见文本没说的部分」——原因与影响范围。模型名、撞线 /
+// 恢复时刻、本地时间口径都已经画在胶囊上了，再塞进 title 就是同一句话说两遍
+// （第一版就是那样：悬停里一半是重复内容，用户明确要求去掉）。
+// 用整句常量而不是拼动态值：title 在 i18n 的 ATTRS 里，整句才能被 DICT 精确
+// 命中；一旦拼进模型名与时间戳，整串命不中键，只剩逐片段匹配，容易漏译。
+const TIP_COOL_HIT = '上游判定该模型额度用满（code 6004）；仅此模型受限，同账号其他模型照常接单';
+const TIP_COOL_PLAIN = '上游临时限流（429），到点自动恢复；仅此模型受限，同账号其他模型照常接单';
+const TIP_LIMIT = '该模型今日 token 用量达到「按模型每日 Token 限额」；仅此模型受限，同账号其他模型照常接单';
+const COOL_ROW_COLS = 11;   // 与 accounts 表头的列数一致
+function coolRow(a){
   const list = a && Array.isArray(a.modelCooldowns) ? a.modelCooldowns : [];
   const pills = list.map(c => {
     const at = c && fmtCoolAt(c.expiresAt);
     if(!at) return '';
-    // 撞过线（上游 code 6004）的模型带 cappedAt：把撞线时间一并画出来，
+    // 撞过线（上游 code 6004）的模型带 cappedAt：把撞线时间一并写出来，
     // 两段时间配合就能看出这是窗口配额用满，而不是一次临时限流。
     const hit = c && fmtCoolAt(c.cappedAt);
     return hit
-      ? '<span class="cool-pill" title="该账号仅此模型受限（上游判定额度用满）；撞线时间与恢复时间均为本地时间">'
-        + esc(c.model) + ' · 撞线 ' + hit + ' · 恢复 ' + at + '</span>'
-      : '<span class="cool-pill" title="该账号仅此模型受限；时间为本地时间">'
-        + esc(c.model) + ' · ' + at + ' 恢复</span>';
+      ? '<span class="cool-pill" title="' + esc(TIP_COOL_HIT) + '">'
+        + esc(c.model) + ' · 撞线 ' + hit + ' · 恢复 ' + at + '（时间为本地时间）</span>'
+      // 这一支的措辞刻意与 6004 那支错开：用「恢复时刻」而不是「恢复」。因为
+      // DICT 里已有一条 ' 恢复': ''（给「剩余用量」的「），额度 X 恢复」用，
+      // 那边整词要并进 returns at），胶囊若也用「X 恢复」，英文会被那段规则
+      // 先手吃掉，变成「18:04(times are local)」——「back」整个丢了。
+      : '<span class="cool-pill" title="' + esc(TIP_COOL_PLAIN) + '">'
+        + esc(c.model) + ' · 恢复时刻 ' + at + '（时间为本地时间）</span>';
   }).filter(Boolean);
-  return pills.length ? '<div class="cool-list">' + pills.join('') + '</div>' : '';
+  if(!pills.length) return '';
+  return '<tr class="cool-row"><td colspan="' + COOL_ROW_COLS + '">'
+    + '<div class="cool-list">' + pills.join('') + '</div></td></tr>';
 }
 
-// 按模型达日限额的模型清单（与冷却并列展示）：只影响列出的模型，其他模型照常。
-function modelLimitPills(a){
+// 按模型达日限额的清单（与冷却同一行承载）：只影响列出的模型，其他模型照常。
+function limitRow(a){
   const limit = Number(a.modelDailyTokenLimit || 0);
   if(limit <= 0 || !a.modelDailyTokens) return '';
   const hit = Object.entries(a.modelDailyTokens)
     .filter(([mid, v]) => Number(v) >= limit);
   if(!hit.length) return '';
-  return '<div class="cool-list">' + hit.map(([mid, v]) =>
-    '<span class="cool-pill" title="该模型今日已达限额，仅此模型受限（本地 0 点恢复）">'
-      + esc(mid) + ' · ' + fmt(v) + ' tok 达限</span>'
-  ).join('') + '</div>';
+  return '<tr class="cool-row"><td colspan="' + COOL_ROW_COLS + '">'
+    + '<div class="cool-list">' + hit.map(([mid, v]) =>
+        '<span class="cool-pill" title="' + esc(TIP_LIMIT) + '">'
+        + esc(mid) + ' · 今日已用 ' + fmt(v)
+        + ' / 上限 ' + fmt(limit) + ' token 已达限额（本地 0 点恢复）</span>'
+      ).join('') + '</div></td></tr>';
 }
 
 // ---- 每日活动（国内签到 / 国际活跃）------------------------------------
@@ -7293,8 +7418,9 @@ function accountRow(a){
               : a.inCooldown ? '<span class="badge warn"' + (Number(a.softStreak || 0) > 1 ? ' title="连续软限流 ' + Number(a.softStreak) + ' 次，冷却时间按 2 倍递增"' : '') + '>冷却 ' + (a.cooldownFor||0) + 's</span>'
               : a.expiresIn === 'expired' ? '<span class="badge bad">已过期</span>'
               : '<span class="badge ok">可用</span>';
-  const pills = coolPills(a);
-  const limitPills = modelLimitPills(a);
+  // 模型冷却 / 达日限额的胶囊不放在账号列里：那里只有 180px，长模型名必然被
+  // 省略号切掉。它们改成账号行之后紧跟的一整行（coolRow / limitRow）在
+  // </tr> 之后输出，宽度够把话说全。
   // The visible label keeps the exact truncation it had before; the tooltip carries
   // the whole upstream body (lastErrorDetail) so a 429 reason is readable on hover
   // without widening the card.
@@ -7306,7 +7432,9 @@ function accountRow(a){
   // 拉宽、也读不出重点。
   const errFull = a.lastErrorDetail || a.lastError || '';
   let err = '';
-  if (a.lastError && !(pills && a.lastError === 'HTTP 429 (model throttled)')) {
+  // 模型级 429（6004）由 coolRow 画「撞线 / 恢复」；lastError 只是那次的
+  // 历史记录，冷却到期后也不能把旧记录再画成账号级错误（#454）。
+  if (a.lastError && a.lastError !== 'HTTP 429 (model throttled)') {
     const httpM = String(a.lastError).match(/HTTP\s+(\d{3})/);
     const codeM = String(errFull).match(/"code"\s*:\s*(\d+)/);
     const label = httpM
@@ -7349,7 +7477,12 @@ function accountRow(a){
   if(weight > 10) weightOpts += '<option value="' + weight + '" selected>' + weight + '</option>';
   // 人工禁用的模型名单（账号级黑名单，与自动冷却无关）
   const deny = (a.disabledModels || []);
-  return '<tr>'
+  // 冷却 / 达日限额的胶囊紧跟本账号行另起一整行：账号列只有 180px，长模型名
+  // 在那里必然被省略号切掉，整行才放得下完整文本。colspan 跨满表头列数，
+  // 所以桌面与窄屏（grid 下 td[colspan] 已跨满 6 栏）都不用再各自的宽度。
+  // 有续行时给账号行打 has-alert：两行是同一块内容，中间不该有分割线（见 CSS）。
+  const alertRows = coolRow(a) + limitRow(a);
+  return '<tr' + (alertRows ? ' class="has-alert"' : '') + '>'
     + '<td style="text-align:center;white-space:nowrap" data-label="版本">' + realmBadge + '</td>'
     + '<td style="text-align:left" data-label="账号">'
     // 账号名（大一号）+ 备注 chip 同一行；备注从独立一行收进账号后面。
@@ -7366,9 +7499,11 @@ function accountRow(a){
     +     (a.machineId ? ' · <span data-tip="设备码：' + esc(String(a.machineId)) + '（由账号 UID 稳定派生的专属设备码，防多号关联风控）">设备码:' + esc(String(a.machineId).slice(0, 4)) + '…</span>' : '')
     +   '</div>'
     + (deny.length
-        ? '<div style="font-size:11px;color:var(--warn);margin-top:2px;cursor:pointer" title="点击编辑该账号禁用的模型（逗号分隔；留空 = 不限制）" onclick="editAccountDisabledModels(&quot;' + uidAttr + '&quot;)">禁用的模型: ' + esc(deny.join(', ')) + '</div>'
+        // 这一行的可见文本没有 ellipsis，名单再长也会换行显示完整，所以悬停里
+        // 只留「点击能干什么」，不再把名单重复一遍（重复即噪音）。
+        ? '<div style="font-size:11px;color:var(--warn);margin-top:2px;cursor:pointer" title="' + esc('点击编辑该账号禁用的模型（逗号分隔；留空 = 不限制）') + '" onclick="editAccountDisabledModels(&quot;' + uidAttr + '&quot;)">禁用的模型: ' + esc(deny.join(', ')) + '</div>'
         : '<div style="font-size:10px;color:var(--dim);margin-top:2px;cursor:pointer;opacity:.7" title="点击设置该账号禁用的模型：命中的模型不再派给这个号，池子里其他号照常接单" onclick="editAccountDisabledModels(&quot;' + uidAttr + '&quot;)">+ 禁用模型</div>')
-    + err + pills + limitPills + '</td>'
+    + err + '</td>'
     + '<td style="text-align:center" data-label="状态">' + state + '</td>'
     + '<td style="text-align:center" data-label="今日活动">' + activityStatusChip(a) + '</td>'
     + '<td style="text-align:center" data-label="出口">' + slotSelectHtml(a) + '</td>'
@@ -7399,7 +7534,8 @@ function accountRow(a){
     +     '<button class="danger mini" onclick="deleteAccount(&quot;' + uidAttr + '&quot;,&quot;' + nameAttr + '&quot;, this)">删除</button>'
     +   '</div>'
     + '</div>'
-    + '</td></tr>';
+    + '</td></tr>'
+    + alertRows;
 }
 
 // 悬停气泡（全局单例）。用自定义 DOM 而不是原生 title：原生 tooltip 由浏览器
@@ -13561,8 +13697,48 @@ const emptyRow = '<tr><td colspan="6" style="text-align:center;color:var(--dim)"
         + '</tr>';
     }).join('');
   });
+  const sampleBody = document.getElementById('remainingSamplesBody');
+  if(sampleBody){
+    const groups = budgets.filter(b => Array.isArray(b.samples_list) && b.samples_list.length);
+    if(!groups.length){
+      sampleBody.textContent = '暂无撞线样本。';
+    } else {
+      sampleBody.innerHTML = groups.map(b => {
+        const rows = b.samples_list.map(s =>
+          '<div style="margin-left:12px">'
+          + esc((s.at_iso || '').slice(5, 16)) + ' · '
+          + esc((s.account || '').slice(0, 8)) + ' · '
+          + fmtTok(s.sample) + ' tok</div>').join('');
+        return '<div style="margin:6px 0"><b>'
+          + esc(b.realm === 'cn' ? '国内版' : '国际版') + ' / ' + esc(b.model)
+          + '</b> <span style="color:var(--dim)">n=' + b.n
+          + ' · ' + fmtTok(b.min) + ' ~ ' + fmtTok(b.max) + '</span>'
+          + rows + '</div>';
+      }).join('');
+    }
+  }
     applyTableSort('remainingUsageTableIntl');
     applyTableSort('remainingUsageTableCn');
+}
+
+function remainingSamplesText(){
+  const budgets = (lastRemainingData && lastRemainingData.budgets) || [];
+  const lines = [];
+  budgets.forEach(b => {
+    const rows = b.samples_list || [];
+    if(!rows.length) return;
+    const vals = rows.map(s => fmtTok(s.sample)).join(' / ');
+    lines.push((b.realm === 'cn' ? '国内版' : '国际版') + ' / ' + b.model + ' / ' + vals);
+  });
+  return lines.join('\n');
+}
+
+function copyRemainingSamples(){
+  const text = remainingSamplesText();
+  if(!text){ toast('暂无撞线样本', 'warn'); return; }
+  writeClipboard(text).then(() => {
+    toast('已复制 ' + text.split('\n').length + ' 组样本', 'ok');
+  }).catch(e => toast('复制失败: ' + e.message, 'bad'));
 }
 
 function loadUsageSeries(){
@@ -14102,8 +14278,10 @@ const state = {
 let prevSummary = null; /* B 版：上一等长周期汇总（环比） */
 
 /* ---------- B 版：环比 / sparkline / 环形卡 / 活动流 ---------- */
-function prevRange(){
-  const now = Math.floor(Date.now() / 1000);
+function prevRange(untilAt){
+  // 环比窗口的上界同样来自调用方：轮询时与 rangeParams 共用同一个量化时刻，
+  // 否则 /usage/timeseries?…&until=… 这一条照样每轮都换 URL。
+  const now = (untilAt === undefined || untilAt === null) ? Math.floor(Date.now() / 1000) : untilAt;
   if (state.range === 'today'){
     const d = new Date(); d.setHours(0,0,0,0);
     const startToday = Math.floor(d.getTime() / 1000);
@@ -14128,8 +14306,8 @@ function prevRange(){
   if (state.range === 'd30') return [now - 60 * 86400, now - 30 * 86400];
   return null;
 }
-async function loadPrevSummary(){
-  const pr = prevRange();
+async function loadPrevSummary(untilAt){
+  const pr = prevRange(untilAt);
   if (!pr) return null;
   try{
     const p = await api(`/usage/timeseries?realm=all&range=custom&since=${pr[0]}&until=${pr[1]}`);
@@ -14209,8 +14387,19 @@ async function loadRecent(){
   }catch(e){ console.error('recent failed', e); }
 }
 
-function rangeParams(range){
-  const now = Math.floor(Date.now() / 1000);
+/* 轮询类请求的窗口上界量化：服务端 _json_cached 只在「调用前后的缓存条目一模一样」
+ * 时才发 ETag（wb_proxy.py:16872），而缓存键里含 until。until 每轮都取 now()，
+ * 缓存键每轮都是新的 → before 永远是 None → 304 一次都命不中外加整份重传。
+ * 量化到服务端聚合缓存自己的 TTL（wb_proxy.py:1778 _STATS_TTL = 15s）：同一个 15 秒
+ * 桶内 URL 逐字相同，第 2、3 轮直接吃 304；代价是最多 15 秒的新鲜度延迟。
+ * 只有轮询走这条（loadRange(true)），用户手点区间仍用精确 now。 */
+const POLL_UNTIL_BUCKET = 15;
+function pollUntil(){
+  return Math.floor(Math.floor(Date.now() / 1000) / POLL_UNTIL_BUCKET) * POLL_UNTIL_BUCKET;
+}
+function rangeParams(range, untilAt){
+  // since 必须和 until 用同一个时间点推导，否则 since 仍在逐秒变化，URL 照样每轮都新。
+  const now = (untilAt === undefined || untilAt === null) ? Math.floor(Date.now() / 1000) : untilAt;
   if (range === 'd3')  return `range=custom&since=${now - 3*86400}&until=${now}`;
   if (range === 'd30') return `range=custom&since=${now - 30*86400}&until=${now}`;
   if (range === 'all') return `range=custom&since=${now - 365*86400}&until=${now}`;
@@ -14234,19 +14423,27 @@ if(typeof MutationObserver !== 'undefined'){
 /* ============================================================
    加载与渲染
    ============================================================ */
-async function loadRange(){
+/* 区间/轮询的代次。与 refreshInner 里 REFRESH_GEN 同一套理由：取数期间又发起了更新
+ * 的一轮（刚切了区间、或轮询撞上点击），这批结果已经过期，直接丢掉——否则慢的那一轮
+ * 晚到，会把上一个区间的数字画到新区间的标题下面（实测有 1.2~1.8 秒的错位窗口）。 */
+let WBA_GEN = 0;
+async function loadRange(polled){
+  const gen = ++WBA_GEN;
+  const untilAt = polled ? pollUntil() : null;
   $('kpis').style.opacity = .55;
-  const rp = rangeParams(state.range);
+  const rp = rangeParams(state.range, untilAt);
   try{
     const [analytics, series, prev] = await Promise.all([
       api(`/usage/analytics?realm=all&${rp}`),
       api(`/usage/timeseries?realm=all&${rp}`),
-      loadPrevSummary(),
+      loadPrevSummary(untilAt),
     ]);
+    if (gen !== WBA_GEN) return;
     state.analytics = analytics;
     state.series = series;
     prevSummary = prev;
   } catch(e){
+    if (gen !== WBA_GEN) return;
     console.error('load range failed', e);
   }
   $('kpis').style.opacity = 1;
@@ -14464,11 +14661,16 @@ function drawSeries(){
   // hover
   cv.onmousemove = ev => {
     if (!seriesLayout) return;
+    // 空数据（今日还没有请求 / 新装实例）时 series.length 是 0，而下面那行的夹取是
+    // Math.max(0, Math.min(n - 1, idx))：n-1 = -1 会被 Math.max 拉回 0，于是
+    // series[0] 是 undefined，B 版气泡里的 b.at 直接抛 TypeError。没有点就收起返回。
+    if (!series.length) { tip.style.opacity = 0; return; }
     const rect = cv.getBoundingClientRect();
     const mx = ev.clientX - rect.left;
     let idx = Math.round((mx - padL) / gap - .5);
-    idx = Math.max(0, Math.min(n - 1, idx));
+    idx = Math.max(0, Math.min(series.length - 1, idx));
     const b = series[idx];
+    if (!b) return;
     tip.style.opacity = 1;
     tip.style.left = Math.min(window.innerWidth - 200, ev.clientX + 14) + 'px';
     tip.style.top = Math.max(8, ev.clientY - 46) + 'px';
@@ -14843,6 +15045,9 @@ $('rangeSeg').addEventListener('click', ev => {
   const btn = ev.target.closest('button'); if (!btn) return;
   [...$('rangeSeg').children].forEach(b => b.classList.toggle('on', b === btn));
   state.range = btn.dataset.range;
+  // 新区间的数字还没到：先把页头的旧读数清成占位，别让「全部」标题下面继续挂着本月的
+  // 数字（那一段是页头最长的一行，误读代价最大）。取回后 renderKpis() 会重新写满。
+  $('pageSub').textContent = '—';
   loadRange();
 });
 $('metricSeg').addEventListener('click', ev => {
@@ -14939,7 +15144,7 @@ function syncOldRange(){
 let wbaStarted = false;
 function wbaTick(){
   if (!wbaStarted){ wbaStarted = true; loadStatic(); }
-  loadRange();
+  loadRange(true);   // 轮询：窗口上界按 15 秒桶量化，连续两轮同桶才有可能吃 304
 }
 window.loadAnalytics = wbaTick;            /* 面板 5s 轮询 / 切页 / 回前台统一入口 */
 window.loadAnalyticsMatrix = function(){}; /* 旧性能矩阵已并入本页（性能分位折叠区） */
