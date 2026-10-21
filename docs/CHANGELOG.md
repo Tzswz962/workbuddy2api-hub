@@ -1,3 +1,22 @@
+## v1.7.24
+
+非 systemd 部署的面板一键更新通道（#561）：`install_enabled()` 不再只认 systemd unit；部署方可以用外部执行者轮询 `request.json`，网关仍只写请求、不碰自己的代码。套件 205 个（153 Python + 52 JS）。
+
+- **外部执行者通道**（#561）：`WB_UPDATE_INSTALL_ENABLED=1` + `WB_UPDATE_REQUEST_DIR` + `WB_UPDATE_EXECUTOR=external`（或目录里的 `executor.json`）即可让面板「安装更新」按钮可用；systemd 路径不变。
+- **`request.json` 扩展**：除 `tag` / `version` / `requested_at` 外，新增 `pid` / `port` / `root`，供外部执行者停进程、探针和替换目录；systemd 执行者忽略额外字段。
+- **参考执行者** `wb_update_external.py`：读取并校验 request（属主 / 权限 / 大小，读完即删），下载 release zip + `SHA256SUMS`，校验后按 manifest 备份 / 替换，停止网关，等 supervisor 拉起，探针 `/health`，失败回滚；启动时如果发现上次状态仍是 `applying` 等活跃状态且有备份，会先自动回滚（供 pre-start hook 使用）。
+- **边界**：只替换 manifest 的 `files`，`accounts/` / `usage/` 不动；应用目录不可写会在下载前报「应用目录不可写」；不替换内置 `python/`。
+- **测试**：`tests/_test_portable_update.py` 扩到 16 项，覆盖外部通道注册、`request.json` 字段、执行者读取 / 删除、无 start 重启模式、半途更新恢复。
+
+## v1.7.23
+
+Windows 便携版支持面板一键更新（#560）：不再要求 systemd unit；面板检测到新版本后，由独立 helper 下载 zip、校验 SHA256SUMS、停服、按 `release-manifest.json` 替换受管文件、重启，失败自动回滚。套件 205 个（153 Python + 52 JS）。
+
+- **便携版一键更新**（#560）：新增 `wb_update_portable.py` 与 `wb_update_apply.py`。`install_enabled()` 在便携包（存在 `release-manifest.json`、`wb_update_apply.py`、`python/python.exe`）里返回 true，面板按钮不再因缺少 systemd unit 而禁用。
+- **更新流程**：下载 `workbuddy2api-hub-vX.Y.Z.zip` 和 `SHA256SUMS` → 校验 → 解包（拒绝 `..` / 绝对路径 / 符号链接）→ 校验 manifest 与 `wb_proxy.py` 版本 → 备份受管文件 → 停止网关 → 替换 → 按原启动模式（静默 / 可见 / LAN）重启 → 轮询 `/health`；失败时恢复备份并重启旧版本。
+- **边界**：只替换 `release-manifest.json` 的 `files`，`accounts/`、`usage/` 等受保护目录不动；不替换内置 `python/` 运行时（运行时升级仍需手动覆盖）；状态写入 `updates/status.json`，面板沿用现有轮询。
+- **测试**：新增 `tests/_test_portable_update.py`（10 项），覆盖 URL / 校验、路径穿越、版本校验、备份 / 替换 / 回滚、helper 启动参数与 bridge 状态；`release/portable.txt` 已加入两个新模块，运行时契约补 `posixpath` / `signal` / `zipfile`。
+
 ## v1.7.22
 
 账号任务参与独立开关（#521）：`enabled` 只管 API 取号，新增 `tasksEnabled` 控制签到、成长任务、连登管家、猫猫旅行和国际版每日活跃；停用账号可以只做任务，启用账号也可以不跑任务。套件 204 个（152 Python + 52 JS）。
