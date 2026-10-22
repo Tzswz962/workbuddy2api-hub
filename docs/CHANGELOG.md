@@ -1,3 +1,36 @@
+## v1.7.28
+
+面板「操作失败: no such account」的根因修复（#581）：手机号脱敏把 uid 改写成了池子里不存在的值。套件 209 个（156 Python + 53 JS）。
+
+- **uid 不再被脱敏改写**（#581）：`_redact_account_names()` 对所有字符串值跑手机号文本正则，国内号 uid `6ef20bf4-76fa-4085-b179-97517476cc1e` 里的 `179-97517476` 恰好满足 3-4-4 分组，被改成 `…b179****7476cc1e`。`/accounts` 把这个假 uid 返回给浏览器，前端点「停用账号 / 测试」时回传，`AccountPool.get()` 查不到 → 404 `no such account` → 「操作失败」。现在 `uid` / `account` / `accountId` / `id` / `file` / `path` / `machineId` / `sessionId` / `key` / `token` 这些标识符键一律原样返回；`nickname` 的脱敏不变。
+- **文本级边界收紧**：`_PHONE_IN_TEXT` 的左右边界从「不是数字」扩到「不是标识符字符」（字母 / 数字 / 下划线），日志或摘要串里嵌着的十六进制 id 不会再被切一段出来当号码。
+- **测试**：`tests/_test_nickname_privacy.py` 新增 3 项，覆盖该 uid 原样、标识符字段不被改写、同载荷里的昵称仍然脱敏。
+
+## v1.7.27
+
+账号档位改为读计费摘要（#505）：付费 / 免费不再靠猜，`is_paid_user` 有了权威来源。套件 209 个（156 Python + 53 JS）。
+
+- **档位来自计费摘要**（#505）：`/billing/meter/get-user-resource-summary` 的 `IsPaidUser` / `SubscriptionPackageName` / `IsProtectedPriceUser` / `ProTrialStatus` 解析成账号上的 `tier` 记录并落盘。国内版的详细积分路径本来就在打这个接口，直接复用同一份响应，零新增请求；国际版的 `get-user-resource` 没有档位字段，因此每账号每天最多多一次摘要请求（`TIER_TTL_SECONDS` = 24h）。
+- **失败不写结论**：401 / 非 0 code / 网络错误保留旧值与时间戳，绝不把一次失败写成「免费」；企业账号（上游语义未验证）与风控限制中的账号跳过。`tier` 按 `VOLATILE_FIELDS` 处理，导入到另一台机器时不沿用上一台的结论。
+- **接线**：`fetch_credits()` 成功后顺带刷新档位，不新开定时器；`is_paid_user` 优先取 `tier`，没有结论时回落到上一次积分快照（与旧行为一致）。面板「会员类型」旁显示包名与读取时刻，hover 给出摘要时间。
+- **测试**：新增 `tests/_test_account_tier.py`（19 项），覆盖解析、缺字段不当免费、企业 / 限制跳过、一天一次、国际版余额取档位、落盘与导入。
+
+## v1.7.26
+
+两个已确认的修复：assistant 历史里的身份句 / 品牌词指纹，以及镜像部署升级写进便携包专用文件。套件 208 个（155 Python + 53 JS）。
+
+- **11-128：assistant 历史也清洗，品牌词缩成 `DeepSeek`**（#574）：同一句 `You are an AI agent powered by DeepSeek Harness.` 放在 assistant 里 400/400/400、放在 user 里 200/200/200，说明身份句的作用域漏了 assistant；`DeepSeek Harness` 与 GUI 描述句（`this page` / `this GUI` / `this app`）连续出现时仍会命中，单独品牌词放行。现在 `sanitize_messages()` 的 identity 作用域扩到 system / developer / assistant，并在这一层把散文里的 `DeepSeek[ \t]+Harness` 缩成 `DeepSeek`。连字符 / 下划线形式（`deepseek-harness`、`deepseek_harness`、`/opt/deepseek-harness/app`）与 user / tool 内容保持原样。新增 5 项断言。
+- **镜像 / rootfs 部署升级不再写便携包专用文件**（#573）：release manifest 新增 `profiles.app`（`wb_*.py` + `dashboard.html`）。非便携包布局（清单与代码同层）的 `request.json` 会带上 `profile: "app"`，执行者据此只替换应用层：`start-wb-proxy*`、`ops/aliyun/*`、`README.md`、`LICENSE` 与 `pricing/pricing.json` 不再落到 `/app`。便携包布局（清单在包根、代码在 `wb-proxy/`）不带档位，行为不变；旧执行者忽略该字段，行为也不变。备份把本次实际管理的 `files` 记进 `backup.json`，按档位备份的目录仍能通过完整性校验并回退。新增 7 项 Python 断言与 3 项 manifest 断言。
+
+## v1.7.25
+
+四笔社区改动：DSH GUI 指纹、跨出口回退、账号表排序续行、更新备份与版本回退。套件 208 个（155 Python + 53 JS）。
+
+- **11-128：DSH GUI 描述段的句尾语序**（#579）：国内版 system 提示里的 GUI 描述段 `… the DeepSeek Harness Web GUI whose URL the runtime context names.` 紧跟 `When the user refers to "this page" …` 会命中 11-128；现在只把 A 句尾改成 `whose URL is named in the runtime context.`，品牌名与句意不变，作用域仍是 system / developer。新增 8 项断言。
+- **跨出口回退：国际版限流 → 国内版（默认关闭）**（#564）：国际版整池被限流 / 24h 窗口用满 / 整池冷却 / 空池时，把同一请求在同名国内版出口重放一次；只对两边都提供的模型、单向、显式指定 realm 的请求不回退，403 11140 不重放。设置页新增开关。新增 16 项单测。
+- **修复账号表排序把冷却 / 达限胶囊拆离账号行**（#568）：`applyTableSort()` 现在按「主行 + 紧跟的 `tr.cool-row` 续行」成组排序；表头列类型推断仍只看数据行。新增 JS 断言。
+- **保留历史版本备份 + 面板版本回退**（#571）：更新成功后保留 `updates/backup-<目标版本>/`，份数由设置控制（0–3，默认 1；0 = 不留备份、回退不可用）。设置页新增「版本回退」卡片，按本地备份恢复、不下载旧包；回退前校验完整性，回退后校验 `Server: wb-proxy/<版本>`，失败自动恢复到回退前版本。`request.json` 新增 `action`（`install` / `rollback`），便携版、外部执行者与 systemd 服务都认；旧执行者会把 rollback 当「重装该 tag」。新增 26 项 Python 断言与 1 个 JS 套件。
+
 ## v1.7.24
 
 非 systemd 部署的面板一键更新通道（#561）：`install_enabled()` 不再只认 systemd unit；部署方可以用外部执行者轮询 `request.json`，网关仍只写请求、不碰自己的代码。套件 205 个（153 Python + 52 JS）。
