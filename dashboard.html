@@ -734,18 +734,34 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
      改成标签与徽章同排一行；国内版双徽章摆不下时靠 flex-wrap 自动换行。 */
   table.account-cards td:nth-child(4){order:4;grid-column:span 6;justify-content:flex-start;flex-wrap:wrap;gap:4px 6px}
   table.account-cards td:nth-child(4)::before{font-size:10px}
-  table.account-cards td:nth-child(5){order:5;grid-column:span 6}
-  table.account-cards td:nth-child(6),
+  /* 出口（第 5 列）与权重（第 6 列）并成一行：出口下拉在前、权重在后，
+     两者都是「标签：控件」的行内形态（权重显示成「权重：1」）。
+     两列高度必须一致，否则出口的 34px 下拉会比权重的 22px 下拉高出一截，
+     同一行看起来参差不齐。这里把两个 select 统一到 34px、并让两格
+     align-items:center，标签与控件在中线上对齐。 */
+  table.account-cards td:nth-child(5),
+  table.account-cards td:nth-child(6){order:5;flex-direction:row;align-items:center;
+    justify-content:flex-start;gap:4px;min-width:0;min-height:36px}
+  table.account-cards td:nth-child(5){grid-column:span 3}
+  table.account-cards td:nth-child(6){grid-column:span 3}
+  table.account-cards td:nth-child(6)::before{content:'权重：'}
+  table.account-cards td:nth-child(5) .slot-select{width:auto;max-width:none;min-height:34px;height:34px;flex:1 1 auto;min-width:0}
+  table.account-cards td:nth-child(6) .mini-select{min-height:34px;height:34px;padding:0 6px;align-self:center}
+  /* 积分（第 7 列）与请求（第 8 列）：各占一半、铺满整行，左右边缘分别与上一行
+     的「出口」「权重」对齐；两格等高、内容水平垂直居中。以前各占 1/3 宽，右边
+     留空一截，看着像没铺满。 */
   table.account-cards td:nth-child(7),
-  table.account-cards td:nth-child(8){order:6;grid-column:span 2;flex-direction:column-reverse;
-    align-items:center;justify-content:center;gap:0;padding:4px 0;
-    background:var(--panel2);border-radius:8px}
+  table.account-cards td:nth-child(8){order:6;grid-column:span 3;
+    flex-direction:column;align-items:center;justify-content:center;gap:2px;
+    padding:6px 4px;min-height:48px;
+    background:var(--panel2);border-radius:8px;text-align:center}
+  table.account-cards td:nth-child(7) .credit-stack{width:100%;align-items:center}
+  table.account-cards td:nth-child(7) .credit-main,
+  table.account-cards td:nth-child(7) .credit-meta{justify-content:center}
   /* 积分格（第 7 列）：column-reverse 会把 ::before 的「积分」列标签排到最底部，
-     与「明细」按钮错行。隐藏列标签，把「积分」并进明细同一行。 */
+     与「明细」按钮错行。隐藏列标签——PC 版这一格本来就只有数值和「明细」，
+     手机上也保持一致，不再额外加一个「积分」字样去挤那一行。 */
   table.account-cards td:nth-child(7)::before{content:none}
-  table.account-cards td:nth-child(7) .credit-meta::before{content:'积分';font-size:10px;color:var(--dim);font-weight:600}
-  table.account-cards td:nth-child(6)::before,
-  table.account-cards td:nth-child(7)::before,
   table.account-cards td:nth-child(8)::before{font-size:10px}
   table.account-cards td.acct-actions{order:7;grid-column:span 6;justify-content:flex-start}
   table.account-cards td.acct-actions::before{content:none}
@@ -796,6 +812,17 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   #cards .card .v{font-size:16px}
   table.data-cards tr{padding:10px}
   .log-ts{font-size:11px}
+}
+@media (max-width: 860px){
+  /* 窄屏统计条：把「积分消耗」与「请求成功率」对调，让积分消耗落在最后、
+     独占一整行。积分卡的副行是「估算价值: ¥49.57 / $6.68」这类长文本，
+     和别的卡挤成半宽时会被 nowrap + ellipsis 截成「$6...」；独占一行后
+     宽度够，再允许换行就能完整显示。
+     只改窄屏的排列顺序，PC 三列布局与卡片内容一字未动。 */
+  #cards .card:nth-child(2){order:3}
+  #cards .card:nth-child(3){order:2}
+  #cards .card:nth-child(2){grid-column:1/-1}
+  #cards .card:nth-child(2) .s{white-space:normal;overflow:visible;text-overflow:clip}
 }
 
 /* ==================================================================
@@ -904,6 +931,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 #pageAnalytics .kpi .v small{font-size:10.5px;font-weight:500;color:var(--dim);margin-left:2px;letter-spacing:0}
 #pageAnalytics .kpi .s{font-size:10.5px;color:var(--dim);margin-top:2px;font-variant-numeric:tabular-nums;line-height:1.4}
 #pageAnalytics .kpi .s b{color:var(--fg2);font-weight:600}
+/* 副行按行分组（.kline）。桌面端就是原来的两行：.kline 独占一行、项间显示
+   「 · 」；窄屏才把每项拆成独立一行，规则见 ≤640px 媒体块。 */
+#pageAnalytics .kpi .s .kline{display:block}
 #pageAnalytics .kpi .accentbar{position:absolute;left:0;top:0;bottom:0;width:2.5px;background:var(--accent);opacity:.9;border-radius:0 3px 3px 0}
 #pageAnalytics .tokflow{display:flex;height:3px;border-radius:3px;overflow:hidden;margin-top:5px;gap:2px}
 #pageAnalytics .tokflow i{display:block;height:100%;border-radius:2px}
@@ -935,6 +965,24 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
 #pageAnalytics .ring .hole span{font-size:9px;color:var(--dim)}
 
 
+@media (max-width:640px){
+  /* 窄屏（3 列，每卡约 80~100px）沿用桌面那两行时，「输入/输出/思考/缓存」
+     会被截断或长短不齐。这里只改「分行」：每项独占一行，分隔符「 · 」隐藏
+     （独占一行后它会孤零零落在行首）；字号、颜色、措辞一律不动。
+     请求数 2 项 → 2 行，生成速度 4 项 → 4 行。 */
+  #pageAnalytics .kpi .s .kline{display:contents}
+  #pageAnalytics .kpi .s .kvi{display:block}
+  #pageAnalytics .kpi .s .ksep{display:none}
+  /* 「峰值吞吐 179 tok/s」在 79px 卡内放不下一行，会从数字与单位之间断开
+     （179 / tok/s）。把数值+单位绑成不可断的整体，只在标签后换行。
+     只作用于第一行三张卡，第二行保持原样。 */
+  #pageAnalytics .kpi.big:nth-child(-n+3) .s .kvi b{white-space:nowrap}
+  /* 同一行三张卡被网格拉成同高，但副行行数不同、有的卡没有对比行、
+     「生成速度」也没有占比色条，sparkline 各自紧跟文字往下排，于是高低不齐。
+     改成纵向 flex 并让图吃掉剩余空间（贴底）：三张图等高 44px、顶底对齐。 */
+  #pageAnalytics .kpi.big:nth-child(-n+3){display:flex;flex-direction:column}
+  #pageAnalytics .kpi.big:nth-child(-n+3) .spark{margin-top:auto}
+}
 #pageAnalytics .recent-list{display:flex;flex-direction:column;max-height:260px;overflow-y:auto;padding-right:2px}
 #pageAnalytics .recent-item{
   display:grid;grid-template-columns:54px minmax(0,1fr) auto;gap:10px;align-items:baseline;
@@ -3992,7 +4040,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <div class="toolbar">
     <button onclick="openLoginModal()">添加</button>
     <!-- 打卡按钮与「添加」同排：手机端靠右显示，不再单独占一行。 -->
-    <div class="tb-group">
+    <div class="tb-group tb-checkin">
     <button class="sec" id="btnCheckin" onclick="doCheckin(this)" style="display:none">Buddy 加油站签到</button>
     <button class="sec" id="btnDailyChat" onclick="doDailyChat(this)" style="display:none">每日活跃打卡 (国际版)</button>
     <!-- 网页通道打卡按钮不再上屏（2026-10-10 起）：网页通道那一步已经由设置里的
@@ -16075,9 +16123,19 @@ function renderKpis(){
 
   // ① Token
   $('kTokens').innerHTML = numSpan(w.total_tokens);
-  $('kTokensSub').innerHTML =
-    `输入 <b>${numSpan(w.prompt_tokens)}</b> · 输出 <b>${numSpan(w.completion_tokens)}</b><br>` +
-    `思考 <b>${numSpan(w.reasoning_tokens)}</b> · 缓存 <b>${numSpan(w.cached_tokens)}</b>`;
+  // 副行按桌面端原本的「行」分组，每项一个 span：
+  //   * 桌面端 .kline 是 block、.ksep 显示为「 · 」，渲染结果与从前逐字一致；
+  //   * 窄屏 .kvi 各占一行、.ksep 隐藏，于是每行只有一项（字号/颜色不变）。
+  const subItems = (lines) => lines.map(line =>
+    '<span class="kline">' +
+    line.map(t => `<span class="kvi">${t}</span>`).join('<span class="ksep"> · </span>') +
+    '</span>').join('');
+  $('kTokensSub').innerHTML = subItems([
+    [`输入 <b>${numSpan(w.prompt_tokens)}</b>`,
+     `输出 <b>${numSpan(w.completion_tokens)}</b>`],
+    [`思考 <b>${numSpan(w.reasoning_tokens)}</b>`,
+     `缓存 <b>${numSpan(w.cached_tokens)}</b>`],
+  ]);
   const parts = [
     ['输入', w.prompt_tokens - (w.cached_tokens||0), 'var(--accent)'],
     ['缓存', w.cached_tokens, 'var(--blue)'],
@@ -16091,7 +16149,10 @@ function renderKpis(){
   // ② 请求
   const okRate = w.requests ? (w.requests - w.errors) / w.requests * 100 : 100;
   $('kReqs').innerHTML = `${numSpan(w.requests)}<small>次</small>`;
-  $('kReqsSub').innerHTML = `失败 <b>${numSpan(w.errors)}</b> · 成功率 <span class="${okRate>=99?'ratio-ok':(okRate>=95?'ratio-gold':'ratio-bad')}"><b>${fmtPct(okRate)}</b></span>`;
+  $('kReqsSub').innerHTML = subItems([
+    [`失败 <b>${numSpan(w.errors)}</b>`,
+     `成功率 <span class="${okRate>=99?'ratio-ok':(okRate>=95?'ratio-gold':'ratio-bad')}"><b>${fmtPct(okRate)}</b></span>`],
+  ]);
 
   // ⑥′ 环形成功率卡
   const ringEl = $('ringSuccess');
@@ -16105,10 +16166,15 @@ function renderKpis(){
   // ③ 速度（TTFT 并入副行）
   $('kSpeed').innerHTML = `${w.speed_avg != null ? Number(w.speed_avg).toFixed(1) : '—'}<small>tok/s</small>`;
   const peak = peakThroughput();
-  $('kSpeedSub').innerHTML =
-    `平均耗时 <b>${fmtSec(w.elapsed_ms_avg)}</b> · 首字 <b>${fmtSec(w.ttft_ms_avg)}</b>` +
-    (peak != null ? `<br>峰值吞吐 <b>${fmtCompact(peak, 0)} tok/s</b>` : '') +
-    (state.perf && state.perf.ttft_ms ? ` · p90 首字 <b>${fmtSec(state.perf.ttft_ms.p90)}</b>` : '');
+  const speedLines = [[
+    `平均耗时 <b>${fmtSec(w.elapsed_ms_avg)}</b>`,
+    `首字 <b>${fmtSec(w.ttft_ms_avg)}</b>`,
+  ]];
+  const speedTail = [];
+  if(peak != null) speedTail.push(`峰值吞吐 <b>${fmtCompact(peak, 0)} tok/s</b>`);
+  if(state.perf && state.perf.ttft_ms) speedTail.push(`p90 首字 <b>${fmtSec(state.perf.ttft_ms.p90)}</b>`);
+  if(speedTail.length) speedLines.push(speedTail);
+  $('kSpeedSub').innerHTML = subItems(speedLines);
 
   // ⑤ 缓存
   $('kCache').innerHTML = fmtPct(w.cache_hit_pct);

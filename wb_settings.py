@@ -111,6 +111,9 @@ UPDATE_CHECK_ENABLED_KEY = "update_check_enabled"
 # The last-check bookkeeping for that daily check. One small object, never a
 # general update-state store: see update_check_state().
 UPDATE_CHECK_STATE_KEY = "update_check"
+# How many startup-check timestamps that object keeps. Enough to count an hour
+# of restarts, and a hard cap so the file cannot grow with uptime.
+STARTUP_CHECK_STAMPS_KEPT = 12
 
 # 剩余用量优先调度：把「估计剩余快耗尽」的 (账号, 模型) 先交出去（剩余越少
 # 权重越高）。缺失键读作关：估算本身是从撞线样本反推的，优先它是一次刻意的
@@ -2538,14 +2541,17 @@ def set_window_probe(accounts_dir, enabled):
 def update_check_state(accounts_dir):
     """The last-check bookkeeping: when it ran, and the version it saw.
 
-    Deliberately three fields. The 24h cadence needs `last_attempt` to survive a
-    restart, and `latest_version` is what lets the panel answer right after one;
-    everything else about a check lives in memory. Nothing from the HTTP
-    exchange - URL, headers, body - is ever stored here.
+    Three fields plus one bounded list. The 24h cadence needs `last_attempt` to
+    survive a restart, and `latest_version` is what lets the panel answer right
+    after one; `startup_checks` holds the timestamps of the last few
+    startup-time checks so the budget in wb_updates can be counted across
+    restarts. Everything else about a check lives in memory, and nothing from
+    the HTTP exchange - URL, headers, body - is ever stored here.
     """
     stored = load(accounts_dir).get(UPDATE_CHECK_STATE_KEY)
     stored = stored if isinstance(stored, dict) else {}
-    out = {"last_attempt": 0.0, "last_success": 0.0, "latest_version": ""}
+    out = {"last_attempt": 0.0, "last_success": 0.0, "latest_version": "",
+           "startup_checks": []}
     for key in ("last_attempt", "last_success"):
         value = stored.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
@@ -2553,7 +2559,37 @@ def update_check_state(accounts_dir):
     version = stored.get("latest_version")
     if isinstance(version, str):
         out["latest_version"] = version.strip()[:32]
+    stamps = stored.get("startup_checks")
+    if isinstance(stamps, list):
+        kept = [float(item) for item in stamps
+                if isinstance(item, (int, float)) and not isinstance(item, bool)
+                and item > 0]
+        out["startup_checks"] = sorted(kept)[-STARTUP_CHECK_STAMPS_KEPT:]
     return out
+
+
+def record_startup_check(accounts_dir, at=None):
+    """Append one startup-time check to the budget ledger. Returns the state.
+
+    A separate write path from record_update_check() on purpose: that one keeps
+    "last attempt / last success / version seen", while the budget needs "when
+    did the last few startup passes happen". Folding the two together would make
+    `last_attempt` mean two different things and leave the cadence unreadable.
+    """
+    stamp = float(at if at is not None else time.time())
+    with _lock:
+        data = load(accounts_dir)
+        state = data.get(UPDATE_CHECK_STATE_KEY)
+        state = dict(state) if isinstance(state, dict) else {}
+        stamps = state.get("startup_checks")
+        kept = [float(item) for item in stamps
+                if isinstance(item, (int, float)) and not isinstance(item, bool)
+                and item > 0] if isinstance(stamps, list) else []
+        kept.append(stamp)
+        state["startup_checks"] = sorted(kept)[-STARTUP_CHECK_STAMPS_KEPT:]
+        data[UPDATE_CHECK_STATE_KEY] = state
+        save(accounts_dir, data)
+    return update_check_state(accounts_dir)
 
 
 def record_update_check(accounts_dir, at=None, success=False, latest_version=""):

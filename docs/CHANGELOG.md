@@ -1,3 +1,15 @@
+## v1.7.29
+
+七笔社区改动：四个手机端布局修复、启动时补一次更新检查、便携更新保留可执行位、API Key 的账号白名单与并发上限落盘。套件 210 个（157 Python + 53 JS）。
+
+- **手机端工具栏打卡按钮靠右**（#585）：`#accountsBody .toolbar .tb-checkin` 的 CSS 在 #498 里只进了样式表，HTML 的类名被并成了 `tb-group`，规则因此悬空；补回类名，桌面端不受影响。
+- **手机端用量统计副行每项一行、图表底边对齐**（#586）：窄屏 KPI 副行改用 `kline` / `kvi` / `ksep` 分组，`display:contents` 让每项独占一行并隐藏分隔符；数值与单位不断行，第一行三张卡改纵向 flex 让 sparkline 贴底等高。桌面端 1280 / 1100 / 900 / 700 / 641px 逐属性对照无变化。
+- **手机端账号卡出口与权重同行**（#587）：出口下拉与权重各占半行、两个 select 统一 34px 高；积分与请求铺满整行，积分格不再把列标签挤进 `credit-meta`。
+- **窄屏统计条让积分消耗独占一行**（#588）：≤860px 时把「积分消耗」与「请求成功率」对调，积分消耗占满整行，副行的估算价值不再被省略号截断。
+- **启动时补一次更新检查**（#589）：`tag` 与发布页只在内存里，重启后 24 小时窗口又锚在上一次尝试上，面板会停在「有新版本但装不了」，最长等一天。后台线程第一次 pass 带 `startup=True`，绕过 24h 窗口但仍受开关与每小时预算约束（`STARTUP_CHECK_WINDOW_SECONDS` / `STARTUP_CHECKS_PER_WINDOW = 6`），预算账本随 `update_check` 落盘；稳态仍是 24 小时一次，关掉每日检查则一个请求都不发。
+- **便携更新保留 unix 权限位**（#582）：`safe_extract()` 用裸 `open()` 写暂存文件，zip 里 755 的 `start-wb-proxy*.sh` 落盘变 644，重启那步 `Popen()` 报 EACCES 并回滚——macOS / Linux 的便携更新每次都会命中。现在按 zip 条目的 `external_attr` 还原模式，无 unix 属性不加执行位，setuid / sticky 不还原，Windows 不受影响。
+- **API Key 的账号白名单与并发上限能落盘了**（#592）：`_handle_settings_save` 重建 key 条目时漏了 `accounts` 与 `concurrency_limit`，`set_api_keys()` 读不到就回落成 `[]` / 0，面板勾选的账号保存后不生效。现在与 `realm` / `models` / `name` / `enabled` 同一规则：补丁没提到就沿用已存值。
+
 ## v1.7.28
 
 面板「操作失败: no such account」的根因修复（#581）：手机号脱敏把 uid 改写成了池子里不存在的值。套件 209 个（156 Python + 53 JS）。

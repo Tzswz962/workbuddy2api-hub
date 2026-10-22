@@ -10184,7 +10184,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.28",
+        "version": "1.7.29",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -17664,7 +17664,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.28"
+    server_version = "wb-proxy/1.7.29"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -19077,6 +19077,18 @@ class Handler(BaseHTTPRequestHandler):
                     enabled = item.get("enabled", True) is not False
                 else:
                     enabled = stored.get("enabled", True) is not False
+                # 账号白名单与并发上限：此前**完全没被转发** —— 重建的 dict 里
+                # 没有这两个键，set_api_keys 归一时读到 None，用户每次保存都被
+                # 静默清空（面板显示已选、落盘却是 []）。
+                # 与上面 realm/models/name 同一规则：补丁没提到就沿用已存值。
+                if "accounts" in item:
+                    accounts = item.get("accounts")
+                else:
+                    accounts = stored.get("accounts")
+                if "concurrency_limit" in item:
+                    concurrency_limit = item.get("concurrency_limit")
+                else:
+                    concurrency_limit = stored.get("concurrency_limit")
                 created_at = item.get("created_at") or (stored.get("created_at") if entry_id in existing else None) or time.strftime("%Y/%m/%d %H:%M")
                 cleaned.append({
                     "id": entry_id,
@@ -19084,6 +19096,8 @@ class Handler(BaseHTTPRequestHandler):
                     "key": value,
                     "realm": realm,
                     "models": models,
+                    "accounts": accounts,
+                    "concurrency_limit": concurrency_limit,
                     "enabled": enabled,
                     "created_at": created_at,
                 })
