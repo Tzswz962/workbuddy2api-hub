@@ -1293,6 +1293,40 @@ def set_section_max_height(accounts_dir, value):
 # 退回完整目录；显式保存空列表表示「用户全部取消」，一键配置会拒绝写空清单
 # ——空清单会生成一个没有模型的 provider，客户端直接不可用。
 AGENT_MODELS_KEY = "agent_models"
+MODEL_ALIASES_KEY = "model_aliases"
+
+
+def _clean_model_aliases(raw):
+    """Normalise an alias table to ``{lowercase alias: target}``.
+
+    ``model_aliases`` predates the current tree and appears in existing
+    settings files as a plain object.  Accept that shape plus the common
+    ``[{"from": ..., "to": ...}]`` spelling, but never let a malformed entry
+    turn a request into a 500: unknown shapes are ignored.
+    """
+    out = {}
+    pairs = []
+    if isinstance(raw, dict):
+        pairs = list(raw.items())
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            source = item.get("from") or item.get("alias") or item.get("name")
+            target = item.get("to") or item.get("target") or item.get("model")
+            pairs.append((source, target))
+    for source, target in pairs:
+        alias = str(source or "").strip().lower()
+        model = str(target or "").strip()
+        if alias and model and alias != model.lower():
+            out[alias] = model
+    return out
+
+
+def model_aliases(accounts_dir):
+    """Read the operator-maintained model alias table."""
+    raw = load(accounts_dir).get(MODEL_ALIASES_KEY)
+    return _clean_model_aliases(raw)
 # 清单写进客户端配置后会被逐条展开；200 条已远超任何出口的模型数，上限只挡
 # 手编 settings.json 把客户端配置撑爆。
 MAX_AGENT_MODELS = 200

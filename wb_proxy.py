@@ -217,7 +217,7 @@ def detect_model_realm(model_id):
 # hy3, glm-5.3 ...) is served by both exits, so it must not be treated as a
 # conflict.
 INTL_EXCLUSIVE_PREFIXES = ("gpt-", "gemini-")
-CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
+CN_EXCLUSIVE_PREFIXES = ("deepseek-v4-pro",)
 INTL_EXCLUSIVE = {
     "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash",
@@ -314,7 +314,13 @@ BACKGROUND_MODEL_NAMES = tuple(
 
 
 def _apply_background_model_alias(payload):
-    """Rewrite known client background-task models to a free target model."""
+    """Rewrite known client background-task models to a free target model.
+
+    A model name alone cannot tell a background job from a model the user
+    picked: the desktop client requests `gpt-5.6-terra` for both. Only rewrite
+    a body that also carries the client's background metadata; an explicit
+    picker request must reach the model it names (issue #619).
+    """
     if not isinstance(payload, dict):
         return
     name = payload.get("model")
@@ -322,8 +328,30 @@ def _apply_background_model_alias(payload):
         return
     if name.strip().lower() not in BACKGROUND_MODEL_NAMES:
         return
+    if not background_request_reason(payload):
+        return
     payload["model"] = BACKGROUND_MODEL_TARGET
     log("alias: background model %s -> %s" % (name, BACKGROUND_MODEL_TARGET))
+
+
+def _apply_model_aliases(payload, aliases):
+    """Rewrite a client's model name from the operator's alias table.
+
+    Claude Desktop's custom endpoint only offers ``claude-*`` names, while the
+    WorkBuddy upstream only knows its real ids.  The mapping belongs before any
+    protocol translation so chat, Responses and Anthropic requests all see the
+    resolved id.  Unknown names pass through unchanged.
+    """
+    if not isinstance(payload, dict) or not isinstance(aliases, dict):
+        return
+    name = payload.get("model")
+    if not isinstance(name, str):
+        return
+    target = aliases.get(name.strip().lower())
+    if not target or target == name:
+        return
+    payload["model"] = target
+    log("alias: model %s -> %s" % (name, target))
 
 
 # The WorkBuddy AI desktop app caches its account product config here on every
@@ -10202,7 +10230,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.30",
+        "version": "1.7.31",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -12891,6 +12919,7 @@ BLOCK_BACKGROUND_REQUESTS = False
 # 命中任一关键字就视为背景请求（不分大小写、子字串比对）
 BACKGROUND_TRIGGER_KEYWORDS = (
     "memory_consolidation",
+    "memory",
     "memory-write",
     "memory_write",
     "memorywriting",
@@ -15318,6 +15347,67 @@ def iter_sse_lines(source, block_size=SSE_READ_BLOCK, before_read=None):
     if buf:
         # 上游没以换行收尾时，最后一行照旧要交出去（迭代 response 也是这个形状）。
         yield buf
+
+SSE_HEARTBEAT_SECONDS = 15.0
+
+
+class SSEHeartbeat:
+    """Write SSE comments while the request thread is blocked on the upstream.
+
+    A keepalive checked only before a blocking read cannot run during the very
+    silence it is meant to cover. This daemon thread owns the same lock as the
+    request's writes, so comments can never split a JSON/SSE frame.
+    """
+
+    def __init__(self, write, interval=SSE_HEARTBEAT_SECONDS):
+        self._write = write
+        self._interval = max(0.05, float(interval))
+        self._lock = threading.RLock()
+        self._last_write_at = time.monotonic()
+        self._stop = threading.Event()
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run, name="wb-sse-heartbeat", daemon=True)
+        self._thread.start()
+
+    def write(self, data):
+        if not data:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            self._write(data)
+            self._last_write_at = time.monotonic()
+
+    def _run(self):
+        tick = min(0.1, self._interval / 4.0)
+        while not self._stop.wait(tick):
+            with self._lock:
+                if self._closed:
+                    return
+                idle = time.monotonic() - self._last_write_at
+                if idle < self._interval:
+                    continue
+                try:
+                    self._write(b": keepalive\n\n")
+                    self._last_write_at = time.monotonic()
+                except Exception:
+                    self._closed = True
+                    return
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+        self._stop.set()
+        self._thread.join(timeout=max(0.1, self._interval))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
 
 def aggregate_stream(raw_iter, model, resp_id):
     """Fold an SSE stream into one non-streaming chat.completion object."""
@@ -17980,7 +18070,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.30"
+    server_version = "wb-proxy/1.7.31"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -21625,37 +21715,39 @@ class Handler(BaseHTTPRequestHandler):
                   "session_key": session_key,
                   "realm": realm}
         first_ms = None
+        heartbeat = SSEHeartbeat(
+            lambda data: (self.wfile.write(data), self.wfile.flush()))
         try:
-            # 一轮跑完如果模型要的是 web_search / web_fetch，就由反代
-            # 执行、把结果喂回去再跑一轮。客户端从头到尾只看到一则连续的回应。
-            rounds = 0
-            total_usage = None
-            while True:
-                holder.pop("internal_calls", None)
-                holder.pop("suppress_completion", None)
-                holder["suppress_lifecycle"] = rounds > 0
-                for frame in stream_responses_events(upstream, model, holder):
-                    if first_ms is None:
-                        first_ms = int((time.time() - t_start) * 1000)
-                    self.wfile.write(clean_responses_frame(frame))
-                    self.wfile.flush()
-                # 每一轮的 token 都是真的花掉的，记帐要加总
-                total_usage = sum_usage(total_usage, holder.get("usage"))
-                internal = holder.get("internal_calls") or []
-                if not internal:
-                    break
-                rounds += 1
-                # 用完就收回工具，让模型自己收尾；这里不合成任何事件。
-                give_up = rounds > wb_webtools.MAX_WEB_ROUNDS
-                try:
-                    upstream.close()
-                except Exception:
-                    pass
-                upstream, account, _ = follow_up_with_tool_results(
-                    internal, holder, model, session_key, t_start, drop_tools=give_up,
-                    **key_open_kwargs(getattr(self, "key_entry", None)))
-            if total_usage:
-                holder["usage"] = total_usage
+            with heartbeat:
+                # 一轮跑完如果模型要的是 web_search / web_fetch，就由反代
+                # 执行、把结果喂回去再跑一轮。客户端从头到尾只看到一则连续的回应。
+                rounds = 0
+                total_usage = None
+                while True:
+                    holder.pop("internal_calls", None)
+                    holder.pop("suppress_completion", None)
+                    holder["suppress_lifecycle"] = rounds > 0
+                    for frame in stream_responses_events(upstream, model, holder):
+                        if first_ms is None:
+                            first_ms = int((time.time() - t_start) * 1000)
+                        heartbeat.write(clean_responses_frame(frame))
+                    # 每一轮的 token 都是真的花掉的，记帐要加总
+                    total_usage = sum_usage(total_usage, holder.get("usage"))
+                    internal = holder.get("internal_calls") or []
+                    if not internal:
+                        break
+                    rounds += 1
+                    # 用完就收回工具，让模型自己收尾；这里不合成任何事件。
+                    give_up = rounds > wb_webtools.MAX_WEB_ROUNDS
+                    try:
+                        upstream.close()
+                    except Exception:
+                        pass
+                    upstream, account, _ = follow_up_with_tool_results(
+                        internal, holder, model, session_key, t_start, drop_tools=give_up,
+                        **key_open_kwargs(getattr(self, "key_entry", None)))
+                if total_usage:
+                    holder["usage"] = total_usage
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             wall = int((time.time() - t_start) * 1000)
             record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
@@ -21895,12 +21987,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         holder = {"usage": None}
         first_ms = None
+        heartbeat = SSEHeartbeat(
+            lambda data: (self.wfile.write(data), self.wfile.flush()))
         try:
-            for frame in stream_messages_events(upstream, model, holder):
-                if first_ms is None:
-                    first_ms = int((time.time() - t_start) * 1000)
-                self.wfile.write(frame)
-                self.wfile.flush()
+            with heartbeat:
+                for frame in stream_messages_events(upstream, model, holder):
+                    if first_ms is None:
+                        first_ms = int((time.time() - t_start) * 1000)
+                    heartbeat.write(frame)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             wall = int((time.time() - t_start) * 1000)
             record_upstream_usage(upstream, model, holder.get("usage"), stream=True, elapsed_ms=wall,
@@ -21917,9 +22011,8 @@ class Handler(BaseHTTPRequestHandler):
                          ttft_ms=first_ms, fp=fp, outcome="upstream_aborted",
                          key=self._key_id())
             try:
-                self.wfile.write(anthropic_sse_frame("error", {
+                heartbeat.write(anthropic_sse_frame("error", {
                     "error": {"type": "api_error", "message": str(exc)}}))
-                self.wfile.flush()
             except Exception:
                 pass
             return
@@ -22090,6 +22183,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if is_account_route:
             return self._handle_accounts(path, payload)
+        try:
+            aliases = wb_settings.model_aliases(ACCOUNTS_DIR)
+        except Exception:
+            aliases = {}
+        _apply_model_aliases(payload, aliases)
         _apply_background_model_alias(payload)
         # Check per-key concurrency limit (#359)
         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)
@@ -22275,6 +22373,8 @@ class Handler(BaseHTTPRequestHandler):
             # 攒到「下一个可能阻塞的读之前」再写，不改变任何延迟：块边界就是
             # socket 里当前已经有的全部字节（见 iter_sse_lines 的 before_read）。
             out_buf = []
+            heartbeat = SSEHeartbeat(
+                lambda data: (self.wfile.write(data), self.wfile.flush()))
             # Egress accounting is settled when the read finishes, not when the
             # headers arrive: a stream that dies mid-body must leave a streak
             # behind (issue #522). retried means this request already had a
@@ -22287,8 +22387,7 @@ class Handler(BaseHTTPRequestHandler):
 
             def flush_out():
                 if out_buf:
-                    self.wfile.write(b"".join(out_buf))
-                    self.wfile.flush()
+                    heartbeat.write(b"".join(out_buf))
                     del out_buf[:]
 
             def write_chunk(payload):
@@ -22309,70 +22408,81 @@ class Handler(BaseHTTPRequestHandler):
                         for payload in chat_tool_call_chunks(model, action[1], chunk_id=stream_chunk_id):
                             write_chunk(payload)
 
+            def before_read():
+                flush_out()
+
             try:
-                for line in iter_sse_lines(upstream, before_read=flush_out):
-                    data = strip_data_prefix(line.decode("utf-8", "replace"))
-                    if not data or data == "[DONE]" or data.startswith(":"):
-                        continue
-                    maybe = None
-                    try:
-                        maybe = json.loads(data)
-                    except Exception:
+                with heartbeat:
+                    for line in iter_sse_lines(upstream, before_read=before_read):
+                        data = strip_data_prefix(line.decode("utf-8", "replace"))
+                        if not data or data == "[DONE]" or data.startswith(":"):
+                            continue
                         maybe = None
-                    if isinstance(maybe, dict):
-                        u = maybe.get("usage")
-                        if u:
-                            if last_usage is None or (u.get("total_tokens") or 0) >= (last_usage.get("total_tokens") or 0):
-                                last_usage = u
-                            # Usage belongs in a trailing choices-less frame (the
-                            # include_usage contract), not on a chunk that also
-                            # carries choices: strict clients and downstream
-                            # gateways reject the in-band block, and the stream
-                            # then ends without billable usage. Re-emitted once
-                            # below, after the finish frame.
-                            maybe.pop("usage", None)
-                        for ch in (maybe.get("choices") or []):
-                            delta = ch.get("delta") or {}
-                            if delta.get("reasoning_content"):
-                                streamed_text.append(delta["reasoning_content"])
-                            piece = delta.get("content")
-                            if piece:
-                                streamed_text.append(piece)
-                                # Hold the text back: it may be a call the model
-                                # printed instead of emitting, and a client that
-                                # reads it as prose ends the turn with nothing to
-                                # run ("it keeps stopping by itself").
-                                delta.pop("content", None)
-                                release(leak_filter.feed(piece))
-                            if ch.get("finish_reason"):
-                                # Hold the terminator too: whether this turn ends
-                                # in tool_calls is only known once the text has
-                                # been flushed at end of stream.
-                                pending_finish = ch["finish_reason"]
-                                ch["finish_reason"] = None
-                    # One response must carry one id. Upstream frames keep the
-                    # upstream id while the text frames this gateway rewrites
-                    # carry its own `chatcmpl-wb-*` one, so a single reply went
-                    # out as two interleaved streams. Clients that key stream
-                    # state by id then see the reasoning half (upstream id,
-                    # never a finish_reason) and the answer half separately,
-                    # and the turn hangs on "still generating" forever even
-                    # though both halves arrived. Normalise before emitting.
-                    if isinstance(maybe, dict) and maybe.get("id"):
-                        maybe["id"] = stream_chunk_id
-                    cleaned = clean_chunk(
-                        json.dumps(maybe, ensure_ascii=False)
-                        if isinstance(maybe, dict) else data)
-                    if not cleaned:
-                        continue
-                    write_chunk(cleaned)
-                release(leak_filter.flush())
-                if synthesized_calls or pending_finish is not None:
-                    write_chunk(chat_finish_chunk(
-                        model, "tool_calls" if synthesized_calls else pending_finish, chunk_id=stream_chunk_id))
-                if last_usage is not None:
-                    write_chunk(chat_usage_chunk(
-                        model, last_usage, chunk_id=stream_chunk_id))
+                        try:
+                            maybe = json.loads(data)
+                        except Exception:
+                            maybe = None
+                        if isinstance(maybe, dict):
+                            u = maybe.get("usage")
+                            if u:
+                                if last_usage is None or (u.get("total_tokens") or 0) >= (last_usage.get("total_tokens") or 0):
+                                    last_usage = u
+                                # Usage belongs in a trailing choices-less frame (the
+                                # include_usage contract), not on a chunk that also
+                                # carries choices: strict clients and downstream
+                                # gateways reject the in-band block, and the stream
+                                # then ends without billable usage. Re-emitted once
+                                # below, after the finish frame.
+                                maybe.pop("usage", None)
+                            for ch in (maybe.get("choices") or []):
+                                delta = ch.get("delta") or {}
+                                if delta.get("reasoning_content"):
+                                    streamed_text.append(delta["reasoning_content"])
+                                piece = delta.get("content")
+                                if piece:
+                                    streamed_text.append(piece)
+                                    # Hold the text back: it may be a call the model
+                                    # printed instead of emitting, and a client that
+                                    # reads it as prose ends the turn with nothing to
+                                    # run ("it keeps stopping by itself").
+                                    delta.pop("content", None)
+                                    release(leak_filter.feed(piece))
+                                if ch.get("finish_reason"):
+                                    # Hold the terminator too: whether this turn ends
+                                    # in tool_calls is only known once the text has
+                                    # been flushed at end of stream.
+                                    pending_finish = ch["finish_reason"]
+                                    ch["finish_reason"] = None
+                        # One response must carry one id. Upstream frames keep the
+                        # upstream id while the text frames this gateway rewrites
+                        # carry its own `chatcmpl-wb-*` one, so a single reply went
+                        # out as two interleaved streams. Clients that key stream
+                        # state by id then see the reasoning half (upstream id,
+                        # never a finish_reason) and the answer half separately,
+                        # and the turn hangs on "still generating" forever even
+                        # though both halves arrived. Normalise before emitting.
+                        if isinstance(maybe, dict) and maybe.get("id"):
+                            maybe["id"] = stream_chunk_id
+                        cleaned = clean_chunk(
+                            json.dumps(maybe, ensure_ascii=False)
+                            if isinstance(maybe, dict) else data)
+                        if not cleaned:
+                            continue
+                        write_chunk(cleaned)
+                    release(leak_filter.flush())
+                    if synthesized_calls or pending_finish is not None:
+                        write_chunk(chat_finish_chunk(
+                            model, "tool_calls" if synthesized_calls else pending_finish, chunk_id=stream_chunk_id))
+                    if last_usage is not None:
+                        write_chunk(chat_usage_chunk(
+                            model, last_usage, chunk_id=stream_chunk_id))
+                    flush_out()
+                    if not emitted:
+                        err = json.dumps({"error": {
+                            "message": "empty upstream stream",
+                            "type": "server_error"}})
+                        heartbeat.write(f"data: {err}\n\n".encode("utf-8"))
+                    heartbeat.write(b"data: [DONE]\n\n")
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Client hung up; still account for what upstream produced.
                 wall = int((time.time() - t_start) * 1000)
@@ -22417,24 +22527,21 @@ class Handler(BaseHTTPRequestHandler):
                 wall = int((time.time() - t_start) * 1000)
                 record_error(model, 502, "stream aborted: %s" % exc,
                              elapsed_ms=wall, account=account.uid,
-                            usage=last_usage, stream=True, ttft_ms=first_ms,
-                            gen_ms=(wall - first_ms) if first_ms is not None else None,
+                             usage=last_usage, stream=True, ttft_ms=first_ms,
+                             gen_ms=(wall - first_ms) if first_ms is not None else None,
                              fp=fp, outcome="upstream_aborted", key=self._key_id())
                 try:
                     release(leak_filter.flush())
-                    flush_out()
+                    if out_buf:
+                        self.wfile.write(b"".join(out_buf))
+                        self.wfile.flush()
+                        del out_buf[:]
                     self.wfile.write(chat_stream_error_frame(
                         "upstream stream aborted: %s" % exc))
                     self.wfile.flush()
                 except Exception:
                     pass
                 return
-            flush_out()
-            if not emitted:
-                err = json.dumps({"error": {"message": "empty upstream stream", "type": "server_error"}})
-                self.wfile.write(f"data: {err}\n\n".encode("utf-8"))
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
             if egress_on and egress_key and emitted and not retried:
                 # A full read (not a retried one) ends the streak.
                 wb_egress.note_success(egress_key)
