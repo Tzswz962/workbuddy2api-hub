@@ -15,6 +15,7 @@ Launchers: start-wb-proxy.bat / start-wb-proxy-lan.bat on Windows,
 start-wb-proxy.command (or ./start-wb-proxy.sh) on macOS/Linux.
 """
 import argparse
+import base64
 import bisect
 import calendar
 import errno
@@ -68,7 +69,6 @@ import wb_activity
 import wb_atrest
 import wb_catalog
 import wb_egress
-import wb_entitlements
 import wb_ipintel
 import wb_logstore
 import wb_pricing
@@ -3167,6 +3167,11 @@ def _remaining_schedule_weight(remaining, budget):
 def remaining_priority_enabled():
     """优先调度开关（默认关）。"""
     return wb_settings.remaining_priority_enabled(ACCOUNTS_DIR) is True
+
+
+def affinity_stable_key_enabled():
+    """更稳的会话粘滞键开关（默认关，关着时与上游逻辑一字不差）。"""
+    return wb_settings.affinity_stable_key_enabled(ACCOUNTS_DIR) is True
 
 
 def remaining_schedule_weights():
@@ -10144,6 +10149,12 @@ def runtime_settings_view():
                                                default=wb_accounts.WEB_TURN_TIMEOUT),
         "daily_chat_web_timeout_default": wb_accounts.WEB_TURN_TIMEOUT,
         "daily_chat_web_timeout_max": wb_settings.DAILY_CHAT_WEB_TIMEOUT_MAX,
+        "daily_chat_web_retry_backoff":
+            wb_settings.daily_chat_web_retry_backoff(
+                ACCOUNTS_DIR, default=wb_accounts.WEB_RETRY_BACKOFF),
+        "daily_chat_web_retry_backoff_default": wb_accounts.WEB_RETRY_BACKOFF,
+        "daily_chat_web_retry_backoff_max":
+            wb_settings.DAILY_CHAT_WEB_RETRY_BACKOFF_MAX,
         "daily_chat_web_fallback": wb_settings.daily_chat_web_fallback(ACCOUNTS_DIR),
         "daily_chat_web_fallback_models":
             wb_settings.daily_chat_web_fallback_models(ACCOUNTS_DIR),
@@ -10163,6 +10174,13 @@ def runtime_settings_view():
             wb_settings.egress_backoff_enabled(ACCOUNTS_DIR),
         "realm_fallback_enabled":
             wb_settings.realm_fallback_enabled(ACCOUNTS_DIR),
+        "account_max_concurrent":
+            wb_settings.account_max_concurrent(ACCOUNTS_DIR),
+        "account_max_concurrent_max":
+            wb_settings.ACCOUNT_MAX_CONCURRENT_MAX,
+        "account_inflight": account_inflight_snapshot(),
+        "affinity_stable_key_enabled":
+            wb_settings.affinity_stable_key_enabled(ACCOUNTS_DIR),
         "log_db_enabled": wb_settings.log_db_enabled(ACCOUNTS_DIR),
         "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
         "log_db_max_days": wb_settings.log_db_max_days(ACCOUNTS_DIR),
@@ -10184,7 +10202,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.7.29",
+        "version": "1.7.30",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -10266,6 +10284,14 @@ def affinity_route(messages):
     conversations whose client supplied its own session key). Both come from
     the same head hash, so every turn of a conversation agrees on its key and
     its page without any server-side state.
+
+    With ``affinity_stable_key_enabled`` the hashed head is longer: the default
+    head is [system, first user], which two conversations with the same opening
+    line share - they then overwrite each other's binding every turn and each
+    turn lands on the other one's account, dropping the prefix cache each time.
+    Adding the first assistant reply (and the user turn after it) makes the two
+    keys diverge from the second turn on. The switch is off by default so an
+    existing install keeps exactly the upstream behaviour and can roll back.
     """
     if not AFFINITY_BY_PREFIX:
         return None, None
@@ -10274,6 +10300,11 @@ def affinity_route(messages):
         if not msgs:
             return None, None
         head = msgs[:2]
+        if affinity_stable_key_enabled() and len(msgs) > 2:
+            # 只加「首条 assistant 回复」这一条：它是两个同开场白会话第一个必然
+            # 不同的地方，又只占一轮的 token，哈希开销可忽略。system 提示相同
+            # 时它同样稳定（同一会话每轮都能算出同一个键）。
+            head = msgs[:3]
         blob = json.dumps(head, ensure_ascii=False, sort_keys=True).encode("utf-8")
         digest = hashlib.sha256(blob).hexdigest()[:16]
         key = "pfx-" + digest
@@ -11021,7 +11052,7 @@ def remote_config_headers(account, realm, ua=None):
     realm's fixed desktop UA rather than the account's current identity.
     """
     cfg = wb_accounts.get_realm_config(realm)
-    return {
+    headers = {
         "Accept": "application/json, text/plain, */*",
         "User-Agent": ua or cfg["chat_ua"],
         "Origin": cfg["origin"],
@@ -11029,6 +11060,12 @@ def remote_config_headers(account, realm, ua=None):
         "Authorization": "Bearer " + account.access_token,
         "X-User-Id": account.uid,
     }
+    # 静态 API Key 必须额外带 X-API-Key：只发 Authorization 时上游下发 54 条
+    # 而不是 56 条，且 HTTP 仍是 200、没有任何提示（实测）。少的四条正是
+    # glm-5.2-aicc / glm-5.3-flashx / kimi-k3-2 / minimax-m3-pay。
+    if getattr(account, "is_api_key", False):
+        headers["X-API-Key"] = account.access_token
+    return headers
 
 
 def _agent_model_lists(payload):
@@ -13535,10 +13572,108 @@ def gateway_hint(status, message):
 MAX_PRODUCT_SWITCHES = 4
 _SWITCH_LOG = {}
 
+# --------------------------------------------------- 账号级并发上限（可选）
+#
+# 上游按「账号 + 分钟」计 token，而一个大上下文会话单请求就带十几万 token。
+# 两个会话同时落在同一个账号上，一分钟内很容易过百万 token，上游回 429；网关
+# 随即把该账号停放 60 秒并换号，新账号没有这段对话的前缀缓存，缓存命中率从
+# 99% 掉到 0、TTFT 从 1.5s 涨到 5-6s —— 并发越高，每个请求反而越慢。
+#
+# 这里给每个账号一个「在飞名额」：名额满了就换下一个账号（不是排队等），
+# 这样两个会话会自然落到两个账号上，各自保留自己的前缀缓存。
+#
+# 默认 0 = 不限，派发行为与上游一字不差（见 wb_settings.account_max_concurrent）。
+_ACCOUNT_INFLIGHT = {}
+_ACCOUNT_INFLIGHT_LOCK = threading.Lock()
+
+
+def account_slot_acquire(account, limit=None):
+    """给这个账号占一个在飞名额。回传 True 表示占到了。
+
+    上限 <= 0（默认）时永远回传 True 且不记账：关闭状态下这条路径不产生任何
+    状态，也就不可能有泄漏。`limit` 由调用方在读设置时算好传进来，避免同一次
+    请求里「占名额时开关是开的、还名额时已经关了」这种不一致。
+    """
+    if limit is None:
+        limit = wb_settings.account_max_concurrent(ACCOUNTS_DIR)
+    if limit <= 0:
+        return True
+    with _ACCOUNT_INFLIGHT_LOCK:
+        current = _ACCOUNT_INFLIGHT.get(account.uid, 0)
+        if current >= limit:
+            return False
+        _ACCOUNT_INFLIGHT[account.uid] = current + 1
+        return True
+
+
+def account_slot_release(account):
+    """归还名额。必须与成功的 acquire 配对；关闭时是空操作。"""
+    if account is None:
+        return
+    with _ACCOUNT_INFLIGHT_LOCK:
+        current = _ACCOUNT_INFLIGHT.get(account.uid, 0)
+        if current <= 1:
+            _ACCOUNT_INFLIGHT.pop(account.uid, None)
+        else:
+            _ACCOUNT_INFLIGHT[account.uid] = current - 1
+
+
+def bind_account_slot_to_response(response, account):
+    """把在飞名额绑到响应对象的生命周期上。
+
+    名额必须一直占到「上游 body 读完/关掉」为止，而不是占到「拿到响应头」——
+    流式回复拿到头之后还要读几十秒，那段时间上游仍算这个账号在跑。响应对象的
+    close() 是唯一必然发生的终点（`with upstream:`、显式 close、客户端中断都走
+    它），所以把归还挂在 close 上，并加一次性保护防重复扣减。
+    """
+    if account is None:
+        return
+    if response is None:
+        # 没有响应对象可挂：没有终点可等，立刻归还，否则这个名额会永久泄漏。
+        account_slot_release(account)
+        return
+    released = [False]
+
+    def release_once():
+        if released[0]:
+            return
+        released[0] = True
+        account_slot_release(account)
+
+    try:
+        original_close = response.close
+    except Exception:
+        release_once()
+        return
+
+    def close_and_release(*args, **kwargs):
+        try:
+            return original_close(*args, **kwargs)
+        finally:
+            release_once()
+
+    try:
+        response.close = close_and_release
+    except Exception:
+        # 内置类型不接受实例属性赋值：退回「读完即还」，宁可早还也不能漏还。
+        release_once()
+
+
+def account_inflight_snapshot():
+    """{uid: 在飞数}，面板与测试用。"""
+    with _ACCOUNT_INFLIGHT_LOCK:
+        return dict(_ACCOUNT_INFLIGHT)
+
+
 #: 出口级退避在单次请求里最多睡这么久（见 wb_egress）：退避阶梯可以到十几秒，
 #: 但把一个客户端请求按住十几秒是不可接受的，所以只睡这个上限；共享计数器仍然
 #: 让并发请求一起变慢（这才是「一次短暂的全局退避」）。
 EGRESS_SLEEP_MAX = 5.0
+
+#: 固定账号（/u/<ref>/ 路由、流式中断原地重连）在名额占满时最多等这么久。
+#: 固定账号没法「换一个」，所以只能等；但这个等待必须有界，否则一个卡住的
+#: 流会把同账号的后续请求全部拖死。
+ACCOUNT_SLOT_WAIT_MAX = 2.0
 
 
 def auto_switch_product_enabled():
@@ -14315,18 +14450,76 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # 每次失败都把【出错的那个账号】从这段对话的历史里降级（demote），而不是
     # 忘掉整段对话：重选时优先回到还留着这段前缀的暖号（见 SessionAffinity），
     # 一次大 prompt 的冷启动比重选一次账号贵得多。
-    for _attempt in range(max_attempts):
+    # 账号级并发上限（可选，默认关）用到的「名额已满」账号。它与 tried 分开：
+    # tried 记的是「这一轮试过且失败」的账号，busy 只是「此刻没空」，等它的请求
+    # 结束后这个账号完全可用，不该被当成失败账号影响熔断或亲和。
+    busy = set()
+    # 当前这一轮已经占住、但还没交给调用方的账号名额。任何失败路径都要归还
+    # （循环开头统一处理），成功路径把它绑到响应对象上后置空。
+    slot_held = None
+    def pick_account():
+        """按当前 exclude/busy 选一个账号，并占住它的在飞名额。
+
+        名额上限关闭时 account_slot_acquire 恒真且不记账，这里与改动前完全等价。
+        """
+        nonlocal busy
+        while True:
+            exclude = tried | busy
+            kwargs = dict(realm=realm, session_key=session_key,
+                          exclude=exclude, model=model, page=affinity_page)
+            if allowed_accounts is not None:
+                kwargs["allowed"] = allowed_accounts
+            candidate = POOL.pick_for_session(**kwargs) if POOL else None
+            if candidate is None:
+                return None
+            if account_slot_acquire(candidate):
+                return candidate
+            busy.add(candidate.uid)
+            if len(busy) >= max(1, total):
+                # 池子里每个可用账号都满了：不再空转，交给上层排队/报错。
+                return None
+
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt > max_attempts:
+            break
+        # 上一轮拿到的名额如果没被交出去（任何 continue/break 都意味着这次尝试
+        # 没把响应交给调用方），在这里统一归还。成功路径会在 return 前把它绑到
+        # 响应对象上并清空这个标记，所以只有失败路径会走到这里。
+        if slot_held is not None:
+            account_slot_release(slot_held)
+            slot_held = None
         if pinned is not None:
             account = pinned if pinned.uid not in tried else None
+            # 固定账号（/u/<ref>/ 路由、流式中断后的原地重连）也要占名额，
+            # 否则下一轮开头的统一归还就会释放一个从未占过的名额。固定账号没有
+            # 「换一个」的余地，所以名额被占满时短暂等待，等不到就报池子忙。
+            if account is not None:
+                got = account_slot_acquire(account)
+                waited = 0.0
+                while not got and waited < ACCOUNT_SLOT_WAIT_MAX:
+                    time.sleep(0.05)
+                    waited += 0.05
+                    got = account_slot_acquire(account)
+                if not got:
+                    account = None
         elif refresh_uid is not None:
             account = pool_account(refresh_uid)
             refresh_uid = None
+            # 令牌刷新后的原地重试同样是「固定账号」：占不到名额就等，等不到
+            # 就放弃这一次尝试，不能凭空释放一个没占过的名额。
+            if account is not None:
+                got = account_slot_acquire(account)
+                waited = 0.0
+                while not got and waited < ACCOUNT_SLOT_WAIT_MAX:
+                    time.sleep(0.05)
+                    waited += 0.05
+                    got = account_slot_acquire(account)
+                if not got:
+                    account = None
         else:
-            pick_kwargs = dict(realm=realm, session_key=session_key,
-                               exclude=tried, model=model, page=affinity_page)
-            if allowed_accounts is not None:
-                pick_kwargs["allowed"] = allowed_accounts
-            account = POOL.pick_for_session(**pick_kwargs) if POOL else None
+            account = pick_account()
         if (account is None and pinned is None
                 and (transient_hits or local_net_hits)):
             # Pool rotation is bookkeeping, not an upstream attempt. Re-pick
@@ -14334,18 +14527,16 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             # Local DNS/route failures need the same bounded retry path.
             tried.clear()
             time.sleep(min(1.5 * (transient_hits or local_net_hits), 3.0))
-            pick_kwargs = dict(realm=realm, session_key=session_key,
-                               exclude=tried, model=model, page=affinity_page)
-            if allowed_accounts is not None:
-                pick_kwargs["allowed"] = allowed_accounts
-            account = POOL.pick_for_session(**pick_kwargs) if POOL else None
+            account = pick_account()
         if account is None:
             break
         if account.realm != realm:
             if session_key and POOL: POOL.affinity.demote(session_key, account.uid)
+            account_slot_release(account)
             continue
         tried.add(account.uid)
         last_uid = account.uid
+        slot_held = account
         cfg = wb_accounts.get_realm_config(account.realm)
         chat_url = account.chat_base_url() + CHAT_PATH
         # The cache key is account scoped, so it is rebuilt per candidate rather
@@ -14398,7 +14589,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                        proxy=account.proxy)
             _apply_stream_idle_timeout(resp, idle_timeout)
             account.note_success(model=model)
-            wb_entitlements.clear(ACCOUNTS_DIR, account.realm, model)
             if egress_backoff and not defer_egress_success:
                 # This outbound path just served a request, so its transient
                 # streak is over (same rule as the account's note_success).
@@ -14407,6 +14597,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 wb_egress.note_success(
                     wb_upstream_pool.egress_key(chat_url, account.proxy))
             reset_switch_counter(account, model)
+            # 名额交给响应对象：它一直占到上游 body 读完/关掉为止（流式回复拿到
+            # 头之后还要读几十秒，那段时间上游仍算这个账号在跑）。绑定后本地
+            # 标记置空，循环开头就不会再重复归还。
+            bind_account_slot_to_response(resp, account)
+            slot_held = None
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
             # model and the request, and the callers record it on the usage row.
@@ -14572,22 +14767,15 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 last_error = exc
                 continue
             if exc.code == 400:
-                detail = http_error_detail(exc)
-                code = upstream_error_code(detail)
-                if code == 11158:
-                    wb_entitlements.mark(
-                        ACCOUNTS_DIR, account.realm, model, code,
-                        user_type=wb_entitlements.user_type_from_detail(detail))
-                    log("model '%s' is not allowed for %s free tier (11158); marked"
-                        % (model, account.realm))
+                # A 400 is passed through unchanged. `11158` (model not allowed
+                # for this user type) used to be recorded here for the model
+                # catalogue label; the tier map from `/v3/config` now drives
+                # both the scheduler and that label, so the request never gets
+                # this far for a gated model.
                 raise
             if exc.code >= 500:
                 detail = http_error_detail(exc)
                 code = upstream_error_code(detail)
-                if code == 11158:
-                    wb_entitlements.mark(
-                        ACCOUNTS_DIR, account.realm, model, code,
-                        user_type=wb_entitlements.user_type_from_detail(detail))
                 if (code in MODEL_SCOPED_ERROR_CODES
                         and not model_scoped_errors_penalize_account()):
                     # A bad model name must not take the whole pool down. The
@@ -14680,6 +14868,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                    3.0 if total <= 1 else 60.0, account.fails, total))
             last_error = exc
             continue
+    # 循环可能从 break 退出（TLS 校验失败、已知硬错误），这时本轮占的名额还在
+    # 手上；成功路径已经在 return 前把它交给响应对象并置空，所以这里释放是安全的。
+    if slot_held is not None:
+        account_slot_release(slot_held)
+        slot_held = None
     # Only spend credits after every enabled, credential-bearing account in
     # this realm has a persisted upstream 6004 cap for this free model. The
     # switch is opt-in because the retry can incur real charges.
@@ -14757,6 +14950,15 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   % (model, wb_settings.model_daily_token_limit(ACCOUNTS_DIR, realm)))
         raise RateLimited(None, reason,
                           wait=seconds_until_local_midnight(), message=reason)
+    if busy and last_error is None:
+        # 名额全满：账号本身完全健康，只是每个都在跑别的请求。必须报得比
+        # 「全部停用/冷却/过期」清楚——否则排查的人会去看账号状态，而真正
+        # 要做的只是等一两秒重发（或把上限调大）。
+        limit = wb_settings.account_max_concurrent(ACCOUNTS_DIR)
+        reason = ("every usable account is already serving %d concurrent "
+                  "request(s) (account_max_concurrent=%d); retry shortly or "
+                  "raise the cap" % (limit, limit))
+        raise RateLimited(None, reason, wait=1, message=reason)
     raise RuntimeError("no usable account for realm '%s': all are disabled, cooling down, "
                        "expired or parked by the daily token limit%s"
                        % (realm, pool_unavailable_detail(realm, model)))
@@ -15832,6 +16034,65 @@ def tool_name_of(tool):
     return str(tool.get("name") or "")
 
 
+# Codex remote compaction v2: the client sends the whole retained history plus a
+# `{"type":"compaction_trigger"}` item and expects exactly one `compaction`
+# output item back. The upstream Chat Completions API has no such concept, so
+# the gateway performs the summarization itself and stores the summary in the
+# item's opaque `encrypted_content` field. Codex replays that item verbatim on
+# later turns; `_responses_input_to_messages` below turns it back into a normal
+# context message, which is what makes a compacted thread continue correctly.
+COMPACTION_PROMPT = (
+    "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff "
+    "summary for another LLM that will resume the task.\n\n"
+    "Include:\n"
+    "- Current progress and key decisions made\n"
+    "- Important context, constraints, or user preferences\n"
+    "- What remains to be done (clear next steps)\n"
+    "- Any critical data, examples, or references needed to continue\n\n"
+    "Be concise, structured, and focused on helping the next LLM seamlessly "
+    "continue the work. Return only the summary."
+)
+
+COMPACTION_ITEM_TYPES = ("compaction", "compaction_summary", "context_compaction")
+
+
+def _has_compaction_trigger(payload):
+    """True when a Responses request is Codex's native compaction turn."""
+    if not isinstance(payload, dict):
+        return False
+    inp = payload.get("input")
+    if isinstance(inp, str):
+        return inp.strip() == "compaction_trigger"
+    if isinstance(inp, list):
+        return any(isinstance(item, dict) and item.get("type") == "compaction_trigger"
+                   for item in inp)
+    return False
+
+
+def _encode_compaction_summary(text):
+    """Pack a summary into the opaque string Codex stores and replays."""
+    raw = json.dumps({"v": 1, "summary": str(text or "")},
+                     ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _decode_compaction_summary(blob):
+    """Best-effort decode of a compaction item's `encrypted_content`."""
+    text = str(blob or "").strip()
+    if not text:
+        return ""
+    try:
+        padded = text + "=" * (-len(text) % 4)
+        obj = json.loads(base64.b64decode(padded).decode("utf-8"))
+        if isinstance(obj, dict) and isinstance(obj.get("summary"), str):
+            return obj["summary"]
+    except Exception:
+        pass
+    # A foreign provider may hand back plain text; keep it rather than drop the
+    # only copy of the summary.
+    return text
+
+
 def _responses_input_to_messages(payload):
     """Turn the Responses input items into chat messages."""
     messages = []
@@ -16042,6 +16303,23 @@ def _responses_input_to_messages(payload):
                         "content": ("[Message from another task - treat this as "
                                     "a user instruction]" + chr(10) + chr(10) + text),
                     })
+            elif itype in COMPACTION_ITEM_TYPES:
+                # A compaction result from an earlier turn. Codex replays it as
+                # an opaque item; to the upstream it is the handoff summary the
+                # rest of the conversation builds on, so keep it as a system
+                # message ahead of the replayed history.
+                summary = _decode_compaction_summary(item.get("encrypted_content"))
+                if summary.strip():
+                    messages.append({
+                        "role": "system",
+                        "content": ("Summary of the earlier conversation "
+                                    "(context checkpoint):" + chr(10) + chr(10)
+                                    + summary.strip()),
+                    })
+            elif itype == "compaction_trigger":
+                # The control item that asks for this compaction turn. It has no
+                # message payload of its own; the caller handles the request.
+                pass
             elif itype == "additional_tools":
                 # 由 responses_to_chat() 统一提取合并进 chat["tools"]，此处无需生成 message
                 pass
@@ -16051,9 +16329,37 @@ def _responses_input_to_messages(payload):
     return messages
 
 
-def responses_to_chat(payload):
+def _looks_like_compaction_prompt(messages):
+    """True when the client already asked for a handoff summary itself.
+
+    Codex's legacy `/responses/compact` sends the summarization prompt as the
+    last user message; the native v2 turn sends only the history and a
+    `compaction_trigger`. Adding our prompt in the first case would ask the
+    model to summarize twice.
+    """
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = message.get("content")
+        if isinstance(text, list):
+            text = " ".join(str((p or {}).get("text") or "") for p in text
+                            if isinstance(p, dict))
+        if "CONTEXT CHECKPOINT COMPACTION" in str(text or "").upper():
+            return True
+        break
+    return False
+
+
+def responses_to_chat(payload, compaction=False):
     """Translate a Responses API request body into a Chat Completions body."""
+    if not compaction:
+        compaction = _has_compaction_trigger(payload)
     messages = _responses_input_to_messages(payload)
+    if compaction and not _looks_like_compaction_prompt(messages):
+        # A compaction turn is a request to summarize, not to continue the task.
+        # Ask for the handoff summary directly and withhold the tools, so the
+        # model cannot spend the turn calling one.
+        messages.append({"role": "user", "content": COMPACTION_PROMPT})
     chat = {"model": payload.get("model"), "messages": messages}
     if preserve_request_contract_enabled():
         text = payload.get("text")
@@ -16091,7 +16397,7 @@ def responses_to_chat(payload):
     if isinstance(payload.get("tools"), list):
         raw_tools.extend(payload["tools"])
     raw_tools.extend(additional_tools_from_input(payload))
-    if raw_tools:
+    if raw_tools and not compaction:
         flat_tools, ns_map = expand_namespace_tools(raw_tools)
         chat["tools"] = _tools_for_chat(flat_tools)
         chat["_namespace_map"] = ns_map
@@ -16099,14 +16405,14 @@ def responses_to_chat(payload):
     # function（见 wb_webtools.install_tool_defs）。
     # 看板开关关闭时原样透传，客户端自己的同名工具不受影响。
     # 用合并后的清单：工具可能整份都在 additional_tools 里，只看顶层会漏。
-    if local_web_tools_enabled():
+    if local_web_tools_enabled() and not compaction:
         wants = wb_webtools.client_wants_web(raw_tools)
         if wants["search"] or wants["fetch"]:
             chat["tools"] = wb_webtools.install_tool_defs(chat.get("tools") or [], wants)
             chat["_web_tools"] = True
-    if payload.get("tool_choice"):
+    if payload.get("tool_choice") and not compaction:
         chat["tool_choice"] = payload["tool_choice"]
-    if payload.get("parallel_tool_calls") is not None:
+    if payload.get("parallel_tool_calls") is not None and not compaction:
         chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
     return chat
 
@@ -17583,6 +17889,16 @@ def _release_key_slot(key_entry):
         else:
             _key_active_concurrency.pop(k_id, None)
 
+# 面板上「不带参数」的 POST 按钮：按钮会带一个 `{}` body，而路由从不解析它。
+# 这些 body 必须在分发前排空 —— 否则那 2 个字节留在 socket 里，同一条 keep-alive
+# 连接上的下一个请求会以 "{}GET /usage?..." 进场 → 501，面板那一轮轮询白丢（日志里
+# 是 `code 501, message Unsupported method ('{}GET')`，紧跟在一条 200 的 POST
+# 之后一两秒）。集中一处是因为按路由各写一遍已经漏过两回：/console/toggle 与
+# /shutdown 修好之后，/updates/check、/updates/install、/quota-scan/run 又漏了。
+# 新增这类「不读 body」的面板路由，请加进这个元组，别在路由里另写一份。
+BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
+                        "/updates/install", "/quota-scan/run")
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # 关掉 Nagle（对连接设 TCP_NODELAY）：响应头和响应体是两次独立 write，Nagle
@@ -17664,7 +17980,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.7.29"
+    server_version = "wb-proxy/1.7.30"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -17798,6 +18114,9 @@ class Handler(BaseHTTPRequestHandler):
         headers = getattr(self, "headers", None)
         if headers is None:
             return
+        # 排空即视为「body 已取走」：分发处排空过一次之后，路由里的 _error() 还会
+        # 再调一次，重复读同一段 Content-Length 字节会一直等到客户端放弃。
+        self._body_consumed = True
         transfer_encoding = (headers.get("Transfer-Encoding") or "").lower()
         try:
             if "chunked" in transfer_encoding:
@@ -18341,21 +18660,13 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"supported": True, "mode": "web", "visible": False})
 
     def _route_console_toggle(self):
-        # 按钮请求均携带 `{}` body 但不解析：必须把残留字节读掉，否则同一条
-        # keep-alive 连接上的下一个请求会以 "{}POST /console/toggle" 进场 →
-        # 501（2026-10-16 面板连点按钮实测）。顺序与 _error 相同：先应对
-        # Expect: 100-continue，否则排空会等待一个永远不会发出的 body。
-        self._handle_expect_continue()
-        self._discard_body()
+        # 按钮的 `{}` body 已在 do_POST 分发前排空（见 BODYLESS_PANEL_POSTS）。
         # 兼容旧面板：新面板直接 window.open，不再请求这里。
         return self._json(200, {"ok": True, "mode": "web",
                                 "url": "/dashboard?tab=logs", "visible": False})
 
     def _route_shutdown(self):
-        # 同 toggle：按钮的 `{}` body 不解析也必须排空，否则它会污染同一条
-        # keep-alive 连接上的下一个请求（连点触发 501）。
-        self._handle_expect_continue()
-        self._discard_body()
+        # 同 toggle：按钮的 `{}` body 已在 do_POST 分发前排空（见 BODYLESS_PANEL_POSTS）。
         # 回响应、延迟退出：0.4s 让 _json 的 body 先 flush 到 socket；端口
         # 随进程释放，下次启动走原来的启动脚本。
         def _bye():
@@ -18428,11 +18739,20 @@ class Handler(BaseHTTPRequestHandler):
             data = [m for m in data
                     if models_available_for(m.get("id"),
                                             req_realm or CURRENT_REALM)]
-        marks = wb_entitlements.snapshot(ACCOUNTS_DIR, req_realm or CURRENT_REALM)
+        # #505: 单向标注——只说「免费账号不可用」，从不宣称可用。数据源就是
+        # 调度器拦人用的那份 tier map（上游目录的 `modelTiers`），所以标注与
+        # 实际拦截不可能互相矛盾：被门控的模型在本地就被拒，请求根本发不到
+        # 上游——这也是「撞到 11158 才写标」那条旧通道后来一直空着的原因。
+        # 没有标注 = 未知，不等于可用。
+        label_realm = req_realm or CURRENT_REALM
+        gate_at = wb_tiers.ingested_at(label_realm)
         for m in data:
-            ent = (marks.get(req_realm or CURRENT_REALM) or {}).get(m.get("id"))
-            if ent:
-                m["entitlement"] = ent
+            if wb_tiers.requires_pro(m.get("id"), label_realm):
+                m["entitlement"] = {
+                    "source": "catalog",
+                    "required": "standard",
+                    "at": gate_at,
+                }
         payload = {"object": "list", "data": data,
                    "realm": req_realm or CURRENT_REALM}
         # 来源说明（面板展示用）：这批清单是上游 API 实时取的，还是读的
@@ -19418,6 +19738,16 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
             reply["daily_chat_web_timeout"] = raw
+        if "daily_chat_web_retry_backoff" in payload:
+            # Whole seconds, 0 = off. Only rounds that never reached the turn
+            # sleep, and each wait is capped, so a stray extra digit costs
+            # seconds rather than hours - wb_settings owns both checks.
+            raw = payload.get("daily_chat_web_retry_backoff")
+            try:
+                wb_settings.set_daily_chat_web_retry_backoff(ACCOUNTS_DIR, raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["daily_chat_web_retry_backoff"] = raw
         if "daily_chat_web_fallback" in payload:
             raw = payload.get("daily_chat_web_fallback")
             if not isinstance(raw, bool):
@@ -19503,6 +19833,29 @@ class Handler(BaseHTTPRequestHandler):
                                    "invalid_request_error")
             wb_settings.set_realm_fallback_enabled(ACCOUNTS_DIR, raw)
             reply["realm_fallback_enabled"] = raw
+        if "account_max_concurrent" in payload:
+            # 账号级并发上限：0 = 不限（默认，与上游一字不差）；1..10 = 每账号
+            # 同时最多几个 chat 请求。严格整数，字符串 "1" 不算数（它会被当成
+            # 布尔/字符串混进 settings.json，下次读出来就不是上限了）。
+            raw = payload.get("account_max_concurrent")
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                return self._error(
+                    400, "account_max_concurrent must be a whole number",
+                    "invalid_request_error")
+            try:
+                value = wb_settings.set_account_max_concurrent(ACCOUNTS_DIR, raw)
+            except ValueError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            reply["account_max_concurrent"] = value
+        if "affinity_stable_key_enabled" in payload:
+            # 更稳的会话粘滞键：严格 JSON 布尔（字符串 "false" 会是真值）。
+            raw = payload.get("affinity_stable_key_enabled")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "affinity_stable_key_enabled must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_affinity_stable_key_enabled(ACCOUNTS_DIR, raw)
+            reply["affinity_stable_key_enabled"] = raw
         if "log_db_enabled" in payload or "log_db_max_rows" in payload \
                 or "log_db_max_days" in payload or "log_db_max_bytes" in payload:
             # 日志落库（默认关闭）：开关与三条保留上限一次提交里可以任选子集，
@@ -20174,6 +20527,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_accounts_delete(payload)
         if path == "/accounts/import":
             return self._route_accounts_import(payload)
+        if path == "/accounts/add-api-key":
+            return self._route_accounts_add_api_key(payload)
         return self._error(404, "unknown account endpoint", "invalid_request_error")
     def _route_accounts_product(self, payload):
         """切换出站身分（cli <-> workbuddy），并即时回传结果。
@@ -20582,7 +20937,14 @@ class Handler(BaseHTTPRequestHandler):
     def _route_accounts_checkin(self, payload):
         uid = payload.get("uid")
         invalidate_tasks_cache()          # 签到会改连续打卡状态，成长任务快照随之作废
-        targets = [POOL.get(uid)] if uid else [a for a in (POOL.accounts if POOL else []) if a.realm == "cn"]
+        # 只挑有个人成长体系的号：静态 API Key 与企业号都没有，签到端点对它们
+        # 一律拒绝，发过去只是白烧一次上游请求。
+        # 任务开关（#521）同样要遵守：停用任务参与的号不跑签到。
+        targets = ([POOL.get(uid)] if uid
+                   else [a for a in (POOL.accounts if POOL else [])
+                         if a.realm == "cn"
+                         and a.task_active()
+                         and not a.uses_enterprise_billing()])
         results = []
         for account in targets:
             if account is None:
@@ -20911,6 +21273,73 @@ class Handler(BaseHTTPRequestHandler):
         log("account %s deleted" % uid[:8])
         return self._json_panel(200, {"deleted": removed, "accounts": account_views()})
 
+    def _route_accounts_add_api_key(self, payload):
+        """新增静态 API Key 账号（CodeBuddy 平台签发，ck_/pt_ 前缀）。
+
+        与 OAuth 扫码是两条并列的入口：静态 Key 无法走设备流（CodeBuddy 的
+        登录页不支持企业微信扫码），只能手工粘贴。
+
+        流程是「先验后落盘」：这类 Key 没有本地可校验的签名字段，唯一可靠的
+        判据是拿它打一次企业额度端点。探测失败就 400 且不写任何文件——坏号
+        进池之后选号侧会反复选中它、每次失败都要冷却换号，表象是「网关时好
+        时坏」，比拒绝添加难查得多。
+        """
+        key = str(payload.get("key") or payload.get("accessToken") or "").strip()
+        if not key:
+            return self._error(400, "key is required", "invalid_request_error")
+        if not wb_accounts.is_api_key_token(key):
+            return self._error(
+                400,
+                "this is not a static API key: expected the ck_/pt_ prefix "
+                "issued by the CodeBuddy API console",
+                "invalid_request_error")
+        nickname = str(payload.get("nickname") or "").strip()
+        uid = str(payload.get("uid") or "").strip()
+        try:
+            account = wb_accounts.Account({
+                "uid": uid,
+                "nickname": nickname,
+                "accessToken": key,
+                "realm": "cn",
+                "platform": "CLI",
+                "source": wb_accounts.SOURCE_API_KEY,
+                "enabled": True,
+                "tasksEnabled": False,
+            })
+        except Exception as exc:
+            return self._error(400, "cannot build account: %s" % exc,
+                               "invalid_request_error")
+        if not account.uid:
+            return self._error(
+                400,
+                "cannot derive a uid from this key; pass uid explicitly",
+                "invalid_request_error")
+        probe = account.probe_api_key()
+        if not probe.get("ok"):
+            return self._error(
+                400,
+                "the key did not pass the balance probe, so it was not saved: %s"
+                % (probe.get("error") or "unknown error"),
+                "invalid_request_error")
+        existed = POOL.get(account.uid) is not None if POOL else False
+        POOL.add(account)
+        try:
+            account.fetch_credits()
+        except Exception:
+            # 额度读失败不影响账号可用性：add() 已落盘，下一个刷新周期会补。
+            pass
+        log("account added (api key): uid=%s nickname=%r probe=ok(%s/%s)"
+            % (account.uid[:8], account.nickname,
+               probe.get("used"), probe.get("limit")), tag="accounts")
+        return self._json_panel(200, {
+            "ok": True,
+            "uid": account.uid,
+            "nickname": account.nickname or account.uid[:8],
+            "updated": existed,
+            "probe": probe,
+            "account": account.public(),
+        })
+
     def _route_accounts_import(self, payload):
         # Import a previously exported document (or any hand-written list
         # of accounts). Body shapes accepted, see wb_accounts._coerce_account_rows:
@@ -20962,13 +21391,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
+        # A legacy `/responses/compact` call carries the summarization prompt in
+        # the body, not a `compaction_trigger`, so it counts as compaction too.
+        is_compact_path = self.path.split("?")[0].rstrip("/").endswith("/responses/compact")
+        compaction = is_compact_path or _has_compaction_trigger(payload)
         # The gateway is stateless: it keeps no store of previous responses,
         # so it cannot replay a prior turn. Silently ignoring the field would
         # answer a follow-up as if it were a fresh conversation - the client
         # gets a normal-looking reply with the context missing. Say so instead.
         # 拒绝 namespace 工具，逼 Codex fallback 成 flat 工具清单。
         # 不这样做的话，MCP／外挂工具全部会被 app 判定为不可执行。
-        if payload.get("previous_response_id"):
+        if payload.get("previous_response_id") and not compaction:
             return self._error(
                 400,
                 "previous_response_id is not supported: this gateway does not "
@@ -20984,7 +21417,7 @@ class Handler(BaseHTTPRequestHandler):
         all_tools = list(all_tools) if isinstance(all_tools, list) else []
         all_tools.extend(additional_tools_from_input(payload))
         custom_names = custom_tool_names(all_tools)
-        chat_req = responses_to_chat(payload)
+        chat_req = responses_to_chat(payload, compaction=compaction)
         ns_map = chat_req.pop("_namespace_map", None)
         # Echo these back on the response object; see chat_to_response.
         request_meta = {
@@ -20997,11 +21430,11 @@ class Handler(BaseHTTPRequestHandler):
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
         log(
-            "responses: model=%s stream=%s msgs=%d effort=%r tools=%d/%d custom_tools=%s key=%s"
+            "responses: model=%s stream=%s msgs=%d effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
             % (model, want_stream, len(chat_req.get("messages") or []),
                chat_req.get("reasoning_effort"),
                len(chat_req.get("tools") or []), len(all_tools),
-               sorted(custom_names) or "-", key_label(self._key_id()) or "-")
+               sorted(custom_names) or "-", compaction, key_label(self._key_id()) or "-")
         )
         try:
             explicit_realm = self._request_realm()
@@ -21068,6 +21501,10 @@ class Handler(BaseHTTPRequestHandler):
                                    " - add or enable one at the dashboard (/)")
             return self._error(502, f"upstream unreachable: {exc}")
         with upstream:
+            if compaction:
+                return self._responses_compaction_response(
+                    upstream, model, fp, account, t_start, want_stream,
+                    session_key=session_key, realm=req_realm)
             if want_stream:
                 return self._responses_stream_response(
                     upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
@@ -21077,6 +21514,100 @@ class Handler(BaseHTTPRequestHandler):
                 upstream, model, custom_names, request_meta, fp, account, t_start, ns_map,
                 base_body=chat_req, session_key=session_key, realm=req_realm,
                 effort=effort)
+
+    def _responses_compaction_response(self, upstream, model, fp, account, t_start,
+                                       want_stream, session_key=None, realm=None):
+        """Answer Codex remote compaction v2 with one `compaction` item.
+
+        Codex sends the full retained history plus `{"type":"compaction_trigger"}`
+        and requires exactly one compaction output item in the stream; the
+        provider's own compaction summary is opaque to it. The upstream is a
+        plain Chat Completions API, so the gateway asks for the handoff summary
+        itself (see COMPACTION_PROMPT) and hands it back in `encrypted_content`.
+        Returning ordinary text here makes Codex report `got 0 compaction output
+        items` and keeps the uncompacted history, which is how a long thread
+        walks past the model's window.
+        """
+        try:
+            chat_obj = aggregate_stream(upstream, model, None)
+        except Exception as exc:
+            record_error(model, 502, "compaction failed: %s" % exc,
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=account.uid, key=self._key_id())
+            return self._error(502, "upstream stream error: %s" % exc)
+        choice = (chat_obj.get("choices") or [{}])[0]
+        summary = str((choice.get("message") or {}).get("content") or "").strip()
+        if not summary:
+            record_error(model, 502, "compaction produced no summary",
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         account=account.uid, usage=chat_obj.get("usage"),
+                         stream=False, fp=fp, outcome="failed", key=self._key_id())
+            return self._error(
+                502, "compaction produced no summary (the model returned no text); retry")
+        wall = int((time.time() - t_start) * 1000)
+        record_upstream_usage(upstream, model, chat_obj.get("usage"), stream=False,
+                              elapsed_ms=wall, fp=fp, account=account.uid,
+                              key=self._key_id())
+        item = {
+            "id": _new_id("cmp_"),
+            "type": "compaction",
+            "encrypted_content": _encode_compaction_summary(summary),
+        }
+        usage = _responses_usage(chat_obj.get("usage")) or {}
+        if not want_stream:
+            obj = {
+                "id": _new_id("resp_"),
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "completed",
+                "model": model,
+                "output": [item],
+                "output_text": "",
+                "metadata": {},
+                "usage": usage,
+            }
+            return self._json(200, obj)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        if cors_origin_allowed(self.path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        resp_id = _new_id("resp_")
+        seq = 0
+
+        def ev(etype, payload):
+            nonlocal seq
+            seq += 1
+            data = {"type": etype, "sequence_number": seq}
+            data.update(payload)
+            body = json.dumps(data, ensure_ascii=False)
+            return ("event: " + etype + chr(10) + "data: " + body
+                    + chr(10) + chr(10)).encode("utf-8")
+
+        base = {
+            "id": resp_id,
+            "object": "response",
+            "created_at": int(time.time()),
+            "model": model,
+            "output": [item],
+            "output_text": "",
+            "metadata": {},
+        }
+        try:
+            self.wfile.write(ev("response.created", {"response": dict(base, status="in_progress", output=[])}))
+            self.wfile.write(ev("response.in_progress", {"response": dict(base, status="in_progress", output=[])}))
+            # Codex's remote-compaction collector only reads output_item.done;
+            # an `added` frame for this item would hand it an empty summary.
+            self.wfile.write(ev("response.output_item.done", {"output_index": 0, "item": item}))
+            self.wfile.write(ev("response.completed", {
+                "response": dict(base, status="completed",
+                                 usage=usage or {"input_tokens": 0, "output_tokens": 0}),
+            }))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
 
     def _responses_stream_response(self, upstream, model, custom_names, request_meta, fp, account, t_start, namespace_map=None, base_body=None, session_key=None, realm=None, effort=None):
         self.send_response(200)
@@ -21408,6 +21939,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._apply_pinned_route():
             return
         path = self.path.split("?")[0]
+        if path in BODYLESS_PANEL_POSTS:
+            # 这一组路由不解析 body，但面板按钮确实会发一个 `{}`：不在这里排空，
+            # 残留字节就会成为同一条连接上下一个请求的请求行（见 BODYLESS_PANEL_POSTS
+            # 的注释）。顺序与 _error() 相同：先应对 `Expect: 100-continue`，否则客户端
+            # 根本不发 body，排空会一直等一个永远不会到的载荷。
+            self._handle_expect_continue()
+            self._discard_body()
         if path == "/console/toggle":
             # Panel-only management write: 收起/唤出本进程自己的控制台窗口，
             # 与设置、定价那几个写入同一个门。按钮带 `{}` body，
@@ -21527,7 +22065,8 @@ class Handler(BaseHTTPRequestHandler):
         if not is_account_route and not is_messages_route and path not in (
                 "/v1/chat/completions", "/chat/completions",
                 "/v1/completions", "/completions",
-                "/v1/responses", "/responses"):
+                "/v1/responses", "/responses",
+                "/v1/responses/compact", "/responses/compact"):
             return self._error(404, "not found", "invalid_request_error")
         if is_messages_route:
             if not self._key_ok():
@@ -21604,7 +22143,8 @@ class Handler(BaseHTTPRequestHandler):
                     pass
                 return self._error(400, background_request_message(reason),
                                    "invalid_request_error")
-        if path in ("/v1/responses", "/responses"):
+        if path in ("/v1/responses", "/responses",
+                    "/v1/responses/compact", "/responses/compact"):
             return self._handle_responses(payload)
         # Diagnostics: what the client actually asked for, and what we forward.
         # Only the knobs that change behaviour are logged - never message text.
@@ -21810,6 +22350,16 @@ class Handler(BaseHTTPRequestHandler):
                                 # been flushed at end of stream.
                                 pending_finish = ch["finish_reason"]
                                 ch["finish_reason"] = None
+                    # One response must carry one id. Upstream frames keep the
+                    # upstream id while the text frames this gateway rewrites
+                    # carry its own `chatcmpl-wb-*` one, so a single reply went
+                    # out as two interleaved streams. Clients that key stream
+                    # state by id then see the reasoning half (upstream id,
+                    # never a finish_reason) and the answer half separately,
+                    # and the turn hangs on "still generating" forever even
+                    # though both halves arrived. Normalise before emitting.
+                    if isinstance(maybe, dict) and maybe.get("id"):
+                        maybe["id"] = stream_chunk_id
                     cleaned = clean_chunk(
                         json.dumps(maybe, ensure_ascii=False)
                         if isinstance(maybe, dict) else data)

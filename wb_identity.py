@@ -604,6 +604,13 @@ def build_identity_headers(product, realm, uid, token,
         headers.update(cli_stainless_headers())
         headers.update(trace_headers(with_parent=True))
 
+    # 静态 API Key（ck_/pt_）：官方 CLI 两个头都发（Authorization 与 X-API-Key
+    # 任一均可鉴权）。只发 Authorization 时，/v3/config 的模型清单只下发 54 条
+    # 而不是 56 条——差的 4 个（glm-5.2-aicc / glm-5.3-flashx / kimi-k3-2 /
+    # minimax-m3-pay）会静默消失，所以两头都发。
+    if str(token or "").startswith(("ck_", "pt_")):
+        headers["X-API-Key"] = str(token)
+
     if enterprise_id:
         headers["X-Enterprise-Id"] = str(enterprise_id)
         headers["X-Tenant-Id"] = str(tenant_id or enterprise_id)

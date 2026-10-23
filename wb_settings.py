@@ -132,6 +132,81 @@ EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
 # 打开后方向仍是单向的：只有 intl → cn，永远不会把请求从国内版打到国际版。
 REALM_FALLBACK_ENABLED_KEY = "realm_fallback_enabled"
 
+# 账号级并发上限：同一个上游账号同时最多跑几个 chat 请求。缺失键读作 0（不限），
+# 老安装的派发行为与上游一字不差。
+#
+# 为什么需要它：上游按「账号 + 分钟」计 token（TPM），而一个大上下文会话单请求
+# 就带十几万 token。两个会话同时落在一个账号上，一分钟内轻松过百万 token，上游
+# 直接回 429；网关随即把该账号停放 60 秒并换号，新账号没有这段对话的前缀缓存，
+# 缓存命中率从 99% 掉到 0、TTFT 从 1.5s 涨到 5-6s。也就是说「并发越高」反而让
+# 每个请求更慢。设成 1 时两个会话自然分到两个账号，各走各的缓存。
+ACCOUNT_MAX_CONCURRENT_KEY = "account_max_concurrent"
+#: 上限值域：0 = 不限；1..10 是「每账号同时几个」。10 只是防手滑的上界。
+ACCOUNT_MAX_CONCURRENT_MAX = 10
+
+
+def account_max_concurrent(accounts_dir):
+    """How many chat requests one upstream account may run at once.
+
+    0 (the default) means unlimited: dispatch behaves exactly as upstream does.
+    Anything unreadable falls back to 0 rather than to a limit, so a hand-edited
+    settings.json can never silently throttle a working install.
+    """
+    value = load(accounts_dir).get(ACCOUNT_MAX_CONCURRENT_KEY)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    if value < 0 or value > ACCOUNT_MAX_CONCURRENT_MAX:
+        return 0
+    return value
+
+
+def set_account_max_concurrent(accounts_dir, value):
+    """Persist the per-account concurrency cap. Returns the stored whole number."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("account_max_concurrent must be a whole number")
+    if value < 0:
+        raise ValueError("account_max_concurrent cannot be less than 0")
+    if value > ACCOUNT_MAX_CONCURRENT_MAX:
+        raise ValueError("account_max_concurrent cannot be more than %d"
+                         % ACCOUNT_MAX_CONCURRENT_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data[ACCOUNT_MAX_CONCURRENT_KEY] = value
+        save(accounts_dir, data)
+    return value
+
+# 更稳的会话粘滞键：把「首条 assistant 回复 + 它后面那条 user」也算进会话键。
+#
+# 为什么需要：会话键原本只用【system + 首条 user】，两个开场白相同的会话会算出
+# 同一个键、共享同一个绑定槽，于是每轮互相覆盖、轮流换账号，缓存每轮归零
+# （见 affinity_route）。把第 2 轮才出现的内容算进去之后，两个会话从第 2 轮起
+# 各走各的账号；前缀真的完全相同的会话仍会共用账号——那本来就是最优的缓存共享。
+#
+# 默认关：改的是派发路径上的会话识别，老安装必须保持原逻辑。关着时
+# affinity_route 与上游一字不差，可随时回退。
+AFFINITY_STABLE_KEY_ENABLED_KEY = "affinity_stable_key_enabled"
+
+
+def affinity_stable_key_enabled(accounts_dir):
+    """Whether the conversation key also covers the first assistant turn."""
+    return load(accounts_dir).get(AFFINITY_STABLE_KEY_ENABLED_KEY) is True
+
+
+def set_affinity_stable_key_enabled(accounts_dir, enabled):
+    """Persist the stable-affinity-key switch. Returns the stored boolean.
+
+    Strict on purpose: ``bool("false")`` is True, so a string that slipped in
+    from a caller would silently turn the new key on. The HTTP layer already
+    rejects non-booleans; this keeps every other caller honest too.
+    """
+    if not isinstance(enabled, bool):
+        raise ValueError("affinity_stable_key_enabled must be true or false")
+    with _lock:
+        data = load(accounts_dir)
+        data[AFFINITY_STABLE_KEY_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
 # 日志落库：把运行日志追加写进 usage/logs.sqlite3，重启后仍能回看，方便事后
 # debug。缺失键读作关 —— 关着的时候日志只留在内存环形缓冲里，与上游一字不差；
 # 只有显式 true 才建库、落盘。
@@ -2185,6 +2260,49 @@ def set_daily_chat_web_timeout(accounts_dir, seconds):
     with _lock:
         data = load(accounts_dir)
         data["daily_chat_web_timeout"] = seconds
+        save(accounts_dir, data)
+    return seconds
+
+
+#: 「还没跑到 turn 就失败」（建会话 5xx、取沙箱失败）时的退避基数上限（秒）。
+#: 那一轮只花掉几百毫秒、不消耗任何等待预算，所以退避是唯一的节奏；但它同样
+#: 有上限——一个卡住的上游会让每个候选都睡这么久。
+DAILY_CHAT_WEB_RETRY_BACKOFF_MAX = 60
+#: 没配过时的退避基数（秒）。调用方另有内置默认（wb_accounts.WEB_RETRY_BACKOFF，
+#: 吃 WB_WEB_RETRY_BACKOFF 环境变量）时会把自己的默认传进来。
+DAILY_CHAT_WEB_RETRY_BACKOFF_DEFAULT = 5
+
+
+def daily_chat_web_retry_backoff(accounts_dir, default=None):
+    """Seconds to wait before retrying a round that never reached the turn.
+
+    0 disables the backoff, which is the pre-1.7.x timing (retry immediately).
+    ``default`` is what an unset install gets, so a caller that has its own
+    built-in default (the env-overridable ``WB_WEB_RETRY_BACKOFF``) keeps it.
+    Anything that is not a whole number in range also falls back to it.
+    """
+    if default is None:
+        default = DAILY_CHAT_WEB_RETRY_BACKOFF_DEFAULT
+    value = load(accounts_dir).get("daily_chat_web_retry_backoff")
+    if (isinstance(value, bool) or not isinstance(value, int)
+            or value < 0 or value > DAILY_CHAT_WEB_RETRY_BACKOFF_MAX):
+        return default
+    return value
+
+
+def set_daily_chat_web_retry_backoff(accounts_dir, seconds):
+    """Persist the backoff base. Returns the stored whole number of seconds."""
+    if isinstance(seconds, bool) or not isinstance(seconds, int):
+        raise ValueError(
+            "daily_chat_web_retry_backoff must be a whole number of seconds")
+    if seconds < 0:
+        raise ValueError("daily_chat_web_retry_backoff cannot be negative")
+    if seconds > DAILY_CHAT_WEB_RETRY_BACKOFF_MAX:
+        raise ValueError("daily_chat_web_retry_backoff cannot be more than %d"
+                         % DAILY_CHAT_WEB_RETRY_BACKOFF_MAX)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_chat_web_retry_backoff"] = seconds
         save(accounts_dir, data)
     return seconds
 
