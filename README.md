@@ -1,12 +1,33 @@
 # WorkBuddy2API-Hub — 国际版、国内版多账号网关中枢
 
+> [!IMPORTANT]
+> **项目进入低频维护（2026-10-23） / Low-frequency maintenance**
+>
+> 大幅降低更新频率与 Issue / PR 处理速度。请先阅读风险说明，再决定是否继续使用。
+>
+> Updates and responses to issues / pull requests will be significantly reduced. Read the risk notice below before continuing.
+
+> [!WARNING]
+> **WorkBuddy 上游正在收紧对非官方客户端的识别与拦截。**
+>
+> - **封禁**：2026-10-23 下午起，非官方客户端的识别与拦截明显收紧。
+> - **维护者**：近期工作压力增大，无法保证及时更新与响应。
+> - **可用性**：上游可能随时进一步收紧，导致本项目不可用。
+> - **账号风险**：使用非官方客户端造成的风控、限流或封禁，由使用者自行承担。
+>
+> **Upstream enforcement** tightened detection and blocking of unofficial clients from the afternoon of 2026-10-23. The maintainer is under increased workload and cannot guarantee timely updates or replies. The upstream may tighten further at any time; rate limits, account restrictions or bans caused by using an unofficial client are the user's responsibility.
+
+本项目仅用于协议学习、研究与个人自用。请优先使用官方客户端，不要使用主账号，不要共享账号，也不要用于商业转售。
+
+This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
+
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.7.32-2496ED?style=flat-square" alt="Version 1.7.32"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v1.8.0-2496ED?style=flat-square" alt="Version 1.8.0"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
   <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/Vibe_Coding-100%25-ff69b4?style=flat-square" alt="Vibe Coding">
+  <img src="https://img.shields.io/badge/Maintenance-Low--frequency-c96f3d?style=flat-square" alt="Low-frequency maintenance">
 </p>
 
 把腾讯 **[www.workbuddy.ai](https://www.workbuddy.ai)**（国际版）与 **[codebuddy.cn](https://www.codebuddy.cn)**（国内版）的原生服务封装成标准 OpenAI 兼容接口（Chat Completions / Responses），并提供默认关闭的实验性 Anthropic Messages 适配；同时补齐多账号调度与运维能力：
@@ -472,11 +493,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
-### Unreleased
-
-- **修复动态取色对比度不足，并说明 `file://` 无法登录面板**（#536）：色彩配置此前只给低对比度标 ⚠，仍然实时应用并写入 `localStorage`，下次打开时调色台是收起状态，用户看不到警告；半透明表面还可能被输入框的十六进制格式当成黑色。现在正文、信号色与主按钮字按实际背景（含 `rgba()` 叠加）计算 WCAG 对比度，低于 `4.5:1` 时以当前内置主题色为基准向黑白方向夹取，输入框、导出值与持久化值同步为校正后的颜色，已有不达标配置也会在加载时纠正。直接双击 `dashboard.html` 时不再发相对请求后显示 `Failed to fetch`，而是在登录闸门内提示改用 `http://127.0.0.1:8788/`。启动后自动打开面板仍保持显式 opt-in，不改变无头 / 服务器部署的默认行为。新增 2 个 JS 套件（对比度与 `file://` 登录各 1 个），完整套件 226 项。 / Fix low-contrast custom themes and explain why opening the panel from disk cannot log in (#536): the colour tuner used to mark low contrast with ⚠ but still applied and persisted the value, and the tuner is closed on the next load, so the warning was invisible; translucent surfaces could also turn black in the hex colour inputs. Body text, signal colours and button labels are now checked against their real backgrounds (including `rgba()` compositing) and clamped toward black or white from the active built-in palette when below `4.5:1`; the input, exported values and persisted values all receive the corrected colour, and a previously saved non-compliant palette is fixed on load. Opening `dashboard.html` directly now shows an instruction to use `http://127.0.0.1:8788/` instead of sending a relative request and reporting `Failed to fetch`. Auto-opening the dashboard after startup remains explicit opt-in, so headless and server deployments keep their current behaviour. Two new JS suites (contrast and `file://` login), 226 suites in total.
-
-- **恢复模型别名映射，并修掉后台别名误伤显式模型选择**（#617 / #619）：`accounts/settings.json` 里的 `model_aliases` 在 v1.7.29 已成为死配置，Claude Desktop 3p 只能发 `claude-*`，实际模型 id 又会被它的模型选择器过滤，导致两边的可用模型都为空。现在启动后首次 POST 会读取别名表（兼容旧的 `{别名: 目标}` 对象与 `[{from, to}]` 列表两种写法），在协议转换和选号前统一改写；未知名称原样透传。同时确认 #619 不是上游静默改道：网关自己的后台模型改写只看模型名，把用户从选择器显式选中的 `gpt-5.6-terra` / `gpt-5.6-luna` 也改成了 `deepseek-v4.1-flash`。现在只有 `client_metadata` 明确表示 `memory` / `compaction` 等后台任务时才改写。新增 `tests/_test_model_alias_and_realm.py`（14 项）及后台改写断言。 / Restore model aliases and stop the background rewrite from touching an explicit picker choice (#617 / #619): `model_aliases` in `accounts/settings.json` had been a dead setting since v1.7.29, while Claude Desktop 3p only exposes `claude-*` names and filters real model ids out of its picker, leaving neither side usable. The first POST after startup now loads the alias table (the legacy `{alias: target}` object and the `[{from, to}]` list both work), resolves it before protocol translation and account selection, and passes unknown names through unchanged. Separately, #619 was not an upstream silent redirect: the gateway's own background rewrite matched on the model name alone and also replaced a user's explicit `gpt-5.6-terra` / `gpt-5.6-luna` choice with `deepseek-v4.1-flash`. It now rewrites only when `client_metadata` identifies a background job such as `memory` or `compaction`. Added `tests/_test_model_alias_and_realm.py` (14 tests) and background-rewrite assertions.
+- **v1.8.0 发布**：汇总 v1.7.33 之后的 #640、#642、#643、#645/#647，并补齐 #578、#618、#625 的发布记录。完整变更、验证范围与已知限制见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v180)**；下一版的改动继续写在本段。
 - **修正 CN 专属模型判定，并给 OpenCode 写入真实上下文上限**（#618 / #625）：`minimax-` 曾被当成整个模型家族的 CN 专属前缀，于是国际版也提供的 `minimax-m3.1-flash` 被本地 400 拦下。现在只保留确定的 CN 独占项（`deepseek-v4-pro*` 与显式 `minimax-m3`），同族其他模型按出口实际目录判断。OpenCode 一键配置此前只写空的模型条目，客户端只能回落到自己的 200k 默认值；现在把网关目录中的 `context_window` / `max_output` 写进 `limit.context` / `limit.output`，没有规格的条目仍保持空对象。新增回归覆盖。 / Narrow the China-only model gate and give OpenCode the real context limit (#618 / #625): `minimax-` used to mark the whole family as CN-exclusive, so the globally served `minimax-m3.1-flash` was refused locally with a 400. Only the confirmed China-only entries remain (`deepseek-v4-pro*` and the explicit `minimax-m3`); other members of the family follow the actual catalogue of the selected exit. OpenCode's one-click config used to write empty model entries, so it fell back to its own 200k default; the gateway's catalogue `context_window` / `max_output` now go into `limit.context` / `limit.output`, while entries without specs stay empty objects. Regression coverage added.
 - **流式回复在真实静默期发送 SSE 心跳**（#578）：上游思考期间可能长时间一个字节都不发，而客户端会把静默误判为断流；只在每次阻塞读之前检查心跳，恰好无法覆盖它。Chat、Responses 与 Anthropic Messages 三条流式路径现在共用后台 `SSEHeartbeat`：每 15 秒无写入就发送合法的 `: keepalive` 注释帧，与业务帧共用锁，保证不会截断 JSON；响应正常时不会多插帧，流结束后线程立即停止。新增 `tests/_test_stream_keepalive.py`（9 项，含读线程阻塞期间仍收到心跳与并发写入完整性），并复跑流式 id、usage 帧、断流错误帧与重试套件。 / Keep SSE streams alive through real upstream silence (#578): while the model is thinking the upstream may send nothing for longer than the client's idle window, and checking a heartbeat only before the next blocking read cannot cover that gap. Chat, Responses and Anthropic Messages now share a background `SSEHeartbeat`: after 15 idle seconds it writes a valid `: keepalive` comment frame under the same lock as application writes, so JSON frames cannot be split; responsive streams gain no extra frames and the thread stops as soon as the stream ends. Added `tests/_test_stream_keepalive.py` (9 checks, including heartbeat delivery while the reader is blocked and write integrity under contention), and re-ran the stream id, usage-frame, abort-frame and retry suites.
 
@@ -568,7 +585,7 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 - **DSH 一键配置放宽限流重试，修掉「对话到一半链接中断」**：WorkBuddy 的 429 冷却通常约一分钟，而 DSH 的默认 `retryPolicy` 是 `normal` / 最多 5 次 / 退避 500ms 起翻倍、封顶 10s——加起来不到 16 秒就放弃，冷却还没结束回合就以 `RATE_LIMIT` 失败。一键配置现在给 `wb-proxy` 单独写 `retryPolicy: {mode: normal, maxRetries: 8, backoff: {initialDelayMs: 2000, maxDelayMs: 30000, jitterRatio: 0.1}}`（合计约 2 分半），只影响 `wb-proxy`，其它 provider 仍用默认策略；字段与取值按 `@deepseek-ai/dsh-llm` 的 `RetryPolicySchema`。已经接入过的机器重新点一次「一键配置」即可补上这段（幂等），重启 DSH 生效。
   DSH's default per-provider retry policy (normal, at most 5 retries, 500ms→10s backoff, under 16 seconds in total) gives up before WorkBuddy's ~60s rate-limit cooldown ends, so the turn dies with `RATE_LIMIT` — which the user sees as the conversation breaking mid-flight. The one-click config now writes a wider `retryPolicy` for `wb-proxy` only (8 retries, 2s initial delay, 30s cap, ~2.5 minutes in total); other providers keep the default policy. Field names and bounds follow `@deepseek-ai/dsh-llm`'s `RetryPolicySchema`. Re-running the one-click config on an already-integrated machine adds it idempotently, and a DSH restart applies it.
 
-已发布版本的完整记录（v1.4.5 ~ v1.7.30，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+已发布版本的完整记录（v1.4.5 ~ v1.8.0，含每版的 PR 归属）见 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
 
 ## 七、致谢与引用声明 (Credits & References)
 
