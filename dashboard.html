@@ -1734,7 +1734,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '候选：': 'Candidates:',
     '停用': 'Disable',
     '全维度统计输入/输出/推理 Token、缓存节省效益与各账号各模型用量': 'Full statistics on input/output/reasoning tokens, cache savings and per-account, per-model usage',
-    '全自动批量接取、事件上报点亮并领取官方成长积分 (+1450分)，以及猫猫日常与打卡': 'Fully automatic batch claiming, event reporting and claiming of the official growth credits (+1450), plus the cat daily routine and check-in',
+    '全自动批量接取、事件上报点亮并领取官方成长积分，以及猫猫日常与打卡': 'Fully automatic batch claiming, event reporting and claiming of the official growth credits, plus the cat daily routine and check-in',
     '全部': 'All',
     '全部任务': 'All tasks',
     '全部停用': 'Disable all',
@@ -3062,7 +3062,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     "全局 ": "全域性 ",
     "全局默认": "全域性預設",
     "全维度统计输入/输出/推理 Token、缓存节省效益与各账号各模型用量": "全維度統計輸入/輸出/推理 Token、快取節省效益與各帳號各模型用量",
-    "全自动批量接取、事件上报点亮并领取官方成长积分 (+1450分)，以及猫猫日常与打卡": "全自動批次接取、事件上報點亮並領取官方成長積分 (+1450分)，以及貓貓日常與打卡",
+    "全自动批量接取、事件上报点亮并领取官方成长积分，以及猫猫日常与打卡": "全自動批次接取、事件上報點亮並領取官方成長積分，以及貓貓日常與打卡",
     "全部启用": "全部啟用",
     "全部启用 · 状态健康": "全部啟用 · 狀態健康",
     "全部国内账号 (批量)": "全部國內帳號 (批次)",
@@ -4532,7 +4532,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
       <div>
         <h2 style="margin:0">国内版任务与福利</h2>
-        <div style="font-size:12px;color:var(--dim)">全自动批量接取、事件上报点亮并领取官方成长积分 (+1450分)，以及猫猫日常与打卡</div>
+        <div style="font-size:12px;color:var(--dim)">全自动批量接取、事件上报点亮并领取官方成长积分，以及猫猫日常与打卡</div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
         <select id="growthAcctSelect" onchange="switchGrowthAccount(this.value)" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--fg);font-family:inherit">
@@ -4549,10 +4549,9 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     </div>
 
     <div class="cards" style="margin-bottom:16px;grid-template-columns:repeat(auto-fit,minmax(185px,1fr))">
-      <div class="card accent2" title="活动 Season: 10 (第 10 期)&#10;活动开始时间: 2026-09-30 00:00:00&#10;活动截止时间: 2026-10-15 23:59:59">
+      <div class="card accent2" title="Buddy 加油站每日签到活动">
         <div class="k">本期 Buddy 加油站活动</div>
         <div class="v" id="cnTodayCheckinState" style="font-size:17px;letter-spacing:-.2px">-</div>
-        <div style="font-size:11px;color:var(--dim);margin-top:4px">第 10 期 (至 10-15 23:59 止)</div>
       </div>
       <div class="card" title="WorkBuddy 成长计划连续登录活跃天数；达到 7/14/28 天可兑换连登奖励">
         <div class="k">当前连续登录天数</div>
@@ -7488,7 +7487,7 @@ function renderAvailableModels(){
     let credBadge = '-';
     let credText = (m.credits == null ? '' : String(m.credits)).trim();
     const forceSg = window.CURRENT_SETTINGS && window.CURRENT_SETTINGS.deepseek_flash_force_sg === true;
-    if(m.id === 'deepseek-v4.1-flash' && forceSg){
+    if(m.id === 'deepseek-v4.1-flash' && forceSg && window.VIEW_REALM === 'intl'){
       credText = 'x0.11';
     }
     const c = credText.toLowerCase().replace('x', '');
@@ -7501,7 +7500,7 @@ function renderAvailableModels(){
         ? ' <span style="font-size:10px;color:var(--accent)">(夜间0.5x)</span>' : '';
       credBadge = '<span class="badge s">' + esc(raw) + night + '</span>';
     }
-    if(m.id === 'deepseek-v4.1-flash'){
+    if(m.id === 'deepseek-v4.1-flash' && window.VIEW_REALM === 'intl'){
       credBadge += forceSg
         ? ' <span class="badge warn" style="font-size:11px;background:var(--warn-soft);color:var(--warn);border-color:rgba(183,121,31,.35)" title="网关设置已强制出站为 deepseek-v4.1-flash-sg">出站: 强制 -sg</span>'
         : ' <span class="badge ok" style="font-size:11px" title="当前走原生 deepseek-v4.1-flash 免积分通道">出站: 原生免费</span>';
@@ -7630,7 +7629,7 @@ function renderAvailableModels(){
     //    isModelPicked() 一律返回 true——默认全部勾选，首屏不必等 GET 回来。
     const picked = isModelPicked(m.id);
     let idPill = '';
-    if(m.id === 'deepseek-v4.1-flash'){
+    if(m.id === 'deepseek-v4.1-flash' && window.VIEW_REALM === 'intl'){
       idPill = '<div style="margin-top:4px;display:inline-flex;align-items:center;gap:3px;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:1px 3px">'
         + '<button type="button" class="sec mini" style="padding:1px 7px;font-size:10px;line-height:16px;border-radius:9px;border:none;cursor:pointer;' + (!forceSg ? 'background:var(--accent2);color:#fff;font-weight:600' : 'background:transparent;color:var(--dim)') + '" onclick="setDeepseekFlashTarget(false)" title="网关后台出站使用 deepseek-v4.1-flash（免积分通道）">原生免费</button>'
         + '<button type="button" class="sec mini" style="padding:1px 7px;font-size:10px;line-height:16px;border-radius:9px;border:none;cursor:pointer;' + (forceSg ? 'background:var(--warn);color:#fff;font-weight:600' : 'background:transparent;color:var(--dim)') + '" onclick="setDeepseekFlashTarget(true)" title="网关后台出站强制重写为 deepseek-v4.1-flash-sg（新加坡付费节点）">强制 -sg</button>'
