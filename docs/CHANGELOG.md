@@ -1,3 +1,42 @@
+## v1.10.9
+
+- **面板布局与主题**：默认使用控制台布局和 Alibaba 配色，保留浏览器已有偏好；支持经典布局以及可选的新导航布局，后者提供桌面侧栏、移动端导航与分组设置（#725、#764、#765）。
+- **面板登录**：增加可选的保持登录，默认关闭；兼容浏览器部分存储不可用的情况（#763）。
+- **CodeArts 账号与调度**：支持账号备注、账号任务开关、积分刷新、签到和令牌保活调度；关闭账号任务后不再由排队或惰性签到触发（#759、#762）。
+- **CodeArts 模型与请求**：支持图片输入和模型视觉能力，校验推理档位并转发采样参数；修复 OpenAI 格式错误响应中 429 状态码丢失的问题（#758、#760、#761）。
+
+## v1.10.8
+
+CodeArts 工具归一化与空函数修复（#750 / #752）、配置并发安全（#751）、账号 UID 注入防护（#757）、日志轮转日限校验（#755）、出站身份诊断工具（#756）与 DeepSeek Flash 真实计费校准：
+
+- **CodeArts 出口工具定义归一化，修复 `Tool function cannot empty`（PR #752，感谢 @XXXoooM，解决 #750）**：
+  - CodeArts 出口构造请求体时接入完整的 `normalize_tools()` 归一化清洗：客户端发来的空 `function`、裸服务端工具（如 `{"type": "web_search"}`）或扁平声明（`{"name": ...}`）统一转换为合规 function schema；
+  - 缺失的 `parameters` 自动补齐为 `{"type": "object", "properties": {}}`，非法/空函数名条目丢弃；
+  - 当所有工具均不可用或客户端传递 `tools: []` 空列表时，彻底从请求体中移除 `tools` 与 `tool_choice` 字段，避免触发华为云上游 `Tool function cannot empty` 拦截。
+- **CodeArts 配置保存并发安全防护（PR #751，感谢 @XXXoooM）**：
+  - 将 `wb_codearts.save_config()` 完整的读-改-写三步统一纳入模块 `_LOCK` 保护，防止多浏览器/并发保存请求导致后写入者静默覆盖前者的配置字段。
+- **CodeArts 账号 UID inline onclick 安全收敛（PR #757，感谢 @ayeaaaa）**：
+  - 看板中的 CodeArts 账号 UID 操作按钮增加字符白名单安全过滤（`uidSafe`），防止单引号突破内联事件处理器导致脚本注入风险。
+- **每日用量折叠按 inode + 尾签名校验 offset（PR #755，感谢 @XXXoooM）**：
+  - `daily_usage_stats()` 接入 `_log_offset_holds()`（inode/设备/大小）与 `_log_tail_signature()` 尾部签名验证，彻底解决 `logrotate copytruncate` 原地清空并追加写入时，增量折叠静默跳过新内容或重复计入已被清空旧数据的问题。
+- **出站身份诊断脚本与 11-128 排障说明（PR #756，感谢 @XXXoooM）**：
+  - 新增离线诊断工具 `scripts/diagnose_identity.py`，脱敏输出账号出站身份信息、`x-stainless-*` 头族与请求特征；
+  - 新增 [`docs/TROUBLESHOOTING-11-128.md`](docs/TROUBLESHOOTING-11-128.md) 完整排障指引。
+- **国际版 `deepseek-v4.1-flash` 统一真实 0.11x 计费**：
+  - 经实测证实国际版官方对 DeepSeek Flash 已全面按 0.11x 计费，彻底清理了此前的「限时免费 0.00x」假标定；
+  - 移除设置页冗余的「国际版 DeepSeek 后台出站模型」切换卡片及模型列表中多余的「原生免费 / 强制 -sg」切换胶囊，模型列表恢复整洁透明展示。
+- **UI 与稳定性修复**：
+  - 账号删除时联动清除任务快照（#745，提交 `d233b17`）；
+  - 自绘下拉面板高度视口防溢出修复（#628，提交 `ef479f7`）；
+  - 嵌套 namespace 丢失父路径与 `responses_to_chat()` tool_choice 回写修复（#736，提交 `ef479f7`）；
+  - 模型列表长文本放开折行限制并增加安全最小宽度（#749，提交 `e33ec72`）；
+  - 测试进程树隔离探针优化（PR #753）与 Windows 网络读截止时间粒度适配（PR #754）。
+
+验证：
+- 完整本地测试套件 261 项全量通过（198 Python + 63 JS，`261 passed, 0 failed, 0 skipped`）；
+- `scripts/check_clean_checkout.py` 严格校验干净通过；
+- 本地 8788 网关热重启冒烟验证正常。
+
 ## v1.10.7
 
 国内版 deepseek-v4.1-flash 计费与出站路由修复（#748）、CodeArts 每日签到按活动类型识别与可选自动签到（#747）：
