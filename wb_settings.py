@@ -1902,14 +1902,6 @@ def set_enable_anthropic_messages(accounts_dir, enabled):
     return enabled
 
 
-def deepseek_flash_force_sg(accounts_dir):
-    return False
-
-
-def set_deepseek_flash_force_sg(accounts_dir, enabled):
-    return False
-
-
 def free_model_credit_fallback(accounts_dir):
     """Whether exhausted free models (deepseek-v4.1-flash) can fall back to credit siblings."""
     return load(accounts_dir).get("free_model_credit_fallback") is True
@@ -2180,6 +2172,44 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
     return enabled
 
 
+RESTRICTION_HOLD_SECONDS_KEY = "restriction_hold_seconds"
+DEFAULT_RESTRICTION_HOLD_SECONDS = 1800
+MAX_RESTRICTION_HOLD_SECONDS = 86400 * 7
+
+
+def restriction_hold_seconds(accounts_dir):
+    """How many seconds the gateway pauses dispatch when upstream reports an
+    unusual activity restriction (403 / 11140).
+
+    Defaults to 1800 seconds (30 minutes). When set to 0, restriction hold is
+    disabled. Operator can configure custom duration via panel settings.
+    """
+    val = load(accounts_dir).get(RESTRICTION_HOLD_SECONDS_KEY)
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val >= 0:
+        return float(val)
+    env_val = os.environ.get("WB_RESTRICTION_HOLD_SECONDS")
+    if env_val is not None:
+        try:
+            return max(0.0, float(env_val))
+        except (ValueError, TypeError):
+            pass
+    return float(DEFAULT_RESTRICTION_HOLD_SECONDS)
+
+
+def set_restriction_hold_seconds(accounts_dir, value):
+    """Persist the restriction hold duration in seconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        raise ValueError("restriction_hold_seconds must be a non-negative number")
+    if value > MAX_RESTRICTION_HOLD_SECONDS:
+        raise ValueError("restriction_hold_seconds exceeds maximum allowed")
+    stored = int(value) if float(value).is_integer() else round(float(value), 1)
+    with _lock:
+        data = load(accounts_dir)
+        data[RESTRICTION_HOLD_SECONDS_KEY] = stored
+        save(accounts_dir, data)
+    return stored
+
+
 def realm_fallback_enabled(accounts_dir):
     """Whether a throttled international exit may fail over to the domestic one.
 
@@ -2348,6 +2378,31 @@ def set_log_db_max_bytes(accounts_dir, value):
         data[LOG_DB_MAX_BYTES_KEY] = stored
         save(accounts_dir, data)
     return stored
+
+
+def daily_activity_enabled(accounts_dir):
+    """Whether the scheduler runs the intl daily activity at all (master switch).
+
+    On unless the operator turns it off: an install that never touched the
+    setting keeps the scheduled daily activity exactly as before. Writing
+    ``false`` stops it (like ``daily_chat_web``, any stored value other than
+    unset / ``true`` reads as off; the panel and API only ever write booleans):
+    the scheduled slots, the forced "check now" cycle and the startup catch-up
+    all skip it, while the manual per-account / batch buttons in the panel
+    still work, because those are explicit operator actions.
+    """
+    value = load(accounts_dir).get("daily_activity")
+    return True if value is None else value is True
+
+
+def set_daily_activity_enabled(accounts_dir, enabled):
+    """Persist the daily-activity master switch. Returns the stored boolean."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data["daily_activity"] = enabled
+        save(accounts_dir, data)
+    return enabled
 
 
 def daily_chat_web(accounts_dir):
