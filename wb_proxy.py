@@ -976,6 +976,14 @@ def read_catalog_dump(realm):
         return None
 MODELS_PATH = "/v2/enterprises/personal/models"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+# Routes whose request head is traced on arrival (see do_POST): the ones a
+# conversation actually uses, so the trace stays quiet on panel polling.
+_CHAT_PATHS = (
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/responses", "/responses",
+    "/v1/messages", "/messages",
+)
 
 # ---------------------------------------------------------------------------
 # Background-model redirection (desktop clients).
@@ -1003,7 +1011,57 @@ BACKGROUND_MODEL_NAMES = tuple(
 )
 
 
+INTL_MODEL_ALIASES = {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash-sg",
+}
+
+
+def intl_model_alias_enabled():
+    """The intl id remap is on unless WB_INTL_MODEL_ALIAS disables it."""
+    raw = os.environ.get("WB_INTL_MODEL_ALIAS", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def intl_model_alias(name, realm=None):
+    """The intl upstream id for `name`, or `name` unchanged.
+
+    The intl exit renamed deepseek-v4.1-flash to the "-sg" build in 2026-11:
+    the desktop client's own catalogue (and the product config fetched from
+    www.workbuddy.ai) lists only deepseek-v4.1-flash-sg, while a request for
+    the old base id answers code 6004 "usage exceeds frequency limit" on
+    accounts whose base bucket is empty.
+
+    This is an outbound alias only. Clients and /v1/models keep the logical
+    id, and API-key model checks run before the alias is applied.
+    """
+    text = str(name or "")
+    if (realm or CURRENT_REALM) != "intl" or not intl_model_alias_enabled():
+        return text
+    return INTL_MODEL_ALIASES.get(text.strip().lower(), text)
+
+
+def apply_intl_model_alias(payload, realm=None):
+    """Rewrite one request body to the intl upstream id; returns the new id.
+
+    Kept for callers that are constructing an outbound body themselves (the
+    panel probe and the window probe). The request handlers must not call it:
+    rewriting the client payload at ingress would make /v1/models and API-key
+    permissions see the upstream id instead of the logical one.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    name = str(payload.get("model") or "")
+    target = intl_model_alias(name, realm)
+    if target == name:
+        return name
+    payload["model"] = target
+    log("alias: intl model %s -> %s" % (name, target))
+    return target
+
+
 def _apply_deepseek_flash_target(payload, realm=None):
+    # Historical hook kept as a no-op: the intl alias is applied when the
+    # upstream body is built, after all client-facing model checks.
     return
 
 
@@ -3365,6 +3423,14 @@ def _remaining_refresh(state):
         log_key = _usage_log_key(path)
         if not _log_resume_ok(slot, log_key, path):
             # 文件被换掉/截短：这个来源的贡献全部作废，从零重折。
+            # 只有「续读失败」才是线索（copytruncate 式轮转、或有人在服务
+            # 运行时改/换过日志）；冷启动时 slot["key"] 本来就是 None，那不是
+            # 事故，报了只会把真正的信号淹掉。
+            folded_before = (slot.get("key") not in (None, (0, 0, 0))
+                             and (slot.get("offset") or 0) > 0)
+            if folded_before:
+                log("remaining usage fold reset (%s, %s): log replaced or truncated, "
+                    "folding from zero" % (source, path), level="WARN", tag="usage")
             state[source] = {"offset": 0, "key": log_key, "tail": b""}
             if source == "log":
                 state["usage"].clear()
@@ -9679,6 +9745,176 @@ _usage_cache_progress = {}
 _usage_cache_checkpointed = {}
 _usage_cache_last_attempt = time.time()
 
+# 补写（retry）状态：某一类这次被跳过（状态锁被占 / 状态不可序列化）时不能
+# 就这么算了 —— 实践中见过一类连续几天没落盘：现场只有 CPU 高，没有任何日志，
+# 重启后又从旧 offset 全量重折。登记一个延迟重试，成功就取消。
+# 退避：30s 起步、指数翻倍、封顶 15 分钟，成功立刻归零。
+_USAGE_CACHE_RETRY_MIN_SECONDS = 30.0
+_USAGE_CACHE_RETRY_MAX_SECONDS = 900.0
+_USAGE_CACHE_SKIP_LOG_SECONDS = 300.0
+# 加载到的 checkpoint 落后当前日志超过这么多字节就告警：它就是「重启后第一批
+# 请求又慢了几分钟」的那个数。
+_USAGE_CACHE_LAG_WARN_BYTES = 64 * 1024 * 1024
+_usage_cache_retry_lock = threading.Lock()
+_usage_cache_retry_due = {}
+_usage_cache_retry_attempts = {}
+_usage_cache_skip_logged = {}
+_usage_cache_skip_counts = {}
+_usage_cache_retry_thread = None
+_usage_cache_retry_starting = False
+
+
+def _usage_cache_retry_min_seconds():
+    """补写最低退避秒数；测试用环境变量压到毫秒级。"""
+    try:
+        value = float(os.environ.get("WB_USAGE_CACHE_RETRY_MIN_SECONDS",
+                                     _USAGE_CACHE_RETRY_MIN_SECONDS))
+    except (TypeError, ValueError):
+        return _USAGE_CACHE_RETRY_MIN_SECONDS
+    # 兜住 0（「立刻重试」的直觉写法）：0 乘任何 2**n 都是 0，退化成补写循环
+    # 的 0.5s 粒度，等于每 0.5 秒试写一次盘。
+    return max(1.0, value)
+
+
+def _usage_cache_schedule_retry(kind):
+    """登记一次延迟补写：跳过的类必须有人接着写，否则永远停在旧 offset 上。
+
+    只提前不延后：同一个类被反复跳过时取更早的那个 deadline，退避由
+    attempts 计数决定（每次登记 +1，封顶 15 分钟）。
+    """
+    global _usage_cache_retry_thread, _usage_cache_retry_starting
+    with _usage_cache_retry_lock:
+        attempts = _usage_cache_retry_attempts.get(kind, 0)
+        delay = min(_usage_cache_retry_min_seconds() * (2 ** min(attempts, 5)),
+                    _USAGE_CACHE_RETRY_MAX_SECONDS)
+        _usage_cache_retry_attempts[kind] = attempts + 1
+        due = time.time() + delay
+        current = _usage_cache_retry_due.get(kind)
+        _usage_cache_retry_due[kind] = due if current is None else min(current, due)
+        need_thread = (_usage_cache_retry_thread is None
+                       and not _usage_cache_retry_starting)
+        if need_thread:
+            _usage_cache_retry_starting = True
+    if need_thread:
+        thread = threading.Thread(target=_usage_cache_retry_loop,
+                                  name="usage-cache-retry", daemon=True)
+        # 先启动、成功才占位：反过来（先赋值再 start）在线程数打满 / 内存紧张
+        # 时 start() 会抛，标志位留成「非 None 的死线程」，补写线程这辈子不会
+        # 再启动，且一条日志都没有——正好复刻这次要消灭的「静默不落盘」。
+        # start() 也必须在锁外：新线程的第一件事就是抢这把锁。
+        try:
+            thread.start()
+        except Exception as exc:
+            with _usage_cache_retry_lock:
+                _usage_cache_retry_starting = False
+            log("usage-cache retry thread failed to start: %s: %s"
+                % (type(exc).__name__, exc), level="WARN", tag="usage")
+            return
+        with _usage_cache_retry_lock:
+            _usage_cache_retry_thread = thread
+            _usage_cache_retry_starting = False
+
+
+# 每一类上一次「收集不到」的真实原因，由 _usage_cache_collect_kind 自己写下：
+# 事后复探锁状态不准（它失败时本来就没拿到锁，等调用方来问时持有者可能已经
+# 放手），会把瞬时的锁竞争误判成「状态不可序列化」。
+_USAGE_CACHE_BUSY = "state lock busy"
+_USAGE_CACHE_UNSERIALISABLE = "state not serialisable (kind state has no checkpointable shape)"
+_usage_cache_collect_reason = {}
+
+
+def _usage_cache_mark_reason(kind, reason):
+    _usage_cache_collect_reason[kind] = reason
+    return None
+
+
+def _usage_cache_clear_retry(kind):
+    """该类已写成功：取消补写并清掉跳过计数/日志节流。"""
+    with _usage_cache_retry_lock:
+        _usage_cache_retry_due.pop(kind, None)
+        _usage_cache_retry_attempts.pop(kind, None)
+        _usage_cache_skip_logged.pop(kind, None)
+        _usage_cache_skip_counts.pop(kind, None)
+
+
+def _usage_cache_note_skip(kind, why=None):
+    """记一次跳过的写盘：留痕（节流）+ 登记补写。
+
+    跳过本身是设计（不能在请求线程里阻塞等状态锁），但静默跳过会让一类
+    连续几天不落盘而现场毫无线索，所以这里必须打日志。
+    """
+    now = time.time()
+    with _usage_cache_retry_lock:
+        _usage_cache_skip_counts[kind] = _usage_cache_skip_counts.get(kind, 0) + 1
+        last = _usage_cache_skip_logged.get(kind)
+        should_log = last is None or (now - last) >= _USAGE_CACHE_SKIP_LOG_SECONDS
+        if should_log:
+            _usage_cache_skip_logged[kind] = now
+            count = _usage_cache_skip_counts[kind]
+    if should_log:
+        # WARN 而不是默认的 INFO：这是「某类即将不落盘」的唯一信号，面板按
+        # WARN 筛问题时要能看到它。
+        log("usage aggregate cache write skipped (%s, %d time(s)): %s"
+            % (kind, count, why or "reason unknown"), level="WARN", tag="usage")
+    if why and why.startswith(_USAGE_CACHE_UNSERIALISABLE[:30]) and count >= 3:
+        # 形状不可序列化不是补写能治的（状态要等下一次折叠成功才有可写的
+        # 形状）：再无限重试只是每 15 分钟白试一次 + 每 300s 一条 WARN。
+        # 留痕到此为止，下一次真正折叠成功时会走 clear_retry 复位。
+        return
+    _usage_cache_schedule_retry(kind)
+
+
+def _usage_cache_requeue_if_needed(kind, wrote):
+    """补写没写成时把名额还回去（写成了就什么都不做）。
+
+    写盘节流闸门挡回去的那次没人在别处登记 → 必须归还，否则「跳过必补写」在
+    推进量小的场景下不成立（最后一段日志永远不落盘）。跳过路径（note_skip）
+    已经登记过，再登记一次会让退避和计数按 2 倍增长，所以先看有没有待办。
+    """
+    if wrote:
+        return
+    with _usage_cache_retry_lock:
+        already = kind in _usage_cache_retry_due
+    if not already:
+        _usage_cache_schedule_retry(kind)
+
+
+def _usage_cache_retry_loop():
+    """后台补写：到点就把跳过的类重新走一遍 _usage_cache_maybe_save。
+
+    永远不抛异常：这是个加速件的看守，它自己挂掉不能影响服务。
+    """
+    while True:
+        try:
+            now = time.time()
+            with _usage_cache_retry_lock:
+                due = [k for k, ts in _usage_cache_retry_due.items() if ts <= now]
+                wait = 60.0
+                if _usage_cache_retry_due:
+                    wait = max(0.5, min(60.0,
+                                       min(_usage_cache_retry_due.values()) - now))
+            if not due:
+                time.sleep(wait)
+                continue
+            for kind in due:
+                with _usage_cache_retry_lock:
+                    _usage_cache_retry_due.pop(kind, None)
+                try:
+                    wrote = _usage_cache_maybe_save(
+                        kind, _usage_cache_progress.get(kind, 0))
+                except Exception as exc:
+                    wrote = False
+                    log("usage aggregate cache retry failed (%s): %s: %s"
+                        % (kind, type(exc).__name__, exc),
+                        level="WARN", tag="usage")
+                _usage_cache_requeue_if_needed(kind, wrote)
+        except Exception as exc:
+            # 这里是最后一道兜底：不留痕就等于把「补写名额」悄悄吃掉，和内层
+            # 静默跳过是同一种事故形态（本次修复要消灭的正是它）。
+            log("usage-cache retry loop hiccup: %s: %s"
+                % (type(exc).__name__, exc), level="WARN", tag="usage")
+            time.sleep(5)
+
 
 def _usage_cache_forget():
     """忘掉本进程读过的 checkpoint（模拟一次重启；测试与探针用）。
@@ -9690,6 +9926,13 @@ def _usage_cache_forget():
     with _usage_cache_lock:
         _usage_cache_kind_cache.clear()
         _usage_cache_legacy_data = _USAGE_CACHE_LEGACY_UNREAD
+    # 补写计划属于「本进程读过的状态」的一部分：不清掉会补写一份进程已经
+    # 忘了的 checkpoint（测试/探针里表现为莫名其妙的迟到写入）。
+    with _usage_cache_retry_lock:
+        _usage_cache_retry_due.clear()
+        _usage_cache_retry_attempts.clear()
+        _usage_cache_skip_logged.clear()
+        _usage_cache_skip_counts.clear()
 
 
 def _usage_cache_kind_entries(kind):
@@ -9706,13 +9949,22 @@ def _usage_cache_kind_entries(kind):
     """
     if not _usage_cache_enabled():
         return None
+    lag_message = None
+    log_size = _usage_log_key()[0]      # 锁外 stat，供 lag 告警使用
     with _usage_cache_lock:
         if kind not in _usage_cache_kind_cache:
             entries = _usage_cache_read_kind(kind)
             if entries is None:
                 entries = _usage_cache_read_legacy_kind(kind)
             _usage_cache_kind_cache[kind] = entries
-        return _usage_cache_kind_cache[kind]
+            lag_message = (_usage_cache_report_lag(kind, entries, log_size=log_size)
+                           if entries else None)
+        result = _usage_cache_kind_cache[kind]
+    # 日志（可能落 SQLite）放到锁外：本函数可能在状态锁内被调用，不能把
+    # _usage_cache_lock 的临界区从内存操作拉长到 I/O。
+    if lag_message:
+        log(lag_message, level="WARN", tag="usage")
+    return result
 
 
 def _usage_cache_read_kind(kind):
@@ -9745,6 +9997,41 @@ def _usage_cache_read_kind(kind):
     if not isinstance(entries, list):
         return None
     return entries
+
+
+def _usage_cache_report_lag(kind, entries, log_size=None):
+    """加载到的 checkpoint 落后当前日志很多时，留一条日志。
+
+    offset 落后多少，重启后第一批请求就要重折多少字节——「早上/发版后面板
+    特别卡、CPU 跑满」的那个数就是它。落后本身不报错（append-only 日志下
+    永远合法），只是要看得见。每类每次进程只报一次（读取结果按类记忆）。
+    """
+    try:
+        # 调用点可以在锁外先 stat 好再传进来：本函数可能被 _usage_cache_lock
+        # 保护着调用，不该在临界区里再发一次 syscall。
+        size = log_size if log_size is not None else _usage_log_key()[0]
+        farthest = 0
+        found = False
+        for entry in entries:
+            # _usage_cache_int() 是形状判断（返回 bool，且把 True/False 排除在外），
+            # 不是取值函数：拿它当 offset 用会把 True 当成 1，谎报落后整份日志。
+            raw = entry.get("offset") if isinstance(entry, dict) else None
+            if _usage_cache_int(raw) and raw > farthest:
+                farthest = raw
+                found = True
+        if not found:
+            # 这类条目里根本没有 offset（形状不认识）：报一个「落后整个日志」
+            # 只会误导人，宁可不说。
+            return
+        lag = size - farthest
+        if lag < _USAGE_CACHE_LAG_WARN_BYTES:
+            return
+        return "usage aggregate cache lag (%s): checkpoint %d, log %d -> %.1f MB " \
+               "to fold on the next refresh" % (kind, farthest, size,
+                                                lag / 1048576.0)
+    except (OSError, TypeError, ValueError, KeyError):
+        # 告警自身不成立（形状不认识/stat 失败）就算了，绝不能影响读取。
+        return None
 
 
 def _usage_cache_read_legacy_kind(kind):
@@ -10835,52 +11122,55 @@ def _usage_cache_collect_kind(kind):
         done = 0
         with _lock_if_free(_usage_snap_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _usage_snap_state.items():
                 entry = _usage_cache_snapshot_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        return (entries, done) if entries else _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_UNSERIALISABLE)
     if kind == "by_account":
         with _lock_if_free(_byacct_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             entry = _usage_cache_by_account_entry(_byacct_state)
             if entry is None:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_UNSERIALISABLE)
             return [entry], _byacct_state["offset"]
     if kind == "analytics":
         entries = []
         done = 0
         with _lock_if_free(_analytics_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _analytics_state.items():
                 entry = _usage_cache_analytics_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        return (entries, done) if entries else _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_UNSERIALISABLE)
     if kind == "series":
         entries = []
         done = 0
         with _lock_if_free(_series_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _series_state.items():
                 entry = _usage_cache_series_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else None
+        return (entries, done) if entries else _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_UNSERIALISABLE)
     if kind == "remaining":
         with _lock_if_free(_remaining_state_lock) as held:
             if not held:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             entry = _usage_cache_remaining_entry(_remaining_state)
             if entry is None:
-                return None
+                return _usage_cache_mark_reason(kind, _USAGE_CACHE_UNSERIALISABLE)
             return [entry], entry["offset"]
     return None
 
@@ -10914,7 +11204,9 @@ def _usage_cache_write_kind(kind, entries):
     payload = {"schema": _USAGE_CACHE_SCHEMA, "kind": kind,
                "written_at": time.time(), "entries": entries}
     path = _usage_cache_kind_path(kind)
-    tmp = path + ".tmp"
+    # 临时文件名带 pid：蓝绿切换时新旧槽位共享同一个 usage 目录、且会同时
+    # 存活约 300 秒，固定名（path + ".tmp"）会让两个进程互相截断临时文件。
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
@@ -10946,11 +11238,12 @@ def _usage_cache_maybe_save(kind, offset):
     """
     global _usage_cache_last_attempt
     if not _usage_cache_enabled():
-        return
+        return False
+    wrote = False
     try:
-        # 串行化整段写盘：两个请求线程可能同时判定「该写」，而临时文件名是
-        # 固定的（path + ".tmp"，和 save_runtime_override 一致），两个写者
-        # 同时打开同一个临时文件会互相截断。等锁的一方在锁里会重新判定一遍，
+        # 串行化整段写盘：两个请求线程可能同时判定「该写」。临时文件名虽然已
+        # 按 pid 区分（见 _usage_cache_write_kind），但同进程的两个写者仍会撞
+        # 同一个临时文件，所以写盘整体串行。等锁的一方在锁里会重新判定一遍，
         # 第一个写者已经把 checkpointed 推上去，于是它多半直接返回。
         with _usage_cache_write_lock:
             now = time.time()
@@ -10972,7 +11265,7 @@ def _usage_cache_maybe_save(kind, offset):
                 if not due_kinds and (not advanced
                                       or (now - _usage_cache_last_attempt)
                                       < min_seconds):
-                    return
+                    return False
                 # 记「尝试」而不是「成功」：只读文件系统上失败会一直成立，
                 # 不退避的话每次刷新都去试写一遍。
                 _usage_cache_last_attempt = now
@@ -10984,18 +11277,34 @@ def _usage_cache_maybe_save(kind, offset):
                 try:
                     collected = _usage_cache_collect_kind(advanced_kind)
                     if collected is None:
+                        # 收集不到就跳过（锁被占 / 状态不可序列化）是设计，但
+                        # 必须留痕并登记补写：静默跳过会让某一类连续几天不落盘
+                        # ———现场只有 CPU 高，重启后又从旧 offset 全量重折。
+                        # 两种原因要能分开：锁被占补写能自愈，「状态不可序列化」
+                        # 补写永远治不好，排障方向完全不同。
+                        _usage_cache_note_skip(
+                            advanced_kind,
+                            _usage_cache_collect_reason.get(advanced_kind)
+                            or _USAGE_CACHE_BUSY)
                         continue
                     entries, done = collected
                     _usage_cache_write_kind(advanced_kind, entries)
                 except Exception as exc:
-                    log("usage aggregate cache write failed (%s): %s"
-                        % (advanced_kind, exc))
+                    log("usage aggregate cache write failed (%s): %s: %s"
+                        % (advanced_kind, type(exc).__name__, exc),
+                        level="WARN", tag="usage")
+                    _usage_cache_note_skip(
+                        advanced_kind, why=type(exc).__name__ + ": " + str(exc))
                     continue
+                _usage_cache_clear_retry(advanced_kind)
+                wrote = True
                 with _usage_cache_lock:
                     if done > _usage_cache_checkpointed.get(advanced_kind, 0):
                         _usage_cache_checkpointed[advanced_kind] = done
     except Exception as exc:
-        log("usage aggregate cache write failed: %s" % exc)
+        log("usage aggregate cache write failed: %s: %s"
+            % (type(exc).__name__, exc), level="WARN", tag="usage")
+    return wrote
 
 
 def runtime_settings_view():
@@ -11059,7 +11368,6 @@ def runtime_settings_view():
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "auto_switch_products": wb_settings.auto_switch_products(ACCOUNTS_DIR),
-        "free_model_credit_fallback": wb_settings.free_model_credit_fallback(ACCOUNTS_DIR),
         "enable_anthropic_messages": wb_settings.enable_anthropic_messages(ACCOUNTS_DIR),
         "filter_models_by_key": wb_settings.filter_models_by_key(ACCOUNTS_DIR),
         "reasoning_effort_map": wb_settings.reasoning_effort_map(ACCOUNTS_DIR),
@@ -11156,7 +11464,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.10.11",
+        "version": "2.0.1",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -11424,7 +11732,7 @@ _LOG_WARN_HINTS = (
 # 想按模块看某一类问题时筛不出来。原有类别（chat/scheduler/tasks/accounts/
 # catalog/auth/settings）的相对顺序保持不变，避免改变既有日志的归类。
 _LOG_TAG_HINTS = (
-    ("chat", ("chat:", "chat done", "request error", "/v1/chat",
+    ("chat", ("chat:", "chat head:", "chat done", "request error", "/v1/chat",
               "/chat/completions", "responses")),
     ("scheduler", ("scheduler", "调度器")),
     ("tasks", ("task", "任务", "打卡", "签到", "猫猫", "travel", "growth")),
@@ -16005,20 +16313,8 @@ def schedule_window_probe(account, model, reset_at, cap=False, cap_at=0.0):
         return False
 
 
-_FREE_MODEL_CREDIT_FALLBACKS = {
-    ("intl", "deepseek-v4.1-flash"): "deepseek-v4.1-flash-sg",
-}
-
-
-def _free_model_credit_fallback_enabled():
-    if wb_settings.free_model_credit_fallback(ACCOUNTS_DIR):
-        return True
-    return os.environ.get("WB_ENABLE_FREE_MODEL_CREDIT_FALLBACK", "0").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
-                  allow_credit_fallback=True, allow_product_switch=True,
+                  allow_product_switch=True,
                   pin_account=None, defer_egress_success=False,
                   allowed_accounts=None):
     # Refresh the daily guards before picking. The scan underneath is
@@ -16037,7 +16333,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         POOL.apply_remaining_weights(
             remaining_schedule_weights() if remaining_priority_enabled() else None)
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
-    model = str(payload.get("model") or "")
+    requested_model = str(payload.get("model") or "")
+    model = intl_model_alias(requested_model, realm)
     pinned = pin_account if pin_account is not None else pinned_account()
     if pinned is not None:
         if allowed_accounts is not None and pinned.uid not in allowed_accounts:
@@ -16066,6 +16363,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # payload 重建（degrade 会切换 prompt 模式，必须拿到新 body）。
     upstream_body = (prebuilt_body if prebuilt_body is not None
                      else build_upstream_body(payload))
+    if upstream_body.get("model") != model:
+        # prebuilt_body is built from the client payload before open_upstream
+        # is called. Copy before changing it so callers can safely reuse their
+        # object across retries, and so the client-visible model never changes.
+        upstream_body = dict(upstream_body)
+        upstream_body["model"] = model
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
     # 位置放在 build_upstream_body 之后，保证键与真正发往上游的消息一致
     # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
@@ -16326,6 +16629,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 resp._wb_account_uid = account.uid
             except Exception:
                 pass
+            if model != requested_model:
+                try:
+                    resp._wb_billed_model = model
+                except Exception:
+                    pass
             slot_held = None
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
@@ -16525,6 +16833,14 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 # catalogue label; the tier map from `/v3/config` now drives
                 # both the scheduler and that label, so the request never gets
                 # this far for a gated model.
+                #
+                # `raise` skips the slot release after the loop, so hand the
+                # concurrency seat back first: without this the account stays
+                # "serving 1 request" forever and every later pick skips it
+                # (`account_max_concurrent=1` makes one leaked seat fatal).
+                if slot_held is not None:
+                    account_slot_release(slot_held)
+                    slot_held = None
                 raise
             if exc.code >= 500:
                 detail = http_error_detail(exc)
@@ -16565,6 +16881,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
+            # Same leak as the 400 branch above: an unhandled status (e.g. 404
+            # from a wrong chat path) escapes the loop, so release the seat
+            # before unwinding.
+            if slot_held is not None:
+                account_slot_release(slot_held)
+                slot_held = None
             raise
         except Exception as exc:
             if wb_accounts.is_tls_verify_error(exc):
@@ -16626,30 +16948,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     if slot_held is not None:
         account_slot_release(slot_held)
         slot_held = None
-    # Only spend credits after every enabled, credential-bearing account in
-    # this realm has a persisted upstream 6004 cap for this free model. The
-    # switch is opt-in because the retry can incur real charges.
-    paid_model = _FREE_MODEL_CREDIT_FALLBACKS.get((realm, model))
-    eligible = ([a for a in POOL.accounts
-                 if a.realm == realm and a.enabled and a.access_token
-                 and (allowed_accounts is None or a.uid in allowed_accounts)]
-                if POOL else [])
-    if (allow_credit_fallback and paid_model and _free_model_credit_fallback_enabled()
-            and eligible and all(a.cap_until(model) > time.time() for a in eligible)):
-        paid_payload = dict(payload)
-        paid_payload["model"] = paid_model
-        log("free model '%s' exhausted on all %d %s account(s); retrying paid model '%s'"
-            % (model, len(eligible), realm, paid_model))
-        response, account, effort = open_upstream(
-            paid_payload, session_key=session_key, target_realm=realm,
-            allow_credit_fallback=False, allow_product_switch=False,
-            **({"allowed_accounts": allowed_accounts}
-               if allowed_accounts is not None else {}))
-        try:
-            response._wb_billed_model = paid_model
-        except Exception:
-            pass
-        return response, account, effort
     if last_error is not None:
         # Carry the account that produced the failure out to the caller, so
         # the error row can name it even though the local variable that would
@@ -17005,12 +17303,13 @@ def probe_account(account, model=None, timeout=30):
     单个「测试」与「一键测试」共用这一份：两边各写一套的话，早晚一边忘了清计数、
     另一边忘了认本机断网——而这两件事正是「明明测了能用，它还熔断」的全部来源。
     """
-    model = model or TEST_MODEL_DEFAULT
+    logical_model = model or TEST_MODEL_DEFAULT
+    upstream_model = intl_model_alias(logical_model, account.realm)
     row = {"uid": account.uid, "nickname": account.nickname or account.uid[:8],
-           "realm": account.realm, "model": model, "ok": False, "elapsed_ms": 0,
+           "realm": account.realm, "model": logical_model, "ok": False, "elapsed_ms": 0,
            "status": None, "reply": "", "error": "", "network": False}
     chat_url = account.chat_base_url() + CHAT_PATH
-    test_body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+    test_body = {"model": upstream_model, "messages": [{"role": "user", "content": "hi"}],
                  "stream": False}
     probe_body = build_upstream_body(test_body)
     cli_identity = account.is_cli_identity()
@@ -17024,7 +17323,7 @@ def probe_account(account, model=None, timeout=30):
         body = wb_identity.gzip_body(body)
     # 与 open_upstream 同一条出站形态：VSCode 身分的 model 请求带 X-Model-ID；
     # CLI / VSCode 官方主 chat 都默认 gzip。
-    probe_headers = account.headers(purpose="chat", model=model)
+    probe_headers = account.headers(purpose="chat", model=upstream_model)
     if cli_identity or vscode_identity:
         probe_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
     req = urllib.request.Request(chat_url, data=body, method="POST",
@@ -17033,7 +17332,7 @@ def probe_account(account, model=None, timeout=30):
     t0 = time.time()
     try:
         with wb_accounts.urlopen(req, timeout=timeout, proxy=account.proxy) as resp:
-            chat_obj = aggregate_stream(resp, model, None)
+            chat_obj = aggregate_stream(resp, upstream_model, None)
             row["elapsed_ms"] = int((time.time() - t0) * 1000)
             choices = chat_obj.get("choices") or []
             msg = (choices[0].get("message") or {}) if choices else {}
@@ -17045,7 +17344,7 @@ def probe_account(account, model=None, timeout=30):
             # ladder from it. Only the tested model's cooldown is dropped here -
             # sibling models keep theirs, and a 402 balance park keeps its own lift
             # path (revive_balance_cooldown on a credits refresh).
-            account.note_success(model=model)
+            account.note_success(model=upstream_model)
             row["ok"] = True
             return row
     except urllib.error.HTTPError as exc:
@@ -17248,7 +17547,12 @@ class SSEHeartbeat:
 
 
 def aggregate_stream(raw_iter, model, resp_id):
-    """Fold an SSE stream into one non-streaming chat.completion object."""
+    """Fold an SSE stream into one non-streaming chat.completion object.
+
+    `model` is the client-facing id. Upstream chunks may echo an outbound alias
+    (for example the intl -sg route); that must not replace the logical model.
+    """
+    logical_model = model
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = None
@@ -17272,8 +17576,6 @@ def aggregate_stream(raw_iter, model, resp_id):
             first_chunk_at = time.time()
         if chunk.get("id"):
             resp_id = chunk["id"]
-        if chunk.get("model"):
-            model = chunk["model"]
         u = chunk.get("usage")
         if u:
             if usage is None or (u.get("total_tokens") or 0) >= (usage.get("total_tokens") or 0):
@@ -17388,7 +17690,7 @@ def aggregate_stream(raw_iter, model, resp_id):
         "id": resp_id or f"chatcmpl-wb-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model,
+        "model": logical_model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
@@ -18932,7 +19234,9 @@ def stream_messages_events(raw_iter, model, holder=None):
         state["started"] = True
         if isinstance(chunk, dict):
             state["id"] = _anthropic_text(chunk.get("id"))
-            state["model"] = _anthropic_text(chunk.get("model")) or state["model"]
+            # `model` is the client-facing id. Do not let the outbound intl
+            # alias (-sg) leak into the Anthropic response.
+            state["model"] = model
         return anthropic_sse_frame("message_start", {
             "message": {
                 "id": _anthropic_message_id(state["id"]),
@@ -19230,6 +19534,7 @@ def reasoning_only_response(result):
 
 def stream_responses_events(upstream, model, holder):
     """Yield Responses-API SSE frames translated from chat-completions chunks."""
+    logical_model = model
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
     created = int(time.time())
     seq = 0
@@ -19259,7 +19564,7 @@ def stream_responses_events(upstream, model, holder):
             "object": "response",
             "created_at": created,
             "status": status,
-            "model": model,
+            "model": logical_model,
             "output": [o for o in outputs if o],
             "output_text": "".join(text_parts),
             "parallel_tool_calls": meta.get("parallel_tool_calls", True),
@@ -19934,7 +20239,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.10.11"
+    server_version = "wb-proxy/2.0.1"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -22573,12 +22878,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_identity.configure_versions(stored)
             reply["identity_versions"] = stored
-        if "free_model_credit_fallback" in payload:
-            raw = payload.get("free_model_credit_fallback")
-            if not isinstance(raw, bool):
-                return self._error(400, "free_model_credit_fallback must be true or false", "invalid_request_error")
-            wb_settings.set_free_model_credit_fallback(ACCOUNTS_DIR, raw)
-            reply["free_model_credit_fallback"] = raw
         if "auto_switch_product" in payload:
             # Strictly a JSON boolean: a string like "false" would be truthy and
             # silently switch the feature on, which is the one thing an operator
@@ -24643,10 +24942,15 @@ class Handler(BaseHTTPRequestHandler):
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
+        # Log the level the request will actually run at, not just what the
+        # client typed: when the client omits `reasoning_effort` the gateway
+        # fills in the model's default (deepseek-* get one), so a bare
+        # `effort=None` reads as "no reasoning" even though it ran at `high`.
         log(
-            "responses: model=%s stream=%s msgs=%d effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
+            "responses: model=%s stream=%s msgs=%d effort=%r -> upstream_effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
             % (model, want_stream, len(chat_req.get("messages") or []),
-               chat_req.get("reasoning_effort"),
+               client_effort_of(chat_req),
+               upstream_effort_of(chat_req, model),
                len(chat_req.get("tools") or []), len(all_tools),
                sorted(custom_names) or "-", compaction, key_label(self._key_id()) or "-")
         )
@@ -25174,6 +25478,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._apply_pinned_route():
             return
         path = self.path.split("?")[0]
+        # Arrival trace for the model routes only, before any body work: the
+        # chat log line is written after the body is in hand, so a request whose
+        # upload is slow (or that a CDN in front of us is still buffering) left
+        # no trace at all - a conversation could look "stuck for minutes" while
+        # the gateway had no line to show for it. This marks the moment the
+        # request head reached this process; pair it with body_wait to tell
+        # "arrived but still uploading" from "never arrived".
+        if path in _CHAT_PATHS:
+            log("chat head: %s content_length=%s key=%s"
+                % (path, self.headers.get("Content-Length") or "-",
+                   key_label(self._key_id()) or "-"), tag="chat")
         if path in BODYLESS_PANEL_POSTS:
             # 这一组路由不解析 body，但面板按钮确实会发一个 `{}`：不在这里排空，
             # 残留字节就会成为同一条连接上下一个请求的请求行（见 BODYLESS_PANEL_POSTS
@@ -25360,7 +25675,6 @@ class Handler(BaseHTTPRequestHandler):
         _apply_background_model_alias(payload)
         if is_media_route:
             return self._handle_media_post(path, payload)
-        _apply_deepseek_flash_target(payload, self._request_realm() or CURRENT_REALM)
         # Check per-key concurrency limit (#359)
         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)
         if not key_ok:
@@ -25762,6 +26076,11 @@ class Handler(BaseHTTPRequestHandler):
                         # though both halves arrived. Normalise before emitting.
                         if isinstance(maybe, dict) and maybe.get("id"):
                             maybe["id"] = stream_chunk_id
+                        # The upstream may echo its outbound alias (-sg). The
+                        # client asked for the logical id, and model-scoped
+                        # chunk helpers below must use that same id too.
+                        if isinstance(maybe, dict) and maybe.get("model"):
+                            maybe["model"] = model
                         cleaned = clean_chunk(
                             json.dumps(maybe, ensure_ascii=False)
                             if isinstance(maybe, dict) else data)
