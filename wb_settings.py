@@ -127,6 +127,11 @@ REMAINING_PRIORITY_ENABLED_KEY = "remaining_priority_enabled"
 # 派发路径上的失败归账与退避尺度，老安装保持原样（传输错误仍喂账号熔断）。
 EGRESS_BACKOFF_ENABLED_KEY = "egress_backoff_enabled"
 
+# 文本 / 媒体号池隔离：默认关闭，所有账号都可同时服务文本与媒体请求。
+# 只有显式打开后才按账号的 poolScope 过滤；独立入口 WB_POOL_SCOPE 仍强制
+# 隔离（见 wb_pool_scope），因为那种部署本来就各带一套账号目录。
+POOL_SEPARATION_ENABLED_KEY = "pool_separation_enabled"
+
 # 跨出口回退（国际版 → 国内版）：国际版出口把某个模型限流 / 当日额度用满 /
 # 整池冷却时，允许拿同名的国内版出口再试一次。缺失键读作关 —— 两个出口是两套
 # 上游、两套额度、两套积分口径，混用会让「这个 Key 只花国际额度」的部署失去
@@ -202,14 +207,15 @@ def set_account_max_concurrent(accounts_dir, value):
 # （见 affinity_route）。把第 2 轮才出现的内容算进去之后，两个会话从第 2 轮起
 # 各走各的账号；前缀真的完全相同的会话仍会共用账号——那本来就是最优的缓存共享。
 #
-# 默认关：改的是派发路径上的会话识别，老安装必须保持原逻辑。关着时
-# affinity_route 与上游一字不差，可随时回退。
+# 默认开启：这是派发路径上的会话识别修复，避免同开场白的并发会话每轮
+# 互相抢账号。仍可在面板关闭，关闭后 affinity_route 与旧逻辑一致。
 AFFINITY_STABLE_KEY_ENABLED_KEY = "affinity_stable_key_enabled"
 
 
 def affinity_stable_key_enabled(accounts_dir):
     """Whether the conversation key also covers the first assistant turn."""
-    return load(accounts_dir).get(AFFINITY_STABLE_KEY_ENABLED_KEY) is True
+    value = load(accounts_dir).get(AFFINITY_STABLE_KEY_ENABLED_KEY)
+    return value is not False if isinstance(value, bool) else value is None
 
 
 def set_affinity_stable_key_enabled(accounts_dir, enabled):
@@ -1713,22 +1719,13 @@ def set_usage_config(accounts_dir, patch):
 
 # ---------------------------------------------------------------- 媒体能力（生图 / 生视频）
 #
-# **默认全关**：这是本仓库里唯一一项「模型自己决定花钱」的能力——一次生图约 5.7
-# 积分、一条 5 秒视频 57~129 积分，直接扣账号积分而不经 token 计费，宿主也没有
-# 「调用前先确认」的机制。所以升级不能附赠它，必须是操作者显式打开的。
+# 媒体路由始终开启，不再提供总开关、媒体出口或出站身份设置。出口由 API Key
+# 绑定优先，未绑定时自动选择当前有可用媒体账号的出口；身份跟随账号自身。
 #
-# 每一项都有上限（与 USAGE_LIMITS 同一套理由）：面板输入框贴错一位数就会把
-# 「每分钟 6 次」变成「每分钟 600 次」，那等于关掉了这道闸。
+# 每一项限额都有上限：面板输入框贴错一位数就会把「每分钟 6 次」变成
+# 「每分钟 600 次」，那等于关掉了这道闸。
 
 MEDIA_DEFAULTS = {
-    # 总闸。false 时媒体路由**根本不存在**（404），不是 403——少一个探测面。
-    "enabled": False,
-    # 媒体只走哪个区。默认国内版：已取证的媒体目录在 cn；intl 有 hy-image-3.5
-    # 与 kling-video-v3，但没有 intl 账号时选它只会得到「该区没有可用账号」。
-    "realm": "cn",
-    # 出站身份：desktop（跟账号自身）或 cli。P0 取证之后把结论落到这里，
-    # 换默认值不需要改代码路径。
-    "identity": "desktop",
     # 每个 API Key 每分钟最多几次生图。6 次/分钟 × 5.71 积分 ≈ 34 积分/分钟。
     "image_max_per_minute": 6,
     # 视频时长上限（秒）。与目录的 maxSeconds 取小值。
@@ -1762,7 +1759,6 @@ MEDIA_MINIMUMS = {
 }
 
 MEDIA_REALMS = ("cn", "intl")
-MEDIA_IDENTITIES = ("desktop", "cli")
 
 
 def validate_media_patch(raw):
@@ -1773,23 +1769,12 @@ def validate_media_patch(raw):
     """
     out = {}
     for key, value in (raw or {}).items():
+        # Old panel tabs may still submit these after an in-place upgrade.
+        # Ignore them instead of failing a save whose four limits are valid.
+        if key in ("enabled", "realm", "identity"):
+            continue
         if key not in MEDIA_DEFAULTS:
             raise ValueError("unknown media setting %r" % key)
-        if key == "enabled":
-            if not isinstance(value, bool):
-                raise ValueError("enabled must be true or false")
-            out[key] = value
-            continue
-        if key == "realm":
-            if value not in MEDIA_REALMS:
-                raise ValueError("realm must be one of %s" % ", ".join(MEDIA_REALMS))
-            out[key] = value
-            continue
-        if key == "identity":
-            if value not in MEDIA_IDENTITIES:
-                raise ValueError("identity must be one of %s" % ", ".join(MEDIA_IDENTITIES))
-            out[key] = value
-            continue
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError("%s must be a whole number" % key)
         if value < MEDIA_MINIMUMS[key]:
@@ -1801,30 +1786,17 @@ def validate_media_patch(raw):
 
 
 def media_config(accounts_dir, environ=None):
-    """媒体设置（带默认值，坏值回落到默认值而不是抛）。
-
-    `WB_MEDIA_ENABLED=1` 可临时打开总闸，供 CI 与冒烟用。**只有总闸**吃这个环境
-    变量：限额要是能被环境变量改大，「谁把它调大了」就变成不可查的问题。
-    """
+    """媒体限额（带默认值，坏值回落到默认值而不是抛）。"""
     stored = load(accounts_dir).get("media")
     stored = stored if isinstance(stored, dict) else {}
     out = {}
     for key, default in MEDIA_DEFAULTS.items():
         value = stored.get(key, default)
-        if key == "enabled":
-            out[key] = value if isinstance(value, bool) else default
-        elif key == "realm":
-            out[key] = value if value in MEDIA_REALMS else default
-        elif key == "identity":
-            out[key] = value if value in MEDIA_IDENTITIES else default
-        elif (isinstance(value, bool) or not isinstance(value, int)
-              or value < MEDIA_MINIMUMS[key] or value > MEDIA_LIMITS[key]):
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or value < MEDIA_MINIMUMS[key] or value > MEDIA_LIMITS[key]):
             out[key] = default
         else:
             out[key] = value
-    environ = os.environ if environ is None else environ
-    if str(environ.get("WB_MEDIA_ENABLED") or "").strip() == "1":
-        out["enabled"] = True
     return out
 
 
@@ -1833,9 +1805,21 @@ def set_media_config(accounts_dir, patch):
     clean = validate_media_patch(patch)
     with _lock:
         data = load(accounts_dir)
-        data["media"] = deep_merge(data.get("media"), clean)
+        current = data.get("media")
+        current = current if isinstance(current, dict) else {}
+        # Keep partial patches useful while dropping obsolete enabled/realm/
+        # identity keys from settings files written by older versions.
+        merged = {}
+        for key, default in MEDIA_DEFAULTS.items():
+            value = current.get(key, default)
+            if (isinstance(value, bool) or not isinstance(value, int)
+                    or value < MEDIA_MINIMUMS[key] or value > MEDIA_LIMITS[key]):
+                value = default
+            merged[key] = value
+        merged.update(clean)
+        data["media"] = merged
         save(accounts_dir, data)
-    return clean
+    return merged
 
 PROMPT_DEFAULTS = {
     "mode": "passthrough",
@@ -2172,6 +2156,22 @@ def set_egress_backoff_enabled(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data[EGRESS_BACKOFF_ENABLED_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
+def pool_separation_enabled(accounts_dir):
+    """Whether text/media pool separation is enforced (default: off)."""
+    return load(accounts_dir).get(POOL_SEPARATION_ENABLED_KEY) is True
+
+
+def set_pool_separation_enabled(accounts_dir, enabled):
+    """Persist the text/media pool separation switch."""
+    if not isinstance(enabled, bool):
+        raise ValueError("pool_separation_enabled must be true or false")
+    with _lock:
+        data = load(accounts_dir)
+        data[POOL_SEPARATION_ENABLED_KEY] = enabled
         save(accounts_dir, data)
     return enabled
 

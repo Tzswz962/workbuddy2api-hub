@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
 <title>WorkBuddy 控制台</title>
 <!-- 首帧判定：必须留在 <head>、在任何页面内容之前同步执行。
      没有面板会话令牌（无痕 / 首次访问 / 已登出）→ 不动 markup 上的 display:flex，
@@ -307,6 +308,22 @@ table.account-cards td[data-label="账号"] .cool-pill{display:block;width:100%;
 @media (min-width:641px){
   table.account-cards{table-layout:fixed;min-width:1262px}
   table.account-cards th:nth-child(2),table.account-cards td:nth-child(2){width:180px}
+  /* 账号表横向滚动时，左侧「版本 / 账号」两列必须跟右侧「操作」列一样钉住。
+     否则滚到最右边后账号名会被推出容器，只剩下一排认不出归属的数据。
+     排除 cool-row：它是 colspan 整行告警，不是普通账号行的第一列。 */
+  table.account-cards th:nth-child(1),
+  table.account-cards tbody tr:not(.cool-row) td:nth-child(1){
+    position:sticky;left:0;z-index:3;background:var(--panel);
+  }
+  table.account-cards th:nth-child(2),
+  table.account-cards tbody tr:not(.cool-row) td:nth-child(2){
+    position:sticky;left:76px;z-index:3;background:var(--panel);
+    box-shadow:1px 0 0 var(--line);
+  }
+  table.account-cards th:nth-child(1),
+  table.account-cards th:nth-child(2){z-index:4;background:var(--panel2)}
+  table.account-cards tbody tr:not(.cool-row):hover td:nth-child(1),
+  table.account-cards tbody tr:not(.cool-row):hover td:nth-child(2){background:var(--panel2)}
   table.account-cards td.acct-actions{white-space:normal;min-width:232px;width:232px;position:sticky;right:0;z-index:2;background:var(--panel);box-shadow:-8px 0 12px -12px rgba(31,30,27,.55)}
   table.account-cards th:last-child{position:sticky;right:0;z-index:3;background:var(--panel2);box-shadow:-8px 0 12px -12px rgba(31,30,27,.55)}
   table.account-cards tbody tr:hover td.acct-actions{background:var(--panel2)}
@@ -316,6 +333,10 @@ table.account-cards td[data-label="账号"] .cool-pill{display:block;width:100%;
 }
 @media (max-width:640px){
   table.account-cards{min-width:0!important;table-layout:auto}
+  table.account-cards th:nth-child(1),
+  table.account-cards th:nth-child(2),
+  table.account-cards td:nth-child(1),
+  table.account-cards td:nth-child(2){position:static;left:auto;z-index:auto;background:transparent;box-shadow:none}
   table.account-cards th:last-child,table.account-cards td.acct-actions{position:static;min-width:0;width:auto;z-index:auto;box-shadow:none}
   table.account-cards td[data-label="积分"]{white-space:normal;align-items:flex-start}
   table.account-cards .credit-stack{width:100%;align-items:flex-start}
@@ -430,7 +451,7 @@ table.account-cards tr.cool-row .cool-pill{display:inline-block;width:auto;max-w
 .acct-actions-row{display:flex;gap:4px;justify-content:center}
 /* 账号列（accountRow）：账号名 + 备注 chip 一行、次要信息一行、报错一行。
    次要信息与报错的完整值都在 data-tip 悬浮气泡里。 */
-.acct-name-row{display:flex;align-items:center;gap:6px;min-width:0}
+.acct-name-row{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}
 /* 移动端专用徽章组：桌面表格视图隐藏（版本/状态有自己的两列）。 */
 .acct-mobile-badges{display:none}
 .acct-mobile-badges .badge,.acct-mobile-badges .realm-badge-intl,.acct-mobile-badges .realm-badge-cn,.acct-mobile-badges .realm-badge-codearts{flex-shrink:0}
@@ -447,7 +468,7 @@ table.account-cards tr.cool-row .cool-pill{display:inline-block;width:auto;max-w
 .credit-meta .badge{font-size:10px;padding:1px 5px}
 @media (max-width:1100px){.realm-cards-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.realm-cards-grid .gateway-ctrl{grid-column:span 2}}
 @media (max-width:720px){.realm-cards-grid{grid-template-columns:1fr!important}.realm-cards-grid .gateway-ctrl{grid-column:auto}.credit-summary{white-space:normal}}
-.acct-name{font-weight:600;font-size:14px;color:var(--fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acct-name{flex:1 1 80px;min-width:72px;font-weight:600;font-size:14px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .note-chip{flex-shrink:0;font-size:10px;line-height:16px;padding:0 6px;border-radius:999px;cursor:pointer;color:var(--dim);border:1px dashed var(--line);white-space:nowrap}
 .note-chip:hover{color:var(--accent);border-color:var(--accent)}
 .note-chip.has{color:var(--accent2);border:1px solid transparent;background:var(--accent2-soft);max-width:120px;overflow:hidden;text-overflow:ellipsis}
@@ -1782,8 +1803,9 @@ html:not([data-console-layout="on"]) .console-mobile-menu,
 html:not([data-console-layout="on"]) .console-sidebar,
 html:not([data-console-layout="on"]) .console-scrim,
 html:not([data-console-layout="on"]) .console-contextbar,
-html:not([data-console-layout="on"]) .console-insights,
-html:not([data-console-layout="on"]) .console-filterbar {display:none!important}
+html:not([data-console-layout="on"]) .console-insights {display:none!important}
+/* 新导航本身不使用 console-layout；筛选栏仍属于内容区，不能被旧布局规则隐藏。 */
+html:not([data-console-layout="on"]):not([data-ui="next"]) .console-filterbar {display:none!important}
 html:not([data-console-layout="on"]) .header-left .console-nav-group {display:contents}
 html:not([data-console-layout="on"]) .header-left .console-nav-caption,
 html:not([data-console-layout="on"]) .header-left .console-nav-link {display:none!important}
@@ -2025,6 +2047,10 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '全部号池': 'All pools',
     '文本号池': 'Text pool',
     '媒体号池': 'Media pool',
+    '文本 / 媒体号池隔离': 'Text / media pool separation',
+    '启用号池隔离': 'Enable pool separation',
+    '默认关闭：所有账号都能服务文本与图片 / 视频；开启后才按号池标签限制派发。':
+      'Off by default: every account can serve text, image and video. Turn it on to enforce pool labels.',
     '未勾选': 'None selected',
     '勾选移入媒体池': 'Move selected to media pool',
     '勾选移回文本池': 'Move selected to text pool',
@@ -2039,27 +2065,23 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '已移回文本号池': 'Moved back to the text pool',
     '切换号池失败: ': 'Failed to switch pool: ',
     '媒体生成': 'Media generation',
-    '生图 / 生视频的开关在「设置」页；这里看模型约束和最近任务。每次生成都会真实扣账号积分。': 'The image / video switches live on the Settings page; this page shows model limits and recent tasks. Every generation really spends account credits.',
+    '生图 / 生视频的限额在「设置」页；这里看模型约束和最近任务。每次生成都会真实扣账号积分。': 'Image / video limits live on the Settings page; this page shows model limits and recent tasks. Every generation really spends account credits.',
     '可用媒体模型': 'Available media models',
     '该区目录里带媒体标签的模型，以及各自的时长与分辨率约束。只读，不发上游。': 'Media-tagged models in this realm\'s catalogue, with their duration and resolution limits. Read-only; no upstream request.',
     '最近任务': 'Recent tasks',
     '生视频是异步任务：提交后在这里看进度、失败原因与产物。每个 API Key 只看得到自己提交的任务。': 'Video generation is asynchronous: submission returns immediately, progress, failure reasons and artifacts show up here. Each API key only sees its own tasks.',
     '媒体能力（生图 / 生视频）': 'Media (image / video generation)',
-    '默认关闭。开启后网关才提供': 'Off by default. Only when enabled does the gateway serve',
-    '；关闭时这些路由': '; when disabled these routes',
-    '根本不存在': 'do not exist at all',
-    '每张图约 5.71 积分、每条 5 秒视频约 57–129 积分，直接从账号积分扣，不经 token 计费。': 'About 5.71 credits per image and 57-129 per 5-second video, deducted from account credits directly — not billed per token.',
-    '开启生图 / 生视频路由': 'Enable image / video routes',
-    '媒体出口': 'Media exit',
-    '出站身份': 'Outbound identity',
-    '桌面身份': 'Desktop',
-    'CLI 身份': 'CLI',
+    '网关始终提供': 'The gateway always serves',
+    '。请求优先使用 API Key 绑定的出口；': '. Requests prefer the exit bound to the API key;',
+    '未绑定时自动选择当前有可用媒体账号的出口。': 'when unbound, it automatically chooses an exit with available media accounts.',
+    '每张图约 5.71 积分、每条 5 秒视频约 57–129 积分，直接从账号积分扣。': 'About 5.71 credits per image and 57-129 per 5-second video, deducted directly from account credits.',
+    '(始终开启)': '(always on)',
     '每分钟生图上限': 'Images per minute',
     '视频时长上限（秒）': 'Video length cap (seconds)',
     '每 Key 每日积分上限': 'Daily credits per key',
     '生视频并发': 'Concurrent videos',
     '生视频并发超过上限时新任务<b>先排队</b>（不提交上游、不扣积分），并行任务会尽量分到不同账号上。': 'When the concurrent-video cap is reached, new tasks queue locally (not submitted upstream, no credits spent). Parallel tasks are spread across different accounts.',
-    '每 Key 每日积分上限填 0 表示不限。视频时长会与模型目录里的上限取小值。出站身份决定冒充哪种客户端发请求，桌面账号一般不用改。': 'A daily credit cap of 0 means unlimited. The video length cap is combined with each model\'s own limit, whichever is smaller. The outbound identity decides which client the request imitates; desktop accounts usually need no change.',
+    '每 Key 每日积分上限填 0 表示不限。视频时长会与模型目录里的上限取小值。': 'A daily credit cap of 0 means unlimited. The video length cap is combined with each model\'s own limit, whichever is smaller.',
     '能力': 'Capability',
     '比例': 'Aspect',
     'prompt 上限': 'Prompt limit',
@@ -2077,8 +2099,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '提交时间': 'Submitted',
     '下载': 'Download',
     '取消': 'Cancel',
-    '已开启：媒体路由可用': 'Enabled: media routes are live',
-    '已关闭：媒体路由不再存在': 'Disabled: media routes no longer exist',
+    '媒体设置已保存': 'Media settings saved',
     '已取消（本地轮询已停止）': 'Cancelled (local polling stopped)',
     '取消请求已发送': 'Cancel request sent',
     '取消失败: ': 'Cancel failed: ',
@@ -2089,8 +2110,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     ' 条 · 进行中 ': ' · in progress ',
     ' 条 · 共持有 ': ' · held ',
     '失败的任务请展开看原因：「invalid_request」没扣积分可以改参数重试，「upstream_error / task_lost」可能已经扣过费。': 'Hover a failed task for its reason: "invalid_request" spent nothing and can be retried with fixed parameters; "upstream_error / task_lost" may already have been charged.',
-    '媒体路由可用': 'media routes are live',
-    '媒体路由不再存在': 'media routes no longer exist',
+    '媒体设置已保存': 'Media settings saved',
     '添加 API Key 账号': 'Add an API Key account',
     '粘贴 CodeBuddy API 管理页签发的静态 Key': 'Paste the static key issued by the CodeBuddy API console',
     '前缀。': 'prefix.',
@@ -2560,6 +2580,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '导入失败:': 'Import failed:',
     '导入完成：新增': 'Import finished: added',
     '导入账号': 'Import accounts',
+    '批量选择时会先校验全部文件，全部通过后再统一预览和导入。': 'For a multi-file import, every file is validated first and only then previewed and imported together.',
     '导出': 'Export',
     '导出中...': 'Exporting...',
     '导出失败:': 'Export failed:',
@@ -2575,6 +2596,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '把全部账号（含另一个版本）的出站身份切到下一个：WB → VSC → CLI': 'Switch every account (both versions) to the next outbound identity: WB → VSC → CLI',
     '将跳过': 'Will skip',
     '尚未选择文件。': 'No file selected yet.',
+    '正在校验 ': 'Validating ',
     '就绪': 'Ready',
     '就绪 ·': 'Ready ·',
     '展开本页导航': 'Expand section navigation',
@@ -2768,6 +2790,8 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '文件不是合法 JSON': 'The file is not valid JSON',
     '文件里没有找到账号（既没有 accounts 数组，也不是单个账号）': 'No account found in the file: it is neither an accounts array nor a single account',
     '文件：': 'File:',
+    '个文件': 'files',
+    '个文件…': 'files...',
     '文本': 'Text',
     '新增': 'Added',
     '新增的行还没有填写 Key': 'The new row has no key yet',
@@ -3362,6 +3386,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '账号余额低于该值时不再接单，避免余额被用尽后触发上游的短信提醒。填 0 表示关闭。': 'An account stops taking orders once its balance drops below this, so the balance is never drained enough to trigger the upstream SMS alert. 0 turns it off.',
     '账号凭证刷新成功': 'Account credentials refreshed',
     '账号列表是空的': 'The account list is empty',
+    '无法读取文件': 'could not be read',
     '账号加载失败:': 'Loading accounts failed:',
     '账号在单个模型上当日消耗的 token 达到该值后，该模型自动切到其他账号（同一账号的其他模型不受影响）；本地时间 0 点后自动恢复。填 0 表示不限（默认）。': 'Once the token use of an account on a single model reaches this today, that model switches to another account (the other models of the same account are unaffected); it recovers after local midnight. 0 means no limit (default).',
     '账号存储目录': 'Account directory',
@@ -3421,7 +3446,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     '连接中断:': 'Connection lost:',
     '连续打卡天数': 'Check-in streak',
     '退出面板登录': 'Sign out of the dashboard',
-    '选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的': 'Pick an account JSON file. It accepts files exported by this gateway, an account array, a single account object, and the one of the desktop client',
+    '选择一个或多个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的': 'Pick one or more account JSON files. It accepts files exported by this gateway, account arrays, single account objects, and the one of the desktop client',
     '选择要登录的版本：': 'Choose the version to sign in to:',
     '选择颜色主题': 'Choose a color theme',
     '速度': 'Speed',
@@ -3545,6 +3570,10 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     "全部号池": "全部號池",
     "文本号池": "文字號池",
     "媒体号池": "媒體號池",
+    "文本 / 媒体号池隔离": "文字 / 媒體號池隔離",
+    "启用号池隔离": "啟用號池隔離",
+    "默认关闭：所有账号都能服务文本与图片 / 视频；开启后才按号池标签限制派发。":
+      "預設關閉：所有帳號都能服務文字與圖片 / 影片；開啟後才依號池標籤限制派發。",
     "未勾选": "未勾選",
     "勾选移入媒体池": "勾選移入媒體池",
     "勾选移回文本池": "勾選移回文字池",
@@ -3769,6 +3798,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     "导入完成：新增": "匯入完成：新增",
     "导入完成：新增 ": "匯入完成：新增 ",
     "导入账号": "匯入帳號",
+    "批量选择时会先校验全部文件，全部通过后再统一预览和导入。": "批次選擇時會先校驗全部檔案，全部通過後再統一預覽和匯入。",
     "导出": "匯出",
     "导出中...": "匯出中...",
     "导出失败:": "匯出失敗:",
@@ -4050,6 +4080,10 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     "请确认已安装并登录 WorkBuddy 客户端后点「重新扫描」。": "請確認已安裝並登入 WorkBuddy 客戶端後點「重新掃描」。",
     "读取设置失败:": "讀取設定失敗:",
     "读取设置失败: ": "讀取設定失敗: ",
+    "正在校验 ": "正在校驗 ",
+    "个文件": "個檔案",
+    "个文件…": "個檔案…",
+    "无法读取文件": "無法讀取檔案",
     "调度器": "排程器",
     "调度器未初始化": "排程器未初始化",
     "调用的模型分布": "呼叫的模型分佈",
@@ -4120,7 +4154,7 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     "连接中断:": "連線中斷:",
     "连接中断: ": "連線中斷: ",
     "退出面板登录": "退出面板登入",
-    "选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的": "選擇一個帳號 JSON 檔案。支援本閘道匯出的檔案、帳號陣列、單個帳號物件， 以及桌面客戶端的",
+    "选择一个或多个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的": "選擇一個或多個帳號 JSON 檔案。支援本閘道匯出的檔案、帳號陣列、單個帳號物件， 以及桌面客戶端的",
     "选择要登录的版本：": "選擇要登入的版本：",
     "逐个刷新所有账号的上游访问凭证（相当于对每个账号点一次「刷新凭证」）": "逐個重新整理所有帳號的上游訪問憑證（相當於對每個帳號點一次「重新整理憑證」）",
     "部分客户端（如 Codex App）会宣告 web_search / web_fetch 这类服务端工具，而上游没有对应的执行器：声明送上去，模型看到工具却没有执行器，客户端最后只拿到一句 unsupported call。开启后由本网关代跑——把声明换成自己的同名函数，在本地执行（搜索按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的顺序自动轮换，抓页面抓这个 URL）再把结果喂回模型。默认关闭，关闭时声明原样透传，客户端自己声明的搜索工具照常拿到调用。": "部分客戶端（如 Codex App）會宣告 web_search / web_fetch 這類服務端工具，而上游沒有對應的執行器：宣告送上去，模型看到工具卻沒有執行器，客戶端最後只拿到一句 unsupported call。開啟後由本閘道代跑——把宣告換成自己的同名函式，在本地執行（搜尋按 DuckDuckGo → Bing → Wikipedia → Stack Overflow → Google News 的順序自動輪換，抓頁面抓這個 URL）再把結果喂回模型。預設關閉，關閉時宣告原樣透傳，客戶端自己宣告的搜尋工具照常拿到呼叫。",
@@ -4168,6 +4202,14 @@ if(!window.__NEXT_UI__ && defaultConsoleLayout) {
     "未活跃打卡一键打卡": "未活躍打卡一鍵打卡",
     "今日未打卡账号": "今日未打卡帳號",
     "国际版账号今天都已打卡": "國際版帳號今天都已打卡",
+    "生图 / 生视频的限额在「设置」页；这里看模型约束和最近任务。每次生成都会真实扣账号积分。": "生圖 / 生影片的限額在「設定」頁；這裡看模型約束和最近任務。每次生成都會真實扣帳號積分。",
+    "网关始终提供": "閘道始終提供",
+    "。请求优先使用 API Key 绑定的出口；": "。請求優先使用 API Key 綁定的出口；",
+    "未绑定时自动选择当前有可用媒体账号的出口。": "未綁定時自動選擇目前有可用媒體帳號的出口。",
+    "每张图约 5.71 积分、每条 5 秒视频约 57–129 积分，直接从账号积分扣。": "每張圖約 5.71 積分、每條 5 秒影片約 57–129 積分，直接從帳號積分扣。",
+    "(始终开启)": "(始終開啟)",
+    "每 Key 每日积分上限填 0 表示不限。视频时长会与模型目录里的上限取小值。": "每 Key 每日積分上限填 0 表示不限。影片時長會與模型目錄裡的上限取小值。",
+    "媒体设置已保存": "媒體設定已儲存",
     "设备 Token 文件": "裝置 Token 檔案",
     "国内版桌面身份会随请求发送 X-Device-Token。这里只配置文件路径；面板只显示脱敏后的来源、长度与加载状态，token 本体不会返回浏览器。留空表示不读取文件。": "國內版桌面身分會隨請求傳送 X-Device-Token。這裡只設定檔案路徑；面板只顯示去識別化後的來源、長度與載入狀態，token 本體不會回傳瀏覽器。留空表示不讀取檔案。",
     "Token 文件路径": "Token 檔案路徑",
@@ -5770,7 +5812,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
     <button class="sec" onclick="setCurrentGroup(true, this)">当前分组启用</button>
     <button class="sec" onclick="setCurrentGroup(false, this)">当前分组停用</button>
     </div>
-    <div class="tb-group tb-pool">
+    <div class="tb-group tb-pool" id="poolToolsGroup" hidden>
     <button class="sec" id="pfAll" onclick="poolFilter('all', this)">全部号池</button>
     <button class="sec" id="pfText" onclick="poolFilter('text', this)">文本号池</button>
     <button class="sec" id="pfMedia" onclick="poolFilter('media', this)">媒体号池</button>
@@ -5952,7 +5994,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
   <div id="pageMedia" class="main-page">
     <div style="margin-bottom:16px">
       <h2 style="margin:0;font-size:17px;color:var(--fg);font-family:var(--serif);font-weight:600;letter-spacing:.02em">媒体生成</h2>
-      <div style="font-size:12px;color:var(--dim);margin-top:4px">生图 / 生视频的开关在「设置」页；这里看模型约束和最近任务。每次生成都会真实扣账号积分。</div>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">生图 / 生视频的限额在「设置」页；这里看模型约束和最近任务。每次生成都会真实扣账号积分。</div>
     </div>
 
     <section>
@@ -5978,31 +6020,13 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
     </section>
     <section>
       <div style="margin-bottom:14px">
-        <h2 style="margin:0">媒体能力（生图 / 生视频） <em id="setMediaState"></em></h2>
+        <h2 style="margin:0">媒体能力（生图 / 生视频） <em id="setMediaState">(始终开启)</em></h2>
         <div style="font-size:12px;color:var(--dim);margin-top:4px">
-          默认关闭。开启后网关才提供 <code>/v1/images/*</code> 与 <code>/v1/videos/*</code>；关闭时这些路由<b>根本不存在</b>（404）。
-          每张图约 5.71 积分、每条 5 秒视频约 57–129 积分，直接从账号积分扣，不经 token 计费。
+          网关始终提供 <code>/v1/images/*</code> 与 <code>/v1/videos/*</code>。请求优先使用 API Key 绑定的出口；
+          未绑定时自动选择当前有可用媒体账号的出口。每张图约 5.71 积分、每条 5 秒视频约 57–129 积分，直接从账号积分扣。
         </div>
       </div>
       <div id="mediaSettingsRow" style="display:flex;gap:12px;flex-wrap:wrap;align-items:flex-start">
-        <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:58px">
-          <input id="setMediaEnabled" type="checkbox" style="width:16px;height:16px">
-          开启生图 / 生视频路由
-        </label>
-        <div style="min-width:150px">
-          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">媒体出口</div>
-          <select id="setMediaRealm" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
-            <option value="cn">国内版</option>
-            <option value="intl">国际版</option>
-          </select>
-        </div>
-        <div style="min-width:150px">
-          <div style="font-size:12px;color:var(--dim);margin-bottom:4px">出站身份</div>
-          <select id="setMediaIdentity" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
-            <option value="desktop">桌面身份</option>
-            <option value="cli">CLI 身份</option>
-          </select>
-        </div>
         <div style="min-width:130px">
           <div style="font-size:12px;color:var(--dim);margin-bottom:4px">每分钟生图上限</div>
           <input id="setMediaImageRate" type="number" min="1" max="60" style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 12px;color:var(--fg);font:inherit">
@@ -6022,7 +6046,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
         <button onclick="saveMediaConfig(this)" style="height:38px;margin-top:20px">保存</button>
       </div>
       <div style="font-size:12px;color:var(--dim);margin-top:10px">
-        每 Key 每日积分上限填 0 表示不限。视频时长会与模型目录里的上限取小值。出站身份决定冒充哪种客户端发请求，桌面账号一般不用改。
+        每 Key 每日积分上限填 0 表示不限。视频时长会与模型目录里的上限取小值。
         生视频并发超过上限时新任务<b>先排队</b>（不提交上游、不扣积分），并行任务会尽量分到不同账号上。
       </div>
     </section>
@@ -6732,6 +6756,25 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
         </div>
       </section>
 
+      <section data-cat="models">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
+          <div>
+            <h2 style="margin:0">文本 / 媒体号池隔离 <em id="setPoolSeparationState"></em></h2>
+            <div style="font-size:12px;color:var(--dim);margin-top:4px">
+              默认关闭：所有账号都能服务文本与图片 / 视频；开启后才按号池标签限制派发。
+              福利与签到任务始终只由账号自己的「参与任务」开关决定，不受号池标签影响。
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
+              <input id="setPoolSeparation" type="checkbox" style="width:16px;height:16px">
+              启用号池隔离
+            </label>
+            <button onclick="savePoolSeparation(this)">保存</button>
+          </div>
+        </div>
+      </section>
+
       <section data-cat="network">
         <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
           <div>
@@ -7284,7 +7327,7 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
           <div>
             <h2 style="margin:0">更稳的会话粘滞键 <span class="help-mark" role="button" tabindex="0" aria-label="功能说明" onclick="toggleHelpDetail('affinityStableKeyHelp', event)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleHelpDetail('affinityStableKeyHelp', event);}">!</span> <em id="setAffinityStableKeyState"></em></h2>
             <div class="help-detail" id="affinityStableKeyHelp" hidden>
-              会话粘滞（同一段对话每轮回到同一个账号）默认只用「system 提示 + 首条提问」算会话键。两个开场白相同的会话会算出同一个键、共享同一个绑定槽，于是每轮互相覆盖、轮流换账号，缓存每轮归零。开启后把「首条 assistant 回复」也算进键里，两个会话从第 2 轮起各走各的账号。默认关闭，关着时与上游逻辑一字不差。
+              会话粘滞（同一段对话每轮回到同一个账号）默认把「system 提示 + 首条提问 + 首条 assistant 回复」算进会话键。两个开场白相同的会话从第 2 轮起会各走各的账号，避免共享绑定槽后互相覆盖、轮流换账号，导致缓存每轮归零。可关闭此开关恢复旧的两条消息会话键。
               <br><br>
               代价：前缀真的完全相同的会话仍会共用一个账号（那本来就是最优的缓存共享）；开启后前两条消息的哈希变成前三条，正在进行的对话会一次性重新绑定账号（那一轮缓存掉一次）。
             </div>
@@ -7748,8 +7791,9 @@ html[data-ui="next"] #nextContent .console-shell > main {padding:24px;max-width:
     </div>
     <div class="modal-bd">
       <p class="hint" style="margin-top:0">
-        选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象，
+        选择一个或多个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象，
         以及桌面客户端的 <code>{"account":…,"auth":…}</code> 格式。
+        批量选择时会先校验全部文件，全部通过后再统一预览和导入。
       </p>
       <div class="field" style="margin-bottom:12px">
         <label for="importGroup">导入到分组（可选）</label>
@@ -11044,14 +11088,18 @@ function accountRow(a){
     + '<td style="text-align:left" data-label="账号">'
     // 账号名（大一号）+ 备注 chip 同一行；备注从独立一行收进账号后面。
     +   '<div class="acct-name-row">'
-    +     '<input type="checkbox" class="acct-sel" data-uid="' + uidAttr + '"'
+    +     (POOL_SEPARATION_EFFECTIVE
+          ? '<input type="checkbox" class="acct-sel" data-uid="' + uidAttr + '"'
     +     ' onchange="updateBatchPoolBar()" onclick="event.stopPropagation()"'
     +     ' style="vertical-align:middle;margin-right:2px" title="勾选后可批量挪号池">'
-    +     '<span class="badge mini' + ((a.poolScope==='media')?' warn':'') + '"'
+          : '')
+    +     (POOL_SEPARATION_EFFECTIVE
+          ? '<span class="badge mini' + ((a.poolScope==='media')?' warn':'') + '"'
     +     ' style="cursor:pointer;margin-right:4px"'
     +     ' title="号池：文本号池只跑对话，媒体号池只跑图片 / 视频。点一下切换"'
     +     ' onclick="toggleAccountPoolScope(&quot;' + uidAttr + '&quot;,' + ((a.poolScope==='media')?'false':'true') + ')">'
     +     ((a.poolScope==='media')?'媒体号池':'文本号池') + '</span>'
+          : '')
     +     '<span class="acct-name" title="' + esc(a.nickname) + '">' + esc(a.nickname) + '</span>'
     // 静态 API Key 账号：没有登录身份，也没有签到/成长体系，标出来省得当成
     // 普通 OAuth 号去点「重新登录」。悬停给出脱敏后的凭证，方便对上是哪一把。
@@ -11496,6 +11544,7 @@ let ACCT_TOTAL_PAGES = 1;
 let ACCT_PAGE_REALM = null;
 let ACCT_PAGE_FILTER = null;
 let POOL_FILTER = 'all';
+let POOL_SEPARATION_EFFECTIVE = false;
 // 账号表上次真正画进 DOM 的内容指纹（同最近请求表的 lastRecentFp）：轮询拿回来
 // 的数据没变就整段跳过，不重拼 HTML、不重排。
 let lastAccountsFp = null;
@@ -11507,7 +11556,8 @@ function accountsRenderFp(){
   // （今日活动列）、视图区域、页码、表头排序、筛选条件、本地日期（「今日」口径）。
   // 筛选也进指纹：不靠「改筛选一定无参调用 renderAccounts()」这条约定兜底。
   return [
-    window.VIEW_REALM || 'intl', ACCT_PAGE, POOL_FILTER,
+    window.VIEW_REALM || 'intl', ACCT_PAGE,
+    POOL_SEPARATION_EFFECTIVE ? POOL_FILTER : 'all',
     JSON.stringify(SORT_STATE.accounts || null),
     JSON.stringify(ACCOUNT_FILTERS),
     new Date().toDateString(),
@@ -11551,13 +11601,14 @@ function renderAccounts(){
   const box = document.getElementById('accounts');
   const currentView = (window.VIEW_REALM || "intl");
   let list = accountsInView();
-  if(POOL_FILTER !== 'all'){
+  if(POOL_SEPARATION_EFFECTIVE && POOL_FILTER !== 'all'){
     list = list.filter(a => String(a.poolScope || 'text') === POOL_FILTER);
   }
   const skipIfSame = arguments[0] === true;
   if(ACCT_PAGE_REALM !== currentView){ ACCT_PAGE_REALM = currentView; ACCT_PAGE = 1; }
   const filterKey = ACCOUNT_FILTERS.query + '\u0001' + ACCOUNT_FILTERS.status
-    + '\u0001' + ACCOUNT_FILTERS.group + '\u0001' + POOL_FILTER;
+    + '\u0001' + ACCOUNT_FILTERS.group + '\u0001'
+    + (POOL_SEPARATION_EFFECTIVE ? POOL_FILTER : 'all');
   const groupSelect = document.getElementById('accountGroupFilter');
   if(groupSelect){
     const groups = Array.from(new Set(list.map(a => String(a.group || '')).filter(Boolean))).sort();
@@ -11678,14 +11729,17 @@ function autoFetchMissingCredits(){
 // poll=true 只给定时轮询 / 切页签 / 回到前台用：数据没变时不重画表格。操作之后
 // 的回读一律不带参数，整表重画。/accounts 始终 no-store：响应里有带凭据的代理
 // 地址，不能落浏览器磁盘缓存。
-async function loadAccounts(poll){
+async function loadAccounts(poll, opts){
   try{
+    // 今日活动来自 /activity/history，可能比账号列表和用量慢；启动首屏
+    // 先用核心数据把账号区画出来，活动记录回来后再补一次重绘。默认仍等待，
+    // 保持设置页、操作回读和既有调用方的完整性语义。
+    const activityPromise = loadActivityToday();
     const [acct, byAcct] = await Promise.all([
       getJSON('/accounts?realm=all'),
       getJSON('/usage/by-account', POLL_READ),
-      // 今日活动与账号列表并行取；它自己吞掉失败，读不到历史不该让账号区跟着坏。
-      loadActivityToday(),
     ]);
+    if(!(opts && opts.deferActivity)) await activityPromise;
     window.ACCOUNTS = acct.accounts || [];
     USAGE_BY_ACCOUNT = {};
     (byAcct.accounts || []).forEach(a => { USAGE_BY_ACCOUNT[a.account] = a; });
@@ -11696,6 +11750,13 @@ async function loadAccounts(poll){
     // 昵称刚到位，补画一次积分扣减历史：它和本请求是并行的，先渲染的那次只有 uid。
     if(LAST_CREDIT_DATA) renderCreditHistory();
     autoFetchMissingCredits();
+    if(opts && opts.deferActivity){
+      activityPromise.then(() => {
+        // 活动记录是账号表的输入之一；它回来时必须重画，否则「今日活动」列
+        // 会一直停在中性态，直到下一次 15 秒轮询。
+        renderAccounts(true);
+      });
+    }
   }catch(e){ toast('账号加载失败: ' + e.message); }
 }
 
@@ -11733,6 +11794,7 @@ async function toggleAccount(uid, enable, btn){
   }
 }
 function poolFilter(scope, btn){
+  if(!POOL_SEPARATION_EFFECTIVE) return;
   POOL_FILTER = scope === 'media' ? 'media' : (scope === 'text' ? 'text' : 'all');
   ['pfAll','pfText','pfMedia'].forEach(function(id){
     const el = document.getElementById(id);
@@ -11741,7 +11803,19 @@ function poolFilter(scope, btn){
   ACCT_PAGE = 1;
   renderAccounts();
 }
+function applyPoolSeparationUi(effective){
+  POOL_SEPARATION_EFFECTIVE = effective === true;
+  if(!POOL_SEPARATION_EFFECTIVE) POOL_FILTER = 'all';
+  const group = document.getElementById('poolToolsGroup');
+  if(group) group.hidden = !POOL_SEPARATION_EFFECTIVE;
+  ['pfAll','pfText','pfMedia'].forEach(function(id){
+    const el = document.getElementById(id);
+    if(el) el.classList.toggle('active', id === 'pfAll' || POOL_FILTER === id.slice(2).toLowerCase());
+  });
+  updateBatchPoolBar();
+}
 function acctSelUids(){
+  if(!POOL_SEPARATION_EFFECTIVE) return [];
   return Array.from(document.querySelectorAll('#accounts .acct-sel:checked'))
     .map(function(el){ return el.dataset.uid; })
     .filter(Boolean);
@@ -11752,10 +11826,14 @@ function updateBatchPoolBar(){
   if(label) label.textContent = n ? ('已选 ' + n + ' 个') : '未勾选';
   ['batchToMedia','batchToText'].forEach(function(id){
     const el = document.getElementById(id);
-    if(el) el.disabled = !n;
+    if(el) el.disabled = !POOL_SEPARATION_EFFECTIVE || !n;
   });
 }
 async function batchPoolScope(scope, btn){
+  if(!POOL_SEPARATION_EFFECTIVE){
+    toast('请先启用「文本 / 媒体号池隔离」', 'warn');
+    return;
+  }
   const uids = acctSelUids();
   if(!uids.length){ toast('先勾选要挪号池的账号', 'warn'); return; }
   if(btn) btn.disabled = true;
@@ -12234,9 +12312,11 @@ async function exportOne(uid){
 }
 
 let importRows = null;   // 已解析、待导入的账号行
+let importFileCount = 0; // 批量选择时已读取的文件数
 
 function openImport(){
   importRows = null;
+  importFileCount = 0;
   const m = document.getElementById('importModal');
   const body = document.getElementById('importBody');
   const ow = document.getElementById('importOverwrite');
@@ -12246,13 +12326,16 @@ function openImport(){
   if(body) body.innerHTML = '<p class="hint">正在打开文件…</p>';
   if(m) m.classList.add('show');
   // The picker is created per call so choosing the same file twice still fires.
+  // `multiple` lets one picker pass every exported JSON at once; all files are
+  // parsed and dry-run together before anything is written.
   const picker = document.createElement('input');
   picker.type = 'file';
+  picker.multiple = true;
   picker.accept = '.json,application/json';
   picker.onchange = () => {
-    const f = picker.files && picker.files[0];
-    if(!f){ closeImport(); return; }
-    readImportFile(f);
+    const files = picker.files ? Array.from(picker.files) : [];
+    if(!files.length){ closeImport(); return; }
+    readImportFiles(files);
   };
   picker.click();
 }
@@ -12319,36 +12402,61 @@ function closeImport(){
   const m = document.getElementById('importModal');
   if(m) m.classList.remove('show');
   importRows = null;
+  importFileCount = 0;
   const btn = document.getElementById('btnImportCommit');
   if(btn) btn.disabled = true;
 }
 
-async function readImportFile(file){
+function importRowsFromDocument(doc, label){
+  // Accept the export document, a bare array, or a single account object.
+  let rows;
+  if(Array.isArray(doc)) rows = doc;
+  else if(doc && Array.isArray(doc.accounts)) rows = doc.accounts;
+  else if(doc && (doc.accessToken || doc.auth)) rows = [doc];
+  else throw new Error((label ? label + '：' : '') + '文件里没有找到账号（既没有 accounts 数组，也不是单个账号）');
+  if(!rows.length) throw new Error((label ? label + '：' : '') + '账号列表是空的');
+  return rows;
+}
+
+async function parseImportFile(file){
+  let text;
+  try{ text = await file.text(); }
+  catch(e){ throw new Error(file.name + '：无法读取文件'); }
+  let doc;
+  try{ doc = JSON.parse(text); }
+  catch(e){ throw new Error(file.name + '：文件不是合法 JSON'); }
+  return {file: file, doc: doc, rows: importRowsFromDocument(doc, file.name)};
+}
+
+async function readImportFiles(files){
   const body = document.getElementById('importBody');
+  const btn = document.getElementById('btnImportCommit');
   try{
-    const text = await file.text();
-    let doc;
-    try{ doc = JSON.parse(text); }
-    catch(e){ throw new Error('文件不是合法 JSON'); }
-
-    // Accept the export document, a bare array, or a single account object.
-    let rows;
-    if(Array.isArray(doc)) rows = doc;
-    else if(doc && Array.isArray(doc.accounts)) rows = doc.accounts;
-    else if(doc && (doc.accessToken || doc.auth)) rows = [doc];
-    else throw new Error('文件里没有找到账号（既没有 accounts 数组，也不是单个账号）');
-
+    importRows = null;
+    importFileCount = files.length;
+    if(btn){ btn.disabled = true; btn.textContent = '校验中...'; }
+    if(body){
+      body.innerHTML = '<p class="hint">正在校验 ' + files.length + ' 个文件…</p>';
+    }
+    // Read and parse every file before the dry run. Sequential reads preserve
+    // picker order, and a rejected file aborts the whole batch so a later
+    // click cannot import only half of what the user selected.
+    const parsed = [];
+    for(const file of files) parsed.push(await parseImportFile(file));
+    const rows = [];
+    for(const item of parsed) rows.push(...item.rows);
     if(!rows.length) throw new Error('账号列表是空的');
     importRows = rows;
-
-    // Dry-run first so the user sees exactly what will happen.
+    // The dry run takes the same shape as the real import. A bare array is
+    // accepted by /accounts/import and keeps rows from different files in one
+    // document, so duplicate UIDs are reported once across the whole batch.
     const group = String((document.getElementById('importGroup') || {}).value || '').trim();
     const r = await postJSON('/accounts/import',
-      {data: doc, dryRun: true, group: group});
-    renderImportPreview(file.name, r.result || {}, rows.length);
+      {data: rows, dryRun: true, group: group});
+    const label = files.length === 1 ? files[0].name : files.length + ' 个文件';
+    renderImportPreview(label, r.result || {}, rows.length);
   }catch(e){
     importRows = null;
-    const btn = document.getElementById('btnImportCommit');
     if(btn) btn.disabled = true;
     if(body) body.innerHTML = '<p class="hint" style="color:var(--warn)">读取失败: ' + esc(e.message) + '</p>';
   }
@@ -12411,7 +12519,7 @@ async function commitImport(btn){
           + '，跳过 ' + (res.skipped || []).length
           + '，无效 ' + (res.invalid || []).length);
     if(n > 0){ closeImport(); await loadAccounts(); }
-    else { renderImportPreview('（已导入）', res, importRows.length); }
+    else { renderImportPreview(importFileCount > 1 ? importFileCount + ' 个文件' : '（已导入）', res, importRows.length); }
   }catch(e){
     toast('导入失败: ' + e.message, 'err');
     if(btn){ btn.disabled = false; btn.textContent = '确认导入'; }
@@ -13746,7 +13854,7 @@ async function startDashboard(){
   resetAccountFilters();
   // 前两步决定下面各自查什么（VIEW_REALM / 面板可见性），必须先行；之后就并行，
   // 别让国内版那条约 2 秒的成长任务接口把首屏的用量卡片拖在后面。
-  await loadSettings();
+  await loadSettings(false, {deferSecondary: true});
   // 新面板把账号固定成独立页：服务端仍保留 accounts_separate_tab 字段给旧壳，
   // 但新壳每次都按拆分布局渲染，避免账号区被搬回总览。
   if(window.__NEXT_UI__) applyAccountsTabLayout(true);
@@ -13756,8 +13864,20 @@ async function startDashboard(){
   // 页签时，KPI 要等这两秒过去才开始发 /usage/analytics。这里只把它摘出来让它
   // 并行跑，其余照旧等待；异常自己收，别变成未处理的拒绝。
   loadGrowthTasks().catch(() => {});
-  await Promise.all([loadAccounts(), loadModels(), loadAgentModelSelection(),
-                     loadSchedulerStatus(), refresh(), loadAgentsAvailability()]);
+  // 总览首屏只需要账号与用量：先把这两项等到可画，模型清单、模型勾选、
+  // 调度器与智能体可用性在后台补齐。它们原先一起把 switchMainTab 押后，
+  // 其中 /v1/models 还可能走上游目录，正是「总览加载太慢」的主要来源。
+  const secondary = Promise.all([
+    loadModels(),
+    loadAgentModelSelection(),
+    loadSchedulerStatus(),
+    loadAgentsAvailability(),
+  ]).catch(() => {});
+  await Promise.all([
+    loadAccounts(false, {deferActivity: true}),
+    refresh(),
+  ]);
+  secondary.catch(() => {});
   updateRecentLimitButtons();
   // The head script already resolved this before first paint; re-apply it
   // here so the data loaders for the active page actually run.
@@ -14475,12 +14595,6 @@ const MEDIA_STATUS_BADGE = {
 
 function applyMediaSettings(media){
   const cfg = media || {};
-  const enabled = document.getElementById('setMediaEnabled');
-  if(enabled) enabled.checked = cfg.enabled === true;
-  const realm = document.getElementById('setMediaRealm');
-  if(realm && cfg.realm) realm.value = cfg.realm;
-  const identity = document.getElementById('setMediaIdentity');
-  if(identity && cfg.identity) identity.value = cfg.identity;
   const rate = document.getElementById('setMediaImageRate');
   if(rate && cfg.image_max_per_minute != null) rate.value = cfg.image_max_per_minute;
   const seconds = document.getElementById('setMediaVideoSeconds');
@@ -14491,8 +14605,8 @@ function applyMediaSettings(media){
   if(conc && cfg.video_concurrency != null) conc.value = cfg.video_concurrency;
   const state = document.getElementById('setMediaState');
   if(state){
-    state.textContent = cfg.enabled === true ? '(已开启)' : '(已关闭)';
-    state.style.color = cfg.enabled === true ? 'var(--accent2)' : 'var(--dim)';
+    state.textContent = '(始终开启)';
+    state.style.color = 'var(--accent2)';
   }
 }
 
@@ -14504,9 +14618,6 @@ async function saveMediaConfig(btn){
   };
   const payload = {
     media: {
-      enabled: !!(document.getElementById('setMediaEnabled') || {}).checked,
-      realm: (document.getElementById('setMediaRealm') || {}).value || 'cn',
-      identity: (document.getElementById('setMediaIdentity') || {}).value || 'desktop',
       image_max_per_minute: num('setMediaImageRate', 6),
       video_max_seconds: num('setMediaVideoSeconds', 15),
       daily_credits_per_key: num('setMediaDailyCredits', 0),
@@ -14517,7 +14628,7 @@ async function saveMediaConfig(btn){
   try{
     const res = await postJSON('/settings/save', payload);
     if(res && res.media) applyMediaSettings(res.media);
-    toast(payload.media.enabled ? '已开启：媒体路由可用' : '已关闭：媒体路由不再存在');
+    toast('媒体设置已保存');
     loadSettings();
   }catch(e){
     toast('保存失败: ' + e.message, 'bad');
@@ -14947,7 +15058,7 @@ async function saveWinMaxHeight(btn){
 }
 // ==== 面板窗口限高结束 ====
 
-async function loadSettings(showToast){
+async function loadSettings(showToast, opts){
   try {
     const data = await getJSON('/settings');
     const pwdState = document.getElementById('setPwdState');
@@ -15243,6 +15354,22 @@ async function loadSettings(showToast){
         egressBackoffState.textContent = egressBackoff ? '(已启用)' : '(未启用)';
         egressBackoffState.style.color = egressBackoff ? 'var(--accent2)' : 'var(--dim)';
       }
+      const poolSeparation = data.pool_separation_enabled === true;
+      const poolSeparationEffective = data.pool_separation_effective === true;
+      const poolSeparationInput = document.getElementById('setPoolSeparation');
+      if(poolSeparationInput) poolSeparationInput.checked = poolSeparation;
+      const poolSeparationState = document.getElementById('setPoolSeparationState');
+      if(poolSeparationState){
+        if(poolSeparationEffective && !poolSeparation){
+          poolSeparationState.textContent = '(已由环境变量 / 独立号池入口强制启用)';
+          poolSeparationState.style.color = 'var(--warn)';
+        } else {
+          poolSeparationState.textContent = poolSeparation
+            ? '(已启用)' : '(默认关闭：账号可同时服务文本与媒体)';
+          poolSeparationState.style.color = poolSeparation ? 'var(--accent2)' : 'var(--dim)';
+        }
+      }
+      applyPoolSeparationUi(poolSeparationEffective);
       const holdSec = typeof data.restriction_hold_seconds === 'number' ? data.restriction_hold_seconds : 1800;
       const holdInput = document.getElementById('setRestrictionHoldSeconds');
       if(holdInput) holdInput.value = holdSec;
@@ -15290,7 +15417,13 @@ async function loadSettings(showToast){
       }
       SAVED_QUOTA_SCAN_MODELS = Array.isArray(data.quota_scan_models) ? data.quota_scan_models.slice() : [];
       QUOTA_SCAN_SELECTED = SAVED_QUOTA_SCAN_MODELS.slice();
-      await loadQuotaScanCatalog();
+      // 定时额度查询的模型目录只服务设置页，启动时不该挡住总览首屏。
+      // 设置页自己的刷新保持等待，启动链传 deferSecondary 在后台补。
+      if(opts && opts.deferSecondary){
+        loadQuotaScanCatalog().then(renderQuotaScanModels).catch(() => {});
+      } else {
+        await loadQuotaScanCatalog();
+      }
       renderQuotaScanModels();
       renderQuotaScanState(data);
       const maxPayload = document.getElementById('setMaxPayloadMB');
@@ -16511,6 +16644,24 @@ async function saveEgressBackoff(btn){
     if(btn) btn.disabled = false;
   }
 }
+
+async function savePoolSeparation(btn){
+  const el = document.getElementById('setPoolSeparation');
+  const value = !!(el && el.checked);
+  if(btn) btn.disabled = true;
+  try {
+    await postJSON('/settings/save', {pool_separation_enabled: value});
+    toast(value ? '已启用：按号池标签限制派发'
+                : '已关闭：所有账号都可服务文本与媒体', 'ok');
+    if(typeof loadSettings === 'function') await loadSettings();
+    else applyPoolSeparationUi(value);
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'bad');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+}
+
 async function saveRestrictionHold(btn){
   const el = document.getElementById('setRestrictionHoldSeconds');
   const val = parseInt(el ? el.value : '1800', 10);
@@ -22160,7 +22311,7 @@ if (typeof SORT_DENY_TABLES !== 'undefined' && SORT_DENY_TABLES && SORT_DENY_TAB
     model: {
       title: '模型与定价',
       desc: '价格估算、Anthropic 适配、思考档位和模型过滤。',
-      items: ['模型价格估算', '启用 Anthropic Messages', '思考等级挡位映射', '按 API Key 过滤模型列表', '只列出可用模型']
+      items: ['模型价格估算', '启用 Anthropic Messages', '思考等级挡位映射', '按 API Key 过滤模型列表', '只列出可用模型', '文本 / 媒体号池隔离']
     },
     automation: {
       title: '自动化',

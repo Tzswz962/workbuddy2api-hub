@@ -867,7 +867,7 @@ def resolve_reference_uploads(body, realm, model_id, account=None):
     return body
 
 
-def _pick_media_account_for(realm, model_id, cost_hint, excluded, config=None):
+def _pick_media_account_for(realm, model_id, cost_hint, excluded):
     """选账号的**模块级**实现（后台提交线程也能用）。
 
     `Handler._pick_media_account` 只是薄薄一层：它把 self 上的 Key 白名单/钉账号
@@ -910,6 +910,57 @@ def _pick_media_account_for(realm, model_id, cost_hint, excluded, config=None):
     if not ok:
         raise wb_media.MediaError("NO_CREDIT", "%s 付不起这次调用：%s" % (account.uid[:8], reason))
     return account
+
+
+def _media_realm_for_key(handler=None, requested=None):
+    """Choose the media exit without a persisted media-realm setting.
+
+    Priority:
+      1. the API key's bound realm,
+      2. an explicitly requested realm (only for the catalogue endpoint),
+      3. the only realm that currently has usable media accounts,
+      4. the panel's active realm when it has media accounts, otherwise any
+         realm with media accounts, and finally the active realm for a fresh
+         install.
+    """
+    # /health is also served without an API key and is exercised by lightweight
+    # request doubles that only implement the health-facing surface. Treat a
+    # missing key context as an unbound request instead of assuming every
+    # handler carries the full authentication helpers.
+    allowed = None
+    bound = ""
+    if handler is not None:
+        allowed_getter = getattr(handler, "_key_allowed_accounts", None)
+        realm_getter = getattr(handler, "_key_realm", None)
+        if callable(allowed_getter):
+            allowed = allowed_getter()
+        if callable(realm_getter):
+            bound = realm_getter() or ""
+    if bound:
+        return bound
+    if requested:
+        # Let the caller's validation turn an unknown explicit realm into 400.
+        return requested
+
+    _, medias = _ensure_pools()
+    realms = [realm for realm in wb_settings.MEDIA_REALMS
+              if medias is not None
+              and medias.count_ready(realm=realm, allowed=allowed, refresh=False) > 0]
+    if len(realms) == 1:
+        return realms[0]
+    if CURRENT_REALM in realms:
+        return CURRENT_REALM
+    if realms:
+        return realms[0]
+    # 没有可用账号时，仍要能从留档目录提供模型清单。否则一次冷启动会
+    # 把“暂时没有账号”误报成“媒体路由不存在”，客户端会以为功能未开启。
+    catalog_realms = [realm for realm in wb_settings.MEDIA_REALMS
+                      if read_catalog_dump(realm) is not None]
+    if CURRENT_REALM in catalog_realms:
+        return CURRENT_REALM
+    if catalog_realms:
+        return catalog_realms[0]
+    return CURRENT_REALM if CURRENT_REALM in wb_settings.MEDIA_REALMS else "cn"
 
 
 def media_tasks():
@@ -957,14 +1008,13 @@ def submit_queued_video_task(task):
     excluded = set(store.busy_accounts() or ())
 
     def pick(avoid):
-        config = wb_settings.media_config(ACCOUNTS_DIR)
         try:
             cost_hint = media_cost_hint(task.get("model"),
                                         task.get("seconds") or 5,
                                         task.get("resolution"))
         except Exception:
             cost_hint = 0
-        return _pick_media_account_for(realm, model_id, cost_hint, avoid, config)
+        return _pick_media_account_for(realm, model_id, cost_hint, avoid)
 
     account = pick(excluded)
     if account is None:
@@ -1743,6 +1793,11 @@ def _persist_usage(row, fail_label):
         os.makedirs(USAGE_DIR, exist_ok=True)
         with open(USAGE_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # The daily guard is evaluated on the next request. Let its cached fold
+        # observe this row immediately instead of handing the same account a
+        # request for up to _STATS_TTL seconds after it crossed the limit.
+        with _daily_usage_lock:
+            _daily_usage["at"] = 0.0
     except Exception as exc:
         log("%s: %s" % (fail_label, exc))
 
@@ -4082,7 +4137,7 @@ def remaining_priority_enabled():
 
 
 def affinity_stable_key_enabled():
-    """更稳的会话粘滞键开关（默认关，关着时与上游逻辑一字不差）。"""
+    """更稳的会话粘滞键开关（默认开；显式关闭时与旧逻辑一字不差）。"""
     return wb_settings.affinity_stable_key_enabled(ACCOUNTS_DIR) is True
 
 
@@ -6924,6 +6979,8 @@ def _credits_sweep(targets, paced=True):
 # Release discovery only - the checker never downloads or installs anything.
 UPDATES = None
 ACCOUNTS_DIR = os.environ.get("ACCOUNTS_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts')
+wb_pool_scope.configure_separation_resolver(
+    lambda: wb_settings.pool_separation_enabled(ACCOUNTS_DIR))
 try:
     # Panel-set version overrides ride on top of the verified defaults; the
     # identity module only changes the version strings it sends.
@@ -9995,6 +10052,9 @@ def _usage_cache_schedule_retry(kind):
 # 放手），会把瞬时的锁竞争误判成「状态不可序列化」。
 _USAGE_CACHE_BUSY = "state lock busy"
 _USAGE_CACHE_UNSERIALISABLE = "state not serialisable (kind state has no checkpointable shape)"
+# 定价总开关关着时，折叠不会读取任何价格，state["pricing"] 必然为 None。
+# 这是操作者的显式选择，不是状态损坏；单独标记，避免 WARN 和无效补写。
+_USAGE_CACHE_PRICING_OFF = "pricing disabled (cost estimation off)"
 _usage_cache_collect_reason = {}
 
 
@@ -10021,11 +10081,17 @@ def _usage_cache_note_skip(kind, why=None):
     now = time.time()
     with _usage_cache_retry_lock:
         _usage_cache_skip_counts[kind] = _usage_cache_skip_counts.get(kind, 0) + 1
+        # count 必须在节流判断外取：下面的「不可序列化到 3 次就停手」分支
+        # 在 should_log 为 False 时同样要读它。
+        count = _usage_cache_skip_counts[kind]
+        # 定价关闭时本来就没有可写的价记录：不占日志节流窗口，也不登记
+        # 永远无法成功的补写。跳过计数仍然保留，便于现场确认确实发生过。
+        if why and why.startswith(_USAGE_CACHE_PRICING_OFF[:30]):
+            return
         last = _usage_cache_skip_logged.get(kind)
         should_log = last is None or (now - last) >= _USAGE_CACHE_SKIP_LOG_SECONDS
         if should_log:
             _usage_cache_skip_logged[kind] = now
-            count = _usage_cache_skip_counts[kind]
     if should_log:
         # WARN 而不是默认的 INFO：这是「某类即将不落盘」的唯一信号，面板按
         # WARN 筛问题时要能看到它。
@@ -11295,16 +11361,27 @@ def _usage_cache_collect_kind(kind):
     if kind == "snapshot":
         entries = []
         done = 0
+        pricing_off = False
+        pricing_disabled = not wb_pricing.pricing_enabled()
         with _lock_if_free(_usage_snap_state_lock) as held:
             if not held:
                 return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _usage_snap_state.items():
+                # 总开关关着时这份折叠没有价记录，写出去也不会被采纳端采用。
+                # 只跳过确实因开关关闭而缺少 pricing 的状态；价表读取失败等
+                # 其他原因仍按不可序列化上报。
+                if pricing_disabled and state.get("pricing") is None:
+                    pricing_off = True
+                    continue
                 entry = _usage_cache_snapshot_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else _usage_cache_mark_reason(
-            kind, _USAGE_CACHE_UNSERIALISABLE)
+        if entries:
+            return entries, done
+        return _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_PRICING_OFF if pricing_off
+            else _USAGE_CACHE_UNSERIALISABLE)
     if kind == "by_account":
         with _lock_if_free(_byacct_state_lock) as held:
             if not held:
@@ -11316,16 +11393,24 @@ def _usage_cache_collect_kind(kind):
     if kind == "analytics":
         entries = []
         done = 0
+        pricing_off = False
+        pricing_disabled = not wb_pricing.pricing_enabled()
         with _lock_if_free(_analytics_state_lock) as held:
             if not held:
                 return _usage_cache_mark_reason(kind, _USAGE_CACHE_BUSY)
             for realm, state in _analytics_state.items():
+                if pricing_disabled and state.get("pricing") is None:
+                    pricing_off = True
+                    continue
                 entry = _usage_cache_analytics_entry(realm, state)
                 if entry is not None:
                     entries.append(entry)
                     done = max(done, state["offset"])
-        return (entries, done) if entries else _usage_cache_mark_reason(
-            kind, _USAGE_CACHE_UNSERIALISABLE)
+        if entries:
+            return entries, done
+        return _usage_cache_mark_reason(
+            kind, _USAGE_CACHE_PRICING_OFF if pricing_off
+            else _USAGE_CACHE_UNSERIALISABLE)
     if kind == "series":
         entries = []
         done = 0
@@ -11609,6 +11694,12 @@ def runtime_settings_view():
             wb_settings.remaining_priority_enabled(ACCOUNTS_DIR),
         "egress_backoff_enabled":
             wb_settings.egress_backoff_enabled(ACCOUNTS_DIR),
+        "pool_separation_enabled":
+            wb_settings.pool_separation_enabled(ACCOUNTS_DIR),
+        # The checkbox reflects the persisted preference; this reflects what
+        # dispatch actually enforces (env vars and standalone pool entries win).
+        "pool_separation_effective":
+            wb_pool_scope.separation_enabled(),
         "restriction_hold_seconds":
             int(wb_settings.restriction_hold_seconds(ACCOUNTS_DIR)),
         "restriction_holds":
@@ -11622,12 +11713,11 @@ def runtime_settings_view():
         "account_inflight": account_inflight_snapshot(),
         "affinity_stable_key_enabled":
             wb_settings.affinity_stable_key_enabled(ACCOUNTS_DIR),
-        # 媒体能力（生图 / 生视频）。默认关；面板把它读回去，才知道开关该画在哪一格。
+        # 媒体能力（生图 / 生视频）限额。路由始终开启，面板只画这四项。
         "media": wb_settings.media_config(ACCOUNTS_DIR),
         "media_limits": dict(wb_settings.MEDIA_LIMITS),
         "media_minimums": dict(wb_settings.MEDIA_MINIMUMS),
         "media_realms": list(wb_settings.MEDIA_REALMS),
-        "media_identities": list(wb_settings.MEDIA_IDENTITIES),
         "log_db_enabled": wb_settings.log_db_enabled(ACCOUNTS_DIR),
         "log_db_max_rows": wb_settings.log_db_max_rows(ACCOUNTS_DIR),
         "log_db_max_days": wb_settings.log_db_max_days(ACCOUNTS_DIR),
@@ -11664,11 +11754,18 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.0.3",
+        "version": "2.0.7",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
-    return representative_account(scope=wb_pool_scope.SCOPE_TEXT)
+    return representative_account(scope=_representative_text_scope())
+
+
+def _representative_text_scope():
+    """Keep the old text-only display when pool separation is enabled."""
+    if wb_pool_scope.separation_enabled():
+        return wb_pool_scope.SCOPE_TEXT
+    return None
 
 
 def representative_account(realm=None, scope=None):
@@ -11771,8 +11868,8 @@ def affinity_route(messages):
     line share - they then overwrite each other's binding every turn and each
     turn lands on the other one's account, dropping the prefix cache each time.
     Adding the first assistant reply (and the user turn after it) makes the two
-    keys diverge from the second turn on. The switch is off by default so an
-    existing install keeps exactly the upstream behaviour and can roll back.
+    keys diverge from the second turn on. The switch is on by default; an
+    existing install can turn it off to restore the old key derivation.
     """
     if not AFFINITY_BY_PREFIX:
         return None, None
@@ -12838,7 +12935,7 @@ def fetch_remote_product_config(realm):
     if realm not in ("intl", "cn") or POOL is None:
         return None
     account = representative_account(
-        realm=realm, scope=wb_pool_scope.SCOPE_TEXT)
+        realm=realm, scope=_representative_text_scope())
     if account is None or not account.access_token:
         log("remote catalog: no usable %s account, skipping" % realm)
         return None
@@ -12973,7 +13070,7 @@ def catalog_daily_pass(now=None):
     done = []
     for realm in catalog_daily_due(now):
         if POOL is None or representative_account(
-                realm=realm, scope=wb_pool_scope.SCOPE_TEXT) is None:
+                realm=realm, scope=_representative_text_scope()) is None:
             continue
         out = refresh_catalog(realm)
         log("catalog daily: %s -> %s" % (realm, out.get("msg")))
@@ -13225,20 +13322,17 @@ def normalize_roles(messages):
 # Fingerprint Sanitization (immunizes against Codex / Claude Code WAF patterns)
 # ---------------------------------------------------------------------------
 SANITIZE_FEATURES = (
-    "x-anthropic-billing-header",
-    "cc_entrypoint=",
+    "x-anthropic-billing-hdr",
     "You are Claude Code",
     "Main branch (",
     "You are a coding agent running in the Codex CLI",
     "github.com/anthropics/",
-    "11128",
 )
 SANITIZE_REWRITES = (
     ("Main branch (you will usually use this for PRs)",
      "Default branch (you will usually use this for PRs)"),
     ("To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
      "To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues"),
-    ("11128", "11-128"),
 )
 # Codex CLI 的自述首段（#743）：上游按「身份句 + Codex CLI」判 11-128。
 # 旧规则把中性句改写成这段自述，反过来把指纹注入出站 body；这里整句中性化，
@@ -13255,8 +13349,12 @@ SANITIZE_CLAUDE_CODE_INTRO_RE = re.compile(
     r"(?: tool)? for Claude(?: Code)?\.?")
 SANITIZE_CLAUDE_CODE_INTRO_REPLACEMENT = "You are a helpful AI assistant."
 SANITIZE_CLAUDE_CODE_LOWER = "you are claude code,"
-SANITIZE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header:[^;\r\n]*;?\s*")
-SANITIZE_BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header")
+SANITIZE_HDR_RE = re.compile(
+    r"(?i)x-anthropic-billing-hdr\s*:\s*[^;\r\n]*(?:;\s*)?")
+# Keep the bare-header pattern derived from the fingerprint list. Spelling the
+# suffix a second time here is fragile: an automated rewrite has already
+# expanded the wire value once, and the fast path must match the exact bytes.
+SANITIZE_BARE_HDR_RE = re.compile("(?i)" + SANITIZE_FEATURES[0])
 SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
 # WorkBuddy upstream returns 11128 ("Illegal API invocation from an unapproved
 # channel") when this exact OmO identity fingerprint appears as a contiguous
@@ -13359,17 +13457,18 @@ SANITIZE_IDENTITY_LOWER = SANITIZE_IDENTITY_VERBS
 def has_fingerprint(text, identity=True):
     if not isinstance(text, str) or not text:
         return False
-    for f in SANITIZE_FEATURES:
-        if f in text:
-            return True
     # 三个特例字符几乎从不出现：先做三次 C 速度探测，命中才走归一化副本，
     # 常规文本只付一次 lower()。
     if "\u0130" in text or "\u0131" in text or "\u017f" in text:
         low = text.translate(SANITIZE_REI_FOLD).lower()
     else:
         low = text.lower()
+    for f in SANITIZE_FEATURES:
+        if f.lower() in low:
+            return True
     if (SANITIZE_BARE_HDR_LOWER in low
-            or SANITIZE_OMO_JUNIOR_LOWER in low):
+            or SANITIZE_OMO_JUNIOR_LOWER in low
+            or "cc_" in low):
         return True
     if not identity:
         return False
@@ -13426,7 +13525,9 @@ def sanitize_text(text, identity=True):
         while prev != text:
             prev = text
             text = SANITIZE_KV_RE.sub("", text)
-    text = SANITIZE_BARE_HDR_RE.sub("x-anthropic-billing-hdr", text)
+    # The bare header is the last rewrite: has_fingerprint() matches this exact
+    # key, so replacing it earlier would leave a value the fast path ignores.
+    text = SANITIZE_BARE_HDR_RE.sub("anthropic-header", text)
     return text.strip()
 def sanitize_content(content, identity=True):
     if isinstance(content, str):
@@ -17573,14 +17674,17 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     text_accounts = texts.accounts() if texts else (POOL.accounts if POOL else [])
     enabled = [a for a in text_accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
-    if enabled and all(a.daily_limit_blocked() for a in enabled):
+    candidates = [a for a in enabled
+                  if allowed_accounts is None or a.uid in allowed_accounts]
+    if candidates and all(a.daily_limit_blocked() for a in candidates):
         reason = ("every usable account reached today's token limit (%s per "
                   "account); the pool resumes after local midnight"
                   % wb_settings.daily_token_limit(ACCOUNTS_DIR, realm))
         midnight = seconds_until_local_midnight()
         raise RateLimited(None, reason, wait=midnight, message=reason,
                           reset_at=time.time() + midnight)
-    if enabled and model and all(a.credit_limit_blocked(model) for a in enabled):
+    if (candidates and model
+            and all(a.credit_limit_blocked(model) for a in candidates)):
         reason = ("every usable account reached today's credit limit (%s per "
                   "account); paid models resume after local midnight, free "
                   "models keep working"
@@ -17588,7 +17692,8 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         midnight = seconds_until_local_midnight()
         raise RateLimited(None, reason, wait=midnight, message=reason,
                           reset_at=time.time() + midnight)
-    if enabled and model and all(a.model_token_limit_blocked(model) for a in enabled):
+    if (candidates and model
+            and all(a.model_token_limit_blocked(model) for a in candidates)):
         reason = ("every usable account reached today's token limit for %s "
                   "(%s per account); the model resumes after local midnight"
                   % (model, wb_settings.model_daily_token_limit(ACCOUNTS_DIR, realm)))
@@ -17605,8 +17710,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   "raise the cap" % (limit, limit))
         raise RateLimited(None, reason, wait=1, message=reason,
                           reset_at=time.time() + 1)
-    candidates = [a for a in enabled
-                  if allowed_accounts is None or a.uid in allowed_accounts]
     if (model and candidates
             and all(a.blocked_by_model_cooldown(model) for a in candidates)):
         # 全部候选都只差"这个模型的上游窗口恢复"：这是**等待**，不是故障。
@@ -20912,7 +21015,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.0.3"
+    server_version = "wb-proxy/2.0.7"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -21819,13 +21922,12 @@ class Handler(BaseHTTPRequestHandler):
             # CodeArts 只是子字段：它掉线不能把整体 /health 变红。
             info["codearts"] = {"configured": False, "ok": False,
                                 "error": str(exc)[:200]}
-        # 媒体能力：`/health` 是运维第一眼看的地方，早给比晚给好。队列深度等视频
-        # 任务表落地后再补（生图是同步请求，没有队列可报）。
+        # 媒体能力：`/health` 是运维第一眼看的地方，早给比晚给好。媒体路由始终
+        # 可用；`realm` 只是当前自动选择的结果，调用方仍可按 Key 绑定走另一个出口。
         media_cfg = wb_settings.media_config(ACCOUNTS_DIR)
         info["media"] = {
-            "enabled": media_cfg["enabled"],
-            "realm": media_cfg["realm"],
-            "identity": media_cfg["identity"],
+            "enabled": True,
+            "realm": _media_realm_for_key(self),
             "slots": MEDIA_SLOTS,
             "inflight": media_inflight(),
             # 生视频并发：超过就排队，不提交上游、不扣费。
@@ -22186,17 +22288,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         cn_accounts = POOL.task_accounts("cn") if POOL else []
-        texts, _ = _ensure_pools()
-        cn_accounts = [a for a in cn_accounts
-                       if texts is None or texts.allows(a)]
         if not cn_accounts:
             return self._json_panel(200, {"tasks": [], "summary": {}, "accounts": [], "msg": "未找到参与任务的国内版账号"})
         uid = (query.get("uid") or [None])[0]
         acc = None
         if uid and uid != "all":
             target = POOL.get(uid) if POOL else None
-            if (target and target.realm == "cn"
-                    and (texts is None or texts.allows(target))):
+            if target and target.realm == "cn":
                 acc = target
         if not acc:
             acc = cn_accounts[0]
@@ -22390,12 +22488,14 @@ class Handler(BaseHTTPRequestHandler):
                 # Cache-Control 必须原样重发（RFC 7232 §4.1），否则缓存会丢掉状态。
                 self.send_response(304)
                 self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Robots-Tag", "noindex, nofollow")
                 self.send_header("ETag", etag)
                 self.end_headers()
                 return
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
         # no-cache 而不是 no-store：允许存储，但每次使用前必须回源校验；配合
         # 上面的校验符，校验命中的代价是一次 304 而不是整页约 470KB。不加
         # max-age：没有它浏览器每次打开都会校验，应用更新后新版页面立即生效。
@@ -22565,33 +22665,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(status, message, err_type)
 
     def _media_config(self):
-        config = wb_settings.media_config(ACCOUNTS_DIR)
-        # 出站身份形状同步给 client（后台 worker 轮询时用的也是这个值）。
-        wb_media_client.set_identity(config.get("identity"))
-        return config
+        return wb_settings.media_config(ACCOUNTS_DIR)
 
     def _media_realm(self, config):
-        """这次媒体请求走哪个出口：Key 绑定的出口优先，其次面板配置。"""
-        bound = self._key_realm()
-        if bound:
-            if bound != config["realm"]:
-                raise wb_media.MediaError(
-                    "INVALID_ARGS",
-                    "本 Key 绑定在 %s 出口，而媒体能力配置在 %s 出口；"
-                    "请换对应出口的 Key，或在设置页把媒体出口改成 %s"
-                    % (bound, config["realm"], bound))
-            return bound
-        return config["realm"]
+        """这次媒体请求走哪个出口：Key 绑定优先，否则自动选择可用出口。"""
+        return _media_realm_for_key(self)
 
     def _media_prepare(self, path, payload, config):
-        """校验开关、挑出模型、拼好请求体。**一个字节都不发**。
+        """挑出模型、拼好请求体。**一个字节都不发**。
 
         放在这里而不是散在路由里，是因为「参数不对」和「上游拒绝」必须能分开：
         前者一分钱没花、不进冷却，后者可能已经扣过积分。
         """
-        if not config["enabled"]:
-            # 关着就是不存在：404 而不是 403，少一个探测面。
-            raise wb_media.MediaError("NO_ROUTE", "not found")
         realm = self._media_realm(config)
         kind = "edit" if path in ("/v1/images/edits", "/images/edits") else "generate"
         prompt = payload.get("prompt")
@@ -22650,7 +22735,9 @@ class Handler(BaseHTTPRequestHandler):
                            realm=realm, scope=wb_pool_scope.SCOPE_MEDIA))
             if account is None:
                 detail = medias.empty_detail(realm) if medias is not None else "该区没有可用账号。"
-                raise wb_media.MediaError("NO_ROUTE", detail)
+                # 没有账号是上游暂时不可用，不是媒体路由不存在。404 会让
+                # 客户端把“稍后重试”误判成“这个部署没有媒体能力”。
+                raise wb_media.MediaError("UPSTREAM", detail)
             payload = wb_media_client._get_json(
                 account, wb_media_client.CONFIG_PATH,
                 wb_media_client.CONFIG_TIMEOUT_SECONDS)
@@ -22875,8 +22962,6 @@ class Handler(BaseHTTPRequestHandler):
         4xx 一律 REJECTED，可以立刻重试。
         """
         config = self._media_config()
-        if not config["enabled"]:
-            return self._media_error(wb_media.MediaError("NO_ROUTE", "not found"))
         store = media_tasks()
         if store.pending_count() >= store.max_pending:
             # 还没花钱：让客户端看到 429，比让它排队几十分钟好。
@@ -23173,8 +23258,8 @@ class Handler(BaseHTTPRequestHandler):
 
         与 `/v1/models` 分开是刻意的：那个清单是给聊天客户端用的，把生图模型塞进去
         客户端会拿它去对话。这里返回**未经投影**的媒体条目，`videoGeneration` 原样
-        带走，调用方据此知道自己能要几秒、哪些分辨率。开关关着也能查——配置之前
-        先看看有什么，正是这个接口存在的理由之一。
+        带走，调用方据此知道自己能要几秒、哪些分辨率。未传 `realm` 时自动选择
+        当前有可用媒体账号的出口。
         """
         if not self._authorized():
             return
@@ -23182,8 +23267,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(
                 403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
                 "pool_boundary")
-        config = self._media_config()
-        realm = (query.get("realm") or [None])[0] or config["realm"]
+        requested = (query.get("realm") or [None])[0]
+        realm = _media_realm_for_key(self, requested)
         if realm not in wb_settings.MEDIA_REALMS:
             return self._error(400, "realm must be one of %s"
                                % ", ".join(wb_settings.MEDIA_REALMS),
@@ -23240,8 +23325,7 @@ class Handler(BaseHTTPRequestHandler):
                 model["creditPerSecondCeiling"] = wb_media.COST_VIDEO_PER_SECOND_CEILING
         return self._json(200, {
             "realm": realm,
-            "enabled": config["enabled"],
-            "identity": config["identity"],
+            "enabled": True,
             "models": models,
         })
 
@@ -23781,6 +23865,14 @@ class Handler(BaseHTTPRequestHandler):
                 # 由下一个请求照常推（此刻就算推也要先折一次剩余估算，没必要
                 # 为一个开关多付这一趟）。
                 POOL.apply_remaining_weights(None)
+        if "pool_separation_enabled" in payload:
+            raw = payload.get("pool_separation_enabled")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "pool_separation_enabled must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_pool_separation_enabled(ACCOUNTS_DIR, raw)
+            reply["pool_separation_enabled"] = raw
         if "realm_fallback_enabled" in payload:
             # 跨出口回退（默认关）：与 remaining_priority_enabled 同一形状——
             # 严格 JSON 布尔，字符串 "false" 会是真值。
@@ -24957,9 +25049,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
-        texts, _ = _ensure_pools()
-        targets = [a for a in targets
-                   if a is not None and (texts is None or texts.allows(a))]
+        targets = [a for a in targets if a is not None]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_growth_tasks
@@ -25000,9 +25090,6 @@ class Handler(BaseHTTPRequestHandler):
         target = POOL.get(uid)
         if not target or target.realm != "cn":
             return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
-        texts, _ = _ensure_pools()
-        if texts is not None and not texts.allows(target):
-            return self._json_panel(200, {"ok": False, "msg": "该账号属于媒体号池，不执行文本任务"})
         from wb_tasks import claim_task
         res = claim_task(target, code)
         invalidate_tasks_cache()
@@ -25024,9 +25111,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
-        texts, _ = _ensure_pools()
-        targets = [a for a in targets
-                   if a is not None and (texts is None or texts.allows(a))]
+        targets = [a for a in targets if a is not None]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_streak_bonus
@@ -25053,9 +25138,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
-        texts, _ = _ensure_pools()
-        targets = [a for a in targets
-                   if a is not None and (texts is None or texts.allows(a))]
+        targets = [a for a in targets if a is not None]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import do_cat_travel
@@ -25276,9 +25359,7 @@ class Handler(BaseHTTPRequestHandler):
                          if a.realm == "cn"
                          and a.task_active()
                          and not a.uses_enterprise_billing()])
-        texts, _ = _ensure_pools()
-        targets = [a for a in targets
-                   if a is not None and (texts is None or texts.allows(a))]
+        targets = [a for a in targets if a is not None]
         results = []
         for account in targets:
             if account is None:
@@ -25307,9 +25388,7 @@ class Handler(BaseHTTPRequestHandler):
                        if a.realm == "intl" and a.task_active() and str(a.uid) in wanted]
         else:
             targets = POOL.task_accounts("intl")
-        texts, _ = _ensure_pools()
-        targets = [a for a in targets
-                   if a is not None and (texts is None or texts.allows(a))]
+        targets = [a for a in targets if a is not None]
         results = []
         for account in targets:
             if account is None:
@@ -25334,9 +25413,7 @@ class Handler(BaseHTTPRequestHandler):
             targets = [POOL.get(uid)]
         else:
             targets = POOL.task_accounts("intl")
-        texts, _ = _ensure_pools()
-        targets = [a for a in targets
-                   if a is not None and (texts is None or texts.allows(a))]
+        targets = [a for a in targets if a is not None]
         results = []
         for account in targets:
             if account is None:
