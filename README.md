@@ -20,7 +20,7 @@
 This project is for protocol research and personal use only. Prefer the official client, do not use your primary account, and do not resell or share access.
 
 <p align="center">
-  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.0.8-2496ED?style=flat-square" alt="Version 2.0.8"></a>
+  <a href="https://github.com/ardeyouxipianyi/workbuddy2api-hub/releases"><img src="https://img.shields.io/badge/Release-v2.1.0-2496ED?style=flat-square" alt="Version 2.1.0"></a>
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-Intl_&_CN-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -111,6 +111,10 @@ services:
 
 更新镜像：`docker compose pull && docker compose up -d`。
 
+Docker 镜像在构建阶段已经编译好当前架构的 Go/uTLS 桥，容器内不需要 Go。
+未设置 `WB_TLS_FINGERPRINT` 时默认 `auto`；如需彻底关闭桥，可加
+`- WB_TLS_FINGERPRINT=python`，卷中的账号、设置和用量不会因此改变。
+
 ### 3. 启动入口：优先用 `-m`
 
 同一份代码、同一个账号池，`python3 wb_proxy.py` 与 `python3 -m wb_proxy` 的常驻内存差 **47-54 MB**
@@ -126,7 +130,29 @@ python3 -m wb_proxy --port 8788
 仓库内的资源路径都基于 `__file__` 解析，不受影响。Docker 镜像和 OpenWrt 包已改用 `-m`；
 Windows / macOS 的 `start-wb-proxy.*` 启动脚本暂未改动。
 
-### 4. CodeArts 原生第三出口
+### 4. TLS 出站桥（默认 `auto`）
+
+从本版本起，未显式配置 TLS 模式的安装默认使用 `WB_TLS_FINGERPRINT=auto`：
+网关会先尝试随包 Go/uTLS 桥；桥二进制缺失、架构不支持、启动失败、桥进程运行中
+退出，或当前请求使用自定义 CA / 不兼容代理时，自动回退 Python/OpenSSL。
+回退只发生在当前进程内，不会反复拉起失败的桥，也不会改变原来的代理出口和证书
+校验。便捷版、Docker 和 OpenWrt 的受支持架构包都自带对应桥，用户不需要安装 Go。
+
+需要强制指定时：
+
+```sh
+WB_TLS_FINGERPRINT=python   # 强制 Python/OpenSSL
+WB_TLS_FINGERPRINT=node     # 强制桥；桥不可用时报明确错误
+```
+
+`node` 模式下不要设置 `WB_TLS_BRIDGE=off`，否则会按显式关闭桥处理而走 Python。
+OpenWrt 使用 `uci set workbuddy2api.main.tls_mode='auto'`、`'node'` 或 `'python'`。
+实际模式、最近路线和回退原因可在 `/health`、`/settings` 及面板网络设置中查看。
+降级到不识别 `auto` 的旧版本前，请临时设置 `WB_TLS_FINGERPRINT=python`。
+逐路径头顺序、代理/桥头隔离和未修改项见
+[`docs/OUTBOUND-HEADER-AUDIT.md`](docs/OUTBOUND-HEADER-AUDIT.md)。
+
+### 5. CodeArts 原生第三出口
 
 网关内置进程内直连华为云 CodeArts，支持聊天 SSE 协议转换与自动签到，无需单独运行第三方桥接服务：
 1. 打开看板 →「设置 → CodeArts 接入」，勾选「启用 CodeArts 出口」并保存；
@@ -222,7 +248,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 289 个套件：218 个 Python + 71 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 290 个套件：218 个 Python + 72 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -244,7 +270,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 - **[88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)**：猫猫日常旅行与成长能量开盲盒（Buddy 盲盒）安全生命周期；
 - **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)**：国内版连登管家闭环逻辑与轻量对话活跃上报事件；
 - **[misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)**：Go/uTLS Node/OpenSSL ClientHello 指纹参数与桥接实现参考（18 Cipher、10 Extension、无 ALPN）；
-- **[Zhengyuuuui/workbuddy2api](https://github.com/Zhengyuuuui/workbuddy2api)**：国际版 11140 风控限制识别、冷却规避与故障排查清单；
+- **[Zhengyuuuui/workbuddy2api](https://github.com/Zhengyuuuui/workbuddy2api)**：国际版 11140 账号封禁识别、冷却规避与故障排查清单；
 - **[yuanyuanyuan430/workbuddy2api-hub](https://github.com/yuanyuanyuan430/workbuddy2api-hub)**：国际版 EdgeOne CDN 证书错配排查与活跃上报优雅降级方案；
 - **[CangShui/workbuddy-cliproxy-fix](https://github.com/CangShui/workbuddy-cliproxy-fix)** & **[lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy)**：早期客户端代理修复与网关通信原型；
 - **[mmqz/cpa-multi-plugins](https://github.com/mmqz/cpa-multi-plugins)**：多插件管理与出站调度结构参考；

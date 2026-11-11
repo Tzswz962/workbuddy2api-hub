@@ -11739,6 +11739,7 @@ def runtime_settings_view():
         "keep_backups": wb_settings.keep_backups(ACCOUNTS_DIR),
         "keep_backups_max": wb_settings.MAX_KEEP_BACKUPS,
         "upstream": _panel_upstream_config(ACCOUNTS_DIR),
+        "outbound_tls": wb_upstream_pool.tls_status(),
         "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
         "desktop_chat_compat": wb_settings.desktop_chat_compat(ACCOUNTS_DIR),
         "max_payload_mb": wb_settings.max_payload_mb(ACCOUNTS_DIR),
@@ -11754,7 +11755,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.0.8",
+        "version": "2.1.0",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -12245,6 +12246,7 @@ def log(msg, level=None, tag=None):
 
 # 本地网路工具的多引擎轮换、冷却与失败分类写进看板日志（tag=webtools）
 wb_webtools.set_logger(log)
+wb_upstream_pool.set_tls_logger(log)
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
     # 落库开启时以数据库为准：它是完整历史（受保留上限约束），而内存环形缓冲
@@ -13366,6 +13368,10 @@ SANITIZE_HDR_RE = re.compile(
     r"(?i)x-anthropic-billing-(?:header|hdr)\s*:\s*[^;\r\n]*(?:;\s*)?")
 SANITIZE_BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-(?:header|hdr)")
 SANITIZE_KV_RE = re.compile(r"(?i)\bcc_[a-z0-9_]+=[^;\r\n]*;?\s*")
+SANITIZE_BILLING_LINE_RE = re.compile(
+    r"(?i)^[ \t]*x-anthropic-billing-(?:header|hdr)[ \t]*:(.*)$")
+SANITIZE_BILLING_CONT_RE = re.compile(
+    r"(?i)^(?:[ \t]*(?:cc_[a-z0-9_]+|cch)=[^;\r\n]*(?:;[ \t]*)?)+$")
 # WorkBuddy upstream returns 11128 ("Illegal API invocation from an unapproved
 # channel") when this exact OmO identity fingerprint appears as a contiguous
 # substring in a system message. A/B tests show the match is case-insensitive,
@@ -13459,9 +13465,10 @@ SANITIZE_REI_FOLD = str.maketrans({0x130: "i", 0x131: "i", 0x17F: "s"})
 # 计费头有两个合法拼写（header / hdr），字面量快路径直接用登记表；
 # OMO 短语仍是单一字面量，继续从正则派生，保证与正则同源。
 SANITIZE_BARE_HDR_LOWER = SANITIZE_BILLING_HDR_NAMES[0]
+SANITIZE_BILLING_LOWER = tuple(name.lower() for name in SANITIZE_BILLING_HDR_NAMES)
 SANITIZE_OMO_JUNIOR_LOWER = SANITIZE_OMO_JUNIOR_RE.pattern.lower()
 SANITIZE_IDENTITY_LOWER = SANITIZE_IDENTITY_VERBS
-def has_fingerprint(text, identity=True):
+def has_fingerprint(text, identity=True, billing=True):
     if not isinstance(text, str) or not text:
         return False
     # 三个特例字符几乎从不出现：先做三次 C 速度探测，命中才走归一化副本，
@@ -13471,11 +13478,13 @@ def has_fingerprint(text, identity=True):
     else:
         low = text.lower()
     for f in SANITIZE_FEATURES:
+        if not billing and f.lower() in SANITIZE_BILLING_LOWER:
+            continue
         if f.lower() in low:
             return True
-    if (SANITIZE_BARE_HDR_LOWER in low
+    if ((billing and SANITIZE_BARE_HDR_LOWER in low)
             or SANITIZE_OMO_JUNIOR_LOWER in low
-            or "cc_" in low):
+            or (billing and "cc_" in low)):
         return True
     if not identity:
         return False
@@ -13501,10 +13510,77 @@ def has_fingerprint(text, identity=True):
     if not any(needle in low for needle in SANITIZE_IDENTITY_LOWER):
         return False
     return SANITIZE_IDENTITY_RE.search(text) is not None
-def sanitize_text(text, identity=True):
+
+
+def _billing_payload_is_metadata(value):
+    """True when a candidate header value contains only known metadata pairs."""
+    value = str(value or "").strip()
+    if not value:
+        return False
+    # Older clients emitted a bare version after the key.
+    if re.fullmatch(r"[0-9]+(?:\.[0-9A-Za-z_-]+){1,4}", value):
+        return True
+    pairs = [part.strip() for part in value.split(";") if part.strip()]
+    if not pairs:
+        return False
+    for pair in pairs:
+        if "=" not in pair:
+            return False
+        key, item = pair.split("=", 1)
+        key = key.strip().lower()
+        if not re.fullmatch(r"[a-z_][a-z0-9_]*", key):
+            return False
+        if key != "cch" and not key.startswith("cc_"):
+            return False
+        if not item.strip():
+            return False
+    return True
+
+
+def sanitize_billing_metadata_prefix(text):
+    """Remove only a leading, self-contained Claude Code billing block.
+
+    #853's metadata is a complete line (or a complete list of ``cc_*`` /
+    ``cch`` continuation lines) at the start of a system/developer block.  A
+    key mentioned in prose, a fenced example, a user message or a tool result
+    is not enough to trigger this cleaner.
+    """
     if not isinstance(text, str) or not text:
         return text
-    if not has_fingerprint(text, identity=identity):
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return text
+    first = lines[0].rstrip("\r\n")
+    match = SANITIZE_BILLING_LINE_RE.fullmatch(first)
+    if match is None or not _billing_payload_is_metadata(match.group(1)):
+        return text
+    end = 1
+    while end < len(lines):
+        candidate = lines[end].rstrip("\r\n")
+        if not SANITIZE_BILLING_CONT_RE.fullmatch(candidate):
+            break
+        end += 1
+    return "".join(lines[end:]).strip()
+
+
+def sanitize_message_text(text, identity=True, billing=False):
+    """Sanitize one message text without applying legacy broad header cleanup.
+
+    The unscoped ``sanitize_text`` entry point remains available for existing
+    callers and tests, but the wire-body pipeline uses this wrapper so billing
+    metadata can only be removed in system/developer messages and only from a
+    fully recognisable leading block.
+    """
+    cleaned = sanitize_text(text, identity=identity, billing=False)
+    if billing:
+        cleaned = sanitize_billing_metadata_prefix(cleaned)
+    return cleaned
+
+
+def sanitize_text(text, identity=True, billing=True):
+    if not isinstance(text, str) or not text:
+        return text
+    if not has_fingerprint(text, identity=identity, billing=billing):
         return text
     # Keep the rewrite deliberately narrow: do not globally remove
     # "OhMyOpenCode" or "Sisyphus-Junior", because either token alone is
@@ -13526,27 +13602,35 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
     for old, new in SANITIZE_REWRITES:
         text = text.replace(old, new)
-    # 计费归因头通常独占 system 首行；先整行删掉，`cch=` 等尾部参数不会残留。
-    text = SANITIZE_HDR_LINE_RE.sub("", text)
-    text = SANITIZE_HDR_RE.sub("", text)
-    if "cc_" in text:
-        prev = ""
-        while prev != text:
-            prev = text
-            text = SANITIZE_KV_RE.sub("", text)
-    # The bare header is the last rewrite: has_fingerprint() matches this exact
-    # key, so replacing it earlier would leave a value the fast path ignores.
-    text = SANITIZE_BARE_HDR_RE.sub("anthropic-header", text)
+    if billing:
+        # Preserve the historical unscoped entry point. Message processing
+        # passes billing=False and uses sanitize_billing_metadata_prefix().
+        text = SANITIZE_HDR_LINE_RE.sub("", text)
+        text = SANITIZE_HDR_RE.sub("", text)
+        if "cc_" in text:
+            prev = ""
+            while prev != text:
+                prev = text
+                text = SANITIZE_KV_RE.sub("", text)
+        # The bare header is the last rewrite: has_fingerprint() matches this
+        # exact key, so replacing it earlier would leave a value the fast path
+        # ignores.
+        text = SANITIZE_BARE_HDR_RE.sub("anthropic-header", text)
     return text.strip()
-def sanitize_content(content, identity=True):
+
+
+def sanitize_content(content, identity=True, billing=False):
     if isinstance(content, str):
-        return sanitize_text(content, identity=identity)
+        return sanitize_message_text(content, identity=identity, billing=billing)
     if isinstance(content, list):
         out = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text" and "text" in part:
                 p = dict(part)
-                p["text"] = sanitize_text(p["text"], identity=identity)
+                p["text"] = sanitize_message_text(
+                    p["text"], identity=identity, billing=billing)
+                if billing and not p["text"]:
+                    continue
                 out.append(p)
             else:
                 out.append(part)
@@ -13575,7 +13659,8 @@ def sanitize_tools(tools):
             fn = dict(fn)
             desc = fn.get("description")
             if isinstance(desc, str):
-                fn["description"] = sanitize_text(desc, identity=True)
+                fn["description"] = sanitize_text(
+                    desc, identity=True, billing=False)
             item["function"] = fn
         out.append(item)
     return out
@@ -13599,7 +13684,9 @@ def sanitize_tool_calls(tool_calls):
                 raw_args = fn.get("arguments")
                 if isinstance(raw_args, str):
                     fn["arguments"] = (raw_args if preserve
-                                       else sanitize_text(raw_args, identity=False))
+                                       else sanitize_text(
+                                           raw_args, identity=False,
+                                           billing=False))
                 elif raw_args is None:
                     fn["arguments"] = "{}"
                 else:
@@ -13626,22 +13713,37 @@ def sanitize_messages(messages):
             # assistant 里 400/400/400，放在 user 里 200/200/200）。user / tool
             # 仍是用户数据，不改写。
             identity = item.get("role") in ("system", "developer", "assistant")
+            billing = item.get("role") in ("system", "developer")
             if "content" in item and not preserve_tool_result:
                 before = item.get("content")
                 item["content"] = sanitize_content(item["content"],
-                                                   identity=identity)
-                # 整条 system 文本可能只有一个计费归因头；清洗后为空就直接
-                # 丢掉，避免把空 system 消息发给上游（空文本段会 400 / 11151）。
+                                                   identity=identity,
+                                                   billing=billing)
+                # 整条 system 文本或文本块数组可能只有计费归因头；清洗后为空
+                # 就直接丢掉，避免把空 system 消息发给上游（空文本段会 400 /
+                # 11151）。图片等非文本块不参与这个判定。
+                had_text = (
+                    isinstance(before, str) and bool(before.strip())
+                ) or (
+                    isinstance(before, list)
+                    and any(
+                        isinstance(part, dict)
+                        and part.get("type") == "text"
+                        and isinstance(part.get("text"), str)
+                        and bool(part["text"].strip())
+                        for part in before
+                    )
+                )
                 if (item.get("role") in ("system", "developer")
-                        and isinstance(before, str) and before.strip()
-                        and item["content"] == ""):
+                        and had_text
+                        and item["content"] in ("", [])):
                     continue
             if isinstance(item.get("reasoning_content"), str):
                 item["reasoning_content"] = sanitize_text(
-                    item["reasoning_content"], identity=False)
+                    item["reasoning_content"], identity=False, billing=False)
             if not preserve_request_contract_enabled() and isinstance(item.get("reasoning"), str):
                 item["reasoning"] = sanitize_text(
-                    item["reasoning"], identity=False)
+                    item["reasoning"], identity=False, billing=False)
             if "tool_calls" in item:
                 item["tool_calls"] = sanitize_tool_calls(item["tool_calls"])
             out.append(item)
@@ -15653,7 +15755,7 @@ class PinnedAccountError(Exception):
 
 
 class ContentRejected(Exception):
-    """Upstream content review rejected this request (403 / code 11140).
+    """Upstream content review rejected this request (HTTP 403).
 
     Not an account problem: another credential gets the same 403 for the same
     content, so it is passed straight through instead of cooling the pool.
@@ -15725,8 +15827,8 @@ def gateway_hint(status, message):
     if ("11140" in lower or "账号存在异常行为" in text
             or "account has been restricted" in lower
             or "unusual activity" in lower):
-        return ("上游已对该账号做账号级风控限制（403 / code 11140）；网关已让该账号"
-                "冷却并停止换号重试。请勿换号或高频重试（同设备账号会连坐），"
+        return ("上游已封禁该账号（403 / code 11140）；网关已停止派发和换号重试。"
+                "请勿换号或高频重试（同设备账号会连坐），"
                 "按 WorkBuddy 官方渠道申诉，通常 1-3 个工作日自动解除。")
     if "no usable account" in lower or "no healthy account" in lower:
         return "no healthy account available in pool; check /status or retry later"
@@ -16609,9 +16711,8 @@ def rate_limit_is_account_level(detail, reset_at):
     return credential_scope_phrase(detail) is not None
 
 
-#: 上游风控限制（HTTP 403, code 11140「账号存在异常行为，已被限制使用」）
-#: 的账号冷却时长。定义在 wb_accounts：这是账号级状态且要持久化
-#: （restrictedUntil），时长跟着它走，避免两处各写一份。
+#: 上游账号封禁（HTTP 403, code 11140「账号存在异常行为，已被限制使用」）
+#: 命中即持久禁用，不再有冷却时长或自动恢复。保留常量仅兼容外部导入。
 RESTRICTED_403_COOLDOWN = wb_accounts.RESTRICTED_ACCOUNT_COOLDOWN
 
 # --- 风控连坐保护 ---------------------------------------------------------
@@ -16681,7 +16782,7 @@ def clamp_restriction_holds(max_seconds, now=None):
 
 
 def note_account_restriction(realm, uid="", now=None):
-    """记一次账号级风控限制；若触发连坐暂停则返回暂停到的 epoch（0 = 尚未触发）。
+    """记一次账号级封禁；若触发连坐暂停则返回暂停到的 epoch（0 = 尚未触发）。
 
     同一个区域内达到 RESTRICTION_WAVE_MIN 个**不同**账号被限制，判定为该区域
     遭到了设备 / 出口级别的风控连坐扫荡，全区域紧急暂停配置的 hold_seconds 秒；期间
@@ -16709,16 +16810,16 @@ def note_account_restriction(realm, uid="", now=None):
 
 def restriction_hold_message(realm, remaining):
     """整池暂停期间交给客户端的说明。"""
-    return ("上游风控已限制本区域账号（403 / code 11140，账号存在异常行为）。"
+    return ("上游已封禁本区域账号（403 / code 11140，账号存在异常行为）。"
             "网关已暂停派发 %d 秒，避免继续换号重试导致同设备账号连坐被封。"
             "请勿换号或高频重试；按 WorkBuddy 官方渠道申诉（通常 1-3 个工作日"
-            "自动解除），解封后再恢复。 Upstream restricted the account(s); "
+            "自动解除），解封后再恢复。 Upstream banned the account(s); "
             "dispatch paused %ds to avoid further bans."
             % (int(remaining), int(remaining)))
 
 
 def _persist_restriction(account):
-    """把 restrictedUntil 落盘；失败只记日志，不影响请求路径。"""
+    """把账号封禁状态落盘；失败只记日志，不影响请求路径。"""
     try:
         path = getattr(account, "path", "") or ""
         if path:
@@ -17037,7 +17138,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             raise PinnedAccountError(
                 503, "pinned account '%s' is not usable right now: %s"
                 % (pinned_ref(), pinned.unavailable_reason(model)), pinned.uid)
-    # 连坐保护：同一区域刚有账号被上游风控限制，整池暂停派发。这里直接快速
+    # 连坐保护：同一区域刚有账号被上游封禁，整池暂停派发。这里直接快速
     # 失败、一个上游请求都不发——继续打只会把同一台设备上的其他账号也送走。
     hold = restriction_hold_remaining(realm)
     if hold > 0:
@@ -17442,18 +17543,17 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     detail = read_http_error(exc, 600).decode("utf-8", "replace")
                 except Exception:
                     detail = ""
-                # 先分流：上游风控限制（code 11140「账号存在异常行为，已被限制
+                # 先分流：上游账号封禁（code 11140「账号存在异常行为，已被限制
                 # 使用」）是账号级的坏，降级提示词救不了。处置按社区复盘的红线
                 # 走：冷却这个账号（持久化）、记一次连坐事件，然后**停手**——
                 # 不再把同一条请求换到下一个号上继续打（默认，见
                 # RESTRICTED_403_ROTATE_MAX）。
                 if restriction_is_account_level(detail):
-                    account.note_restricted(detail=detail,
-                                            cooldown=RESTRICTED_403_COOLDOWN)
+                    account.note_restricted(detail=detail)
                     _persist_restriction(account)
-                    log("account %s restricted by upstream (403 11140), "
-                        "cooling %.0fs (persisted)" % (account.uid[:8],
-                                                       RESTRICTED_403_COOLDOWN))
+                    log("account %s banned by upstream (403 11140), "
+                        "disabled until manually re-enabled (persisted)"
+                        % account.uid[:8])
                     if session_key and POOL:
                         POOL.affinity.demote(session_key, account.uid)
                     last_error = exc
@@ -17801,7 +17901,7 @@ def open_upstream_with_fallback(payload, session_key=None, target_realm=None,
       * `no usable account` 的 RuntimeError —— 该出口的账号全部停用/过期/熔断，
         池子空了。
 
-    别的失败照原样抛出。403 11140（账号被上游风控限制）尤其不能跨出口重打：
+    别的失败照原样抛出。403 11140（账号被上游封禁）尤其不能跨出口重打：
     项目对它有一条红线（见 RESTRICTED_403_ROTATE_MAX 附近），换出口继续打同一台
     设备正是它要防的那件事。pinned / 参数错误更不是换出口能修的。
 
@@ -18081,13 +18181,13 @@ def probe_account(account, model=None, timeout=30):
         # cover a gateway that names the credential as bad).
         row["error"] = wb_accounts.http_error_message(exc, detail, 150)
         if exc.code == 403 and restriction_is_account_level(detail):
-            # 测试也认账号级风控限制：不能用 60 秒的普通冷却把 2 小时覆盖掉，
-            # 更不能用「测试通过」的语义把被限制的账号放回池子（见 #422）。
+            # 测试也认账号级封禁：命中即持久禁用，只有操作者手动启用才解除。
             # 一并记连坐事件：一键测试正好是发现「整池被清扫」的入口。
             account.note_restricted(detail=detail)
             _persist_restriction(account)
             note_account_restriction(account.realm, account.uid)
             row["restricted"] = True
+            row["accountBanned"] = True
             row["fails"] = int(account.fails)
             return row
         account.note_error(wb_accounts.http_error_message(exc, detail, 80),
@@ -21031,7 +21131,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.0.8"
+    server_version = "wb-proxy/2.1.0"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -21871,6 +21971,7 @@ class Handler(BaseHTTPRequestHandler):
             "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
             "authenticated": self._panel_ok(),
             "crypto_ok": crypto_ok,
+            "outbound_tls": wb_upstream_pool.tls_status(),
         }
         if not crypto_ok:
             info["crypto_error"] = crypto_reason
@@ -21919,6 +22020,7 @@ class Handler(BaseHTTPRequestHandler):
             # literal "intl" and drifted from the panel switch.
             "realm": CURRENT_REALM,
             "crypto_ok": crypto_ok,
+            "outbound_tls": wb_upstream_pool.tls_status(),
         }
         if not crypto_ok:
             info["crypto_error"] = crypto_reason
@@ -24895,6 +24997,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._route_account_credits_detail(payload)
         if path == "/tasks/run":
             return self._route_tasks_run(payload)
+        if path == "/tasks/night":
+            return self._route_tasks_night(payload)
         if path == "/tasks/claim":
             return self._route_tasks_claim(payload)
         if path == "/tasks/travel":
@@ -25092,6 +25196,64 @@ class Handler(BaseHTTPRequestHandler):
             "credit_added": total_credit,
             "logs": combined_logs,
             "accounts_count": len(targets)
+        })
+
+    def _route_tasks_night(self, payload):
+        """Run the daily night-owl task only.
+
+        Kept separate from /tasks/run: that endpoint is the one-time / event
+        task pipeline, while black_cat is a daily task with its own 23:00-08:00
+        window. Mixing them made a one-time run consume a daily quota silently.
+        """
+        if not POOL:
+            return self._json_panel(200, {"ok": False, "msg": "账号池不可用"})
+        invalidate_tasks_cache()
+        uid = payload.get("uid")
+        if uid and uid != "all":
+            target = POOL.get(uid)
+            if not target or target.realm != "cn":
+                return self._json_panel(200, {"ok": False,
+                                              "msg": "未找到指定的国内版账号"})
+            targets = [target]
+        else:
+            targets = POOL.task_accounts("cn")
+        targets = [a for a in targets if a is not None]
+        if not targets:
+            return self._json_panel(200, {"ok": False,
+                                          "msg": "未找到参与任务的国内版账号"})
+
+        from wb_tasks import run_night_growth
+        results = []
+        all_ok = True
+        for i, acc in enumerate(targets):
+            uid_str = acc.uid[:8] if acc.uid else "?"
+            nick = acc.nickname or uid_str
+            res = run_night_growth(acc)
+            ok = res.get("ok") is not False
+            all_ok = all_ok and ok
+            results.append({
+                "uid": acc.uid,
+                "nickname": nick,
+                "ok": ok,
+                "logs": res.get("logs") or [],
+                "earned_credit": res.get("earned_credit") or 0,
+            })
+            for line in res.get("logs") or []:
+                add_log_entry(f"[任务福利] 账号 [{nick}] 夜猫子任务: {line}",
+                              tag="tasks")
+            if i < len(targets) - 1:
+                time.sleep(1.0)
+
+        summary = chr(10).join(
+            "%s: %s" % (r["nickname"],
+                        (r["logs"][-1] if r["logs"] else
+                         ("完成" if r["ok"] else "未完成")))
+            for r in results)
+        return self._json_panel(200, {
+            "ok": all_ok,
+            "results": results,
+            "msg": summary,
+            "accounts_count": len(targets),
         })
 
     def _route_tasks_claim(self, payload):
@@ -25773,6 +25935,39 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_panel(200, {
                 "moved": len(moved),
                 "uids": moved,
+                "accounts": account_views(),
+            })
+        uids = payload.get("uids")
+        if uids is not None:
+            # Checkbox batch actions are an explicit set, not a group or the
+            # whole pool. Reject malformed or unknown UIDs instead of silently
+            # applying the operation to something broader.
+            if not isinstance(uids, list) or not uids:
+                return self._error(
+                    400, "uids must be a non-empty list",
+                    "invalid_request_error")
+            wanted = list(dict.fromkeys(
+                str(uid).strip() for uid in uids if str(uid).strip()))
+            if not wanted:
+                return self._error(
+                    400, "uids must contain at least one non-empty uid",
+                    "invalid_request_error")
+            missing = [uid for uid in wanted if POOL.get(uid) is None]
+            if missing:
+                return self._error(
+                    404, "no such account: %s" % ", ".join(missing[:5]),
+                    "invalid_request_error")
+            raw_enabled = payload.get("enabled")
+            if not isinstance(raw_enabled, bool):
+                return self._error(400, "enabled must be true or false",
+                                   "invalid_request_error")
+            changed = POOL.set_enabled_many(wanted, raw_enabled)
+            log("selected accounts: %d %s"
+                % (len(changed),
+                   "enabled" if raw_enabled else "disabled"))
+            return self._json_panel(200, {
+                "changed": len(changed),
+                "uids": changed,
                 "accounts": account_views(),
             })
         group = str(payload.get("group") or "").strip()
