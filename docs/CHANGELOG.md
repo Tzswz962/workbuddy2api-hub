@@ -1,5 +1,15 @@
+## Unreleased
+
+- **运营活动任务自动化**：新增星巴克协作与记者节福利活动，接入 `/portal/activity/tasks` 的任务读取、`viewed`、事件上报、`claim` 与 `claimed_at` 回读确认。星巴克自动完成 3 次小程序对话和专家对话；记者节自动完成指定专家、`interview-material-organizer` 技能体验及桌面 `playbook_prompt_send` 灵感任务。手机端 App 对话任务只提示、不伪造，完成后再运行会自动补领。
+- **活动与成长任务解耦**：运营活动走独立的 portal 契约，不再依赖成长任务清单是否下发；成长任务暂时为空或读取失败时，一次性 / 活动入口仍会继续执行活动任务并分别记录原因。
+- **真实技能分享**：`skill_share` 先从市场技能目录取可分享技能，调用 Open Platform `asset-shares/c2c/channels` 创建真实分享渠道；只有同时拿到 `share_code` 与 `link` 才上报 `skill_share_channel_action` 的 `click` / `success` 事件，服务端进度确认后才领奖。渠道创建失败、缺少链接或事件上报失败均不伪造、不领奖。
+- **模板任务真实场景**：`template_5` 从 `/console/as/support/scenes` 读取真实场景 ID，按缺口逐组上报 `agent_task_created`、`agent_task_created_with_template`、`template_used`、`playbook_prompt_send` 四事件；服务端不可用时才回落到内置场景表，进度未确认不提前领奖。
+- **测试**：新增活动任务读取、viewed、进度补发、专家 / 技能 / 桌面事件、App 边界、领奖回读，以及技能分享渠道 / 链接校验和模板真实场景 / 四事件组 / 进度确认测试。
+
 ## v2.1.2
 
+- **CodeArts 并发名额占满时改为有界排队**（跟进 #740）：单账号并发上限默认 1，客户端的自动标题请求与首轮请求常常在同一瞬间到达；旧实现只等约 100ms 就回「没有可用的 CodeArts 账号：请在看板「账号」页添加并启用至少一个账号」，并经 `_codearts_error` 映射成 502，客户端把它当成配置错误、整轮直接失败（用户再发一次「继续」时名额已空出来，于是又正常）。现在 `open_chat` 在池里还有健康账号、只是并发名额被占满时最多等待 `busy_wait_seconds`（默认 10 秒，范围 0–120）秒；等不到才抛新增的 `CodeArtsBusy`，并在 OpenAI / Anthropic 两条错误通道映射为可重试的 429（带 `reset_at`），不再冒充「没有账号」。名额归还时通过 `Condition` 立即唤醒等待者；多账号时仍优先直接选空闲账号，不排队。`#740` 当年加的 50ms 缓冲保留为兜底，但不再是唯一手段。
+- 测试：`tests/_test_codearts_native.py` 新增「busy slot queue」10 项（排队后成功、确实等待、超时抛 `CodeArtsBusy`、文案不再误导、等待有上界）。
 - **请求列表支持失败详情与筛选**（#883）：最近请求现在可按账号、模型、API Key 和结果筛选；失败状态可直接展开完整错误，不再只能看到截断的一行。筛选与分页在后端完成，跨区域扫描有上限，不会为了筛一页把全部日志读进内存。
 - **CodeArts 请求积分不再恒为 0**（#866）：CodeArts 聊天 SSE 只返回 token，不返回逐请求 `credit`。网关现在在请求发出前读取账号累计已用积分，响应结束后按差值写入本次 usage 行；`chat/completions`、`responses`、`messages` 的流式与非流式共用同一结算点。采样失败、计数回退或上游已返回非零 `credit` 时不改写，且查询失败不会影响正常聊天。
 - **计费头的宽松兜底**（`WB_SANITIZE_LOOSE_BILLING`，默认 `0` = 关闭）：#853 / #854 把清洗作用域收紧成「整块都是 `cc_*` / `cch` 元数据」的形态，误删最少；但客户端一旦改字段名或多塞一个未知键，`_billing_payload_is_metadata()` 就判它「不是元数据」，整行原样留下——而这类行每个请求都不同，留在 system 首部等于每轮把整段前缀的 prompt 缓存打掉，命中率静默归零、没有任何报错可循。开关打开后，严格解析认不出但首行看着就是计费头（≥2 个 `cc_*=` / `cch=` 键值，且≤400 字符）时整段删除；续行只在自身也是合法元数据行时才被带走。默认关闭，行为与现在逐字节一致。

@@ -97,6 +97,14 @@ SOFT_COOLDOWN = 60.0
 #: 积分耗尽不是瞬时错误：账号需要等用户补积分或活动到账，60 秒后重试
 #: 只会把同一个 400 再打一遍。给它一个更长的可恢复冷却，仍会自然解冻。
 CREDIT_COOLDOWN = 600.0
+#: 并发名额满时的最长等待（秒）。单账号并发上限默认 1，而客户端常常在同一
+#: 瞬间发出第二个请求（DSH 的自动标题请求就与首轮请求同时到达）。旧实现只
+#: 等约 100ms 就回「没有可用的 CodeArts 账号」，把一次几百毫秒的正常排队
+#: 说成了账号缺失，客户端把它当成配置错误、不会重试。这里改为在名额释放
+#: 前排队等待，等不到再回可重试的 429。10s 足够覆盖标题请求那 1~2s 的
+#: 占用；真被长请求占着时，继续等 20s 也未必能等到，不如早点回 429 让
+#: 客户端按退避重试。
+BUSY_WAIT_SECONDS = 10.0
 #: token 提前刷新窗口。
 REFRESH_SKEW = 1800.0
 #: OAuth 会话 TTL。
@@ -110,6 +118,7 @@ DEFAULTS = {
     "stream_timeout_seconds": 600.0,
     "models_ttl_seconds": 300.0,
     "max_concurrent": 1,
+    "busy_wait_seconds": BUSY_WAIT_SECONDS,
     "benefit_auto_claim": True,
     "credits_auto_claim": False,
 }
@@ -175,6 +184,15 @@ class CodeArtsUnavailable(CodeArtsError):
     pass
 
 
+class CodeArtsBusy(CodeArtsUnavailable):
+    """池里还有健康账号，只是并发名额暂时被别的请求占满。
+
+    与「一个账号都没有」必须分开：前者等一会儿就好，后者要用户去账号页
+    添加账号。客户端对两者的处理也不同（重试 vs 报配置错误）。
+    """
+    pass
+
+
 class CodeArtsAuthError(CodeArtsError):
     pass
 
@@ -232,6 +250,9 @@ def load_config(accounts_dir):
             60.0, 86400.0),
         "max_concurrent": _positive_int(
             raw.get("max_concurrent"), DEFAULTS["max_concurrent"], 1, 20),
+        "busy_wait_seconds": _positive_float(
+            raw.get("busy_wait_seconds"), DEFAULTS["busy_wait_seconds"],
+            0.0, 120.0),
         "benefit_auto_claim": raw.get("benefit_auto_claim", True) is not False,
         "credits_auto_claim": raw.get("credits_auto_claim", False) is True,
         "accounts_dir": accounts_dir,
@@ -271,6 +292,9 @@ def save_config(accounts_dir, patch):
             60.0, 86400.0)
         merged["max_concurrent"] = _positive_int(
             merged.get("max_concurrent"), DEFAULTS["max_concurrent"], 1, 20)
+        merged["busy_wait_seconds"] = _positive_float(
+            merged.get("busy_wait_seconds"), DEFAULTS["busy_wait_seconds"],
+            0.0, 120.0)
         merged["benefit_auto_claim"] = merged.get("benefit_auto_claim", True) is not False
         merged["credits_auto_claim"] = merged.get("credits_auto_claim", False) is True
         # 重新读 settings：`load_config` 只返回收敛后的 codearts 段，写回去要
@@ -588,6 +612,9 @@ class CodeArtsPool(object):
         self.config = dict(config)
         self.accounts = []
         self._lock = threading.RLock()
+        # 并发名额归还时唤醒等待中的请求。用独立的 Condition（不挂在
+        # `_lock` 上）避免 `release()` 在持有账号锁时再去抢池锁。
+        self._release_cond = threading.Condition()
         self.load()
 
     # ---- 持久化 ----
@@ -841,9 +868,41 @@ class CodeArtsPool(object):
             return True
 
     def release(self, acct):
+        released = False
         with acct._lock:
             if acct.active_concurrent > 0:
                 acct.active_concurrent -= 1
+                released = True
+        if released:
+            # 在账号锁外唤醒排队者：被唤醒的线程会立刻 `pick()`，那里要
+            # 遍历账号；持着 acct._lock 通知只会把唤醒拖到锁外，没有意义。
+            with self._release_cond:
+                self._release_cond.notify_all()
+
+    def wait_for_slot(self, timeout):
+        """等任一在飞请求归还名额；返回 True 表示被唤醒。
+
+        只当提示用：调用方醒来后必须重新 `pick()`，因为名额可能被另一个
+        等待者先抢走（也可能在进入 wait 前就已经归还）。
+        """
+        with self._release_cond:
+            return self._release_cond.wait(max(0.0, float(timeout)))
+
+    def busy_accounts(self, exclude=None, allowed_accounts=None):
+        """健康、允许使用、但并发名额已满的账号。
+
+        用来区分「账号池是空的/全在冷却」和「账号都在忙」：只有后者值得
+        排队等待。不看 `has_model()`，与 `pick()` 的兜底选号口径保持一致。
+        """
+        exclude = set(exclude or ())
+        now = time.time()
+        with self._lock:
+            accounts = list(self.accounts)
+        return [acct for acct in accounts
+                if acct.uid not in exclude
+                and (allowed_accounts is None or acct.uid in allowed_accounts)
+                and acct.healthy(now)
+                and acct.active_concurrent >= acct.max_concurrent]
 
     def note_success(self, acct):
         if acct.err_count or acct.cool_until or acct.last_error:
@@ -2224,8 +2283,27 @@ def _client_chat(acct, body, session_key):
     raise last_error or CodeArtsUpstreamError("CodeArts 并发会话已满")
 
 
+def _busy_wait_seconds(config):
+    """池内排队等待并发名额的上限（秒）。0 表示不等，立即回 429。"""
+    return _positive_float((config or {}).get("busy_wait_seconds"),
+                           BUSY_WAIT_SECONDS, 0.0, 120.0)
+
+
+def _busy_message(busy, waited):
+    names = "、".join(acct.nickname or acct.uid for acct in busy[:2])
+    return ("CodeArts 账号正忙：%s 的并发名额都被其它请求占用，"
+            "已等待 %.1fs；请稍后重试。" % (names, waited))
+
+
 def open_chat(config, body, session_key=None, allowed_accounts=None):
-    """选账号、续期、发现模型并打开 SSE；返回 (stream, account, model)。"""
+    """选账号、续期、发现模型并打开 SSE；返回 (stream, account, model)。
+
+    并发名额占满时在这里排队等待，而不是像旧实现那样只等约 100ms 就报
+    「没有可用的 CodeArts 账号」。单账号并发上限默认 1，而客户端往往在同一
+    瞬间发出第二个请求（DSH 的自动标题请求就与首轮请求同时到达）；把排队
+    说成账号缺失会让客户端把它当成配置错误，首轮直接失败——用户再发一次
+    「继续」时名额已经空出来，于是又正常了。
+    """
     if not config.get("enabled"):
         raise CodeArtsBadRequest(
             "CodeArts 出口未启用：请到设置页打开「启用 CodeArts 出口」。")
@@ -2234,13 +2312,27 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
     exclude = set()
     last_error = None
     attempts = max(2, len(pool.accounts) + 1)
+    wait_started = time.time()
+    wait_deadline = wait_started + _busy_wait_seconds(config)
     for _ in range(attempts):
-        acct = pool.pick(model, session_key=session_key, exclude=exclude,
-                         allowed_accounts=allowed_accounts)
+        acct = None
+        while True:
+            acct = pool.pick(model, session_key=session_key, exclude=exclude,
+                             allowed_accounts=allowed_accounts)
+            if acct is not None:
+                break
+            busy = pool.busy_accounts(exclude=exclude,
+                                      allowed_accounts=allowed_accounts)
+            if not busy:
+                # 池是空的 / 账号全被停用或冷却：排队也等不到名额。
+                break
+            remaining = wait_deadline - time.time()
+            if remaining <= 0:
+                raise CodeArtsBusy(
+                    _busy_message(busy, time.time() - wait_started))
+            # 上限 0.25s：即使 notify 丢了一次，也能很快重新检查名额。
+            pool.wait_for_slot(min(remaining, 0.25))
         if acct is None:
-            if pool.accounts and any(a.active_concurrent > 0 for a in pool.accounts):
-                time.sleep(0.05)
-                continue
             break
         if not pool.acquire(acct):
             exclude.add(acct.uid)

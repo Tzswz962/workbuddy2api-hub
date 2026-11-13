@@ -553,6 +553,90 @@ try:
     state.chat_error = None
     state.chat_error_remaining = -1
 
+    # 单账号并发上限 1 时，第二个请求必须排队等名额，而不是在约 100ms 内
+    # 被误报成「没有可用的 CodeArts 账号」并回 502（DSH 的自动标题请求与
+    # 首轮请求同时到达就是这个形态）。
+    print("== busy slot queue ==")
+    cfg_before = C.load_config(ACCOUNTS)
+    models_before = list(acct.models)
+    acct.models = [{"id": "GLM-5.2"}]
+    C.save_config(ACCOUNTS, {"max_concurrent": 1, "busy_wait_seconds": 2.0})
+    C.pool_for(ACCOUNTS)  # 让单例池按新配置刷新每个账号的 max_concurrent
+    check("busy test config", C.load_config(ACCOUNTS)["max_concurrent"] == 1)
+    check("busy test holds the only slot", pool.acquire(acct) is True)
+
+    class _HeldStream(object):
+        def __init__(self, owner):
+            self.owner = owner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+        def close(self):
+            self.owner.pool.release(self.owner)
+
+    def _fake_client(owner, body, session_key):
+        return _HeldStream(owner), body.get("model") or "GLM-5.2"
+
+    outcome = {}
+
+    def _queued_call():
+        started = time.time()
+        try:
+            stream, _owner, _mid = C.open_chat(
+                C.load_config(ACCOUNTS), {"model": "GLM-5.2"}, "sess-busy")
+            stream.close()
+            outcome["ok"] = True
+        except Exception as exc:  # noqa: BLE001 - report the type for the check
+            outcome["ok"] = False
+            outcome["error"] = exc
+        outcome["elapsed"] = time.time() - started
+
+    with mock.patch.object(C, "_client_chat", _fake_client), \
+            mock.patch.object(C, "_ensure_token", lambda owner: None), \
+            mock.patch.object(C, "ensure_models",
+                              lambda owner, force=False, timeout=20.0: []):
+        queued = threading.Thread(target=_queued_call)
+        queued.start()
+        time.sleep(0.4)
+        check("second request waits instead of failing fast", queued.is_alive())
+        pool.release(acct)
+        queued.join(5)
+        check("queued request runs after the slot frees",
+              outcome.get("ok") is True, outcome)
+        check("queued request really waited",
+              outcome.get("elapsed", 0) >= 0.3, outcome.get("elapsed"))
+
+        C.save_config(ACCOUNTS, {"busy_wait_seconds": 0.2})
+        C.pool_for(ACCOUNTS)
+        check("busy timeout config",
+              C.load_config(ACCOUNTS)["busy_wait_seconds"] == 0.2)
+        check("busy test holds the slot again", pool.acquire(acct) is True)
+        started = time.time()
+        try:
+            C.open_chat(C.load_config(ACCOUNTS), {"model": "GLM-5.2"},
+                        "sess-busy-timeout")
+            busy_error = None
+        except Exception as exc:  # noqa: BLE001
+            busy_error = exc
+        waited = time.time() - started
+        check("busy timeout raises CodeArtsBusy",
+              isinstance(busy_error, C.CodeArtsBusy),
+              type(busy_error).__name__)
+        check("busy timeout says busy, not missing",
+              "正忙" in str(busy_error)
+              and "添加并启用" not in str(busy_error), str(busy_error))
+        check("busy wait is bounded", waited >= 0.15, waited)
+        pool.release(acct)
+
+    C.save_config(ACCOUNTS, {"max_concurrent": cfg_before["max_concurrent"],
+                             "busy_wait_seconds": C.BUSY_WAIT_SECONDS})
+    acct.models = models_before
+
     print("== credit exhausted cooldown ==")
     credit_message = (
         "您的积分已耗尽，请关注活动积分领取活动或者[升级套餐]"

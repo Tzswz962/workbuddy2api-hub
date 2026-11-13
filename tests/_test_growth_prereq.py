@@ -67,14 +67,14 @@ class GrowthPrereqTests(unittest.TestCase):
     def setUp(self):
         self._orig = (T.fetch_growth_tasks, T.accept_tasks, T.claim_task,
                       T.report_events, T.do_cat_travel, T.do_buddy_open,
-                      T.run_miniprogram_tasks)
+                      T.run_miniprogram_tasks, T.run_campaign_tasks)
         self.events = []
         self.state = {"fb": 0, "cc": "not_accepted"}
 
     def tearDown(self):
         (T.fetch_growth_tasks, T.accept_tasks, T.claim_task,
          T.report_events, T.do_cat_travel, T.do_buddy_open,
-         T.run_miniprogram_tasks) = self._orig
+         T.run_miniprogram_tasks, T.run_campaign_tasks) = self._orig
 
     def _stub(self):
         def fetch(acc):
@@ -110,6 +110,8 @@ class GrowthPrereqTests(unittest.TestCase):
         T.do_cat_travel = lambda acc: {"ok": True, "msg": "ok"}
         T.do_buddy_open = lambda acc: {"ok": True, "action": "open",
                                        "msg": "unexpected"}
+        T.run_campaign_tasks = lambda acc, claim=True: {
+            "ok": True, "logs": [], "earned_credit": 0, "available": 0}
 
     def test_auto_task_completed_and_claimed_before_accept(self):
         self._stub()
@@ -342,6 +344,318 @@ class GrowthPrereqTests(unittest.TestCase):
         self.assertEqual(events[0]["id"], "ex_xQHHD1u5Jkua")
         self.assertEqual(events[0]["name"], "无畏契约拼豆专家")
         self.assertEqual(earned, 100)
+
+    def test_skill_share_reports_only_after_real_channel_and_progress(self):
+        """分享任务必须先建真实渠道，事件上报后再回读进度才领奖。"""
+        calls = []
+        state = {"channel": False, "reported": False, "fetches": 0}
+
+        def fake_urlopen(req, timeout=20, proxy=""):
+            calls.append(("http", req.full_url))
+            if req.full_url == T.SKILL_MARKET_URL:
+                return _Resp({"code": 0, "data": {"skills": [{
+                    "skill_id": "skill-test-1",
+                    "display_name_zh": "测试技能",
+                    "description_zh": "用于测试",
+                }]}})
+            if req.full_url == T.SKILL_SHARE_CHANNEL_URL:
+                body = json.loads(req.data.decode("utf-8"))
+                self.assertEqual(body["asset_kind"], "skill")
+                self.assertEqual(json.loads(body["asset_ref"])["asset_id"],
+                                 "skill-test-1")
+                state["channel"] = True
+                return _Resp({"code": 0, "data": {
+                    "share_code": "share-1",
+                    "channel_id": "channel-1",
+                    "ways": [{"share_way": "link",
+                              "resource_ref": "https://example.test/share"}],
+                }})
+            raise AssertionError(req.full_url)
+
+        def fake_fetch(acc):
+            if not state["reported"]:
+                return [_task("skill_share", status="accepted")]
+            state["fetches"] += 1
+            calls.append(("fetch", state["fetches"]))
+            if state["fetches"] == 1:
+                return [_task("skill_share", status="accepted", current=0)]
+            return [_task("skill_share", status="completed", current=1)]
+
+        def fake_report(acc, events):
+            self.assertTrue(state["channel"], "渠道创建前不得上报分享事件")
+            state["reported"] = True
+            calls.append(("report", events))
+            return True
+
+        def fake_claim(acc, code):
+            self.assertTrue(state["reported"])
+            self.assertGreaterEqual(state["fetches"], 2)
+            calls.append(("claim", code))
+            return {"ok": True, "credit": 100}
+
+        original = (T._accounts.urlopen, T.fetch_growth_tasks,
+                    T._report_desktop_events, T.claim_task, T.time.sleep,
+                    T.SKILL_SHARE_POLL_GAP)
+        T._accounts.urlopen = fake_urlopen
+        T.fetch_growth_tasks = fake_fetch
+        T._report_desktop_events = fake_report
+        T.claim_task = fake_claim
+        T.time.sleep = lambda _seconds: None
+        T.SKILL_SHARE_POLL_GAP = 0
+        try:
+            earned = T._progress_one(
+                FakeAccount(), _task("skill_share", status="accepted"),
+                [], 0)
+        finally:
+            (T._accounts.urlopen, T.fetch_growth_tasks,
+             T._report_desktop_events, T.claim_task, T.time.sleep,
+             T.SKILL_SHARE_POLL_GAP) = original
+
+        self.assertEqual(earned, 100)
+        events = next(value for kind, value in calls if kind == "report")
+        self.assertEqual([e["panelAction"] for e in events],
+                         ["click", "success"])
+        self.assertTrue(all(e["eventCode"] == "skill_share_channel_action"
+                            for e in events))
+        kinds = [kind for kind, _value in calls]
+        self.assertLess(kinds.index("report"), kinds.index("claim"))
+
+    def test_skill_share_without_link_does_not_report_or_claim(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=20, proxy=""):
+            if req.full_url == T.SKILL_MARKET_URL:
+                return _Resp({"code": 0, "data": {"skills": [{
+                    "skill_id": "skill-test-1", "display_name_zh": "测试技能",
+                }]}})
+            if req.full_url == T.SKILL_SHARE_CHANNEL_URL:
+                return _Resp({"code": 0, "data": {
+                    "share_code": "share-1",
+                    "ways": [{"share_way": "link", "resource_ref": ""}],
+                }})
+            raise AssertionError(req.full_url)
+
+        original = (T._accounts.urlopen, T._report_desktop_events,
+                    T.claim_task)
+        T._accounts.urlopen = fake_urlopen
+        T._report_desktop_events = lambda acc, events: calls.append("report")
+        T.claim_task = lambda acc, code: calls.append("claim")
+        try:
+            earned = T._progress_one(
+                FakeAccount(), _task("skill_share", status="accepted"),
+                [], 0)
+        finally:
+            (T._accounts.urlopen, T._report_desktop_events,
+             T.claim_task) = original
+        self.assertEqual(earned, 0)
+        self.assertEqual(calls, [])
+
+    def test_template_uses_server_scene_and_four_event_group(self):
+        calls = []
+        state = {"progress": 0}
+
+        def fake_urlopen(req, timeout=20, proxy=""):
+            if req.full_url == T.TEMPLATE_SCENES_URL:
+                return _Resp({"code": 0, "data": {"scenes": [
+                    {"id": "42", "name": "服务端场景A"},
+                    {"id": "43", "name": "服务端场景B"},
+                    {"id": "44", "name": "服务端场景C"},
+                    {"id": "45", "name": "服务端场景D"},
+                    {"id": "46", "name": "服务端场景E"},
+                ]}})
+            raise AssertionError(req.full_url)
+
+        def fake_fetch(acc):
+            status = "completed" if state["progress"] >= 5 else "accepted"
+            return [_task("template_5", status=status,
+                          current=state["progress"], target=5)]
+
+        def fake_report(acc, events):
+            calls.append(events)
+            state["progress"] += 1
+            return True
+
+        def fake_claim(acc, code):
+            self.assertEqual(state["progress"], 5)
+            calls.append("claim")
+            return {"ok": True, "credit": 200}
+
+        original = (T._accounts.urlopen, T.fetch_growth_tasks,
+                    T._report_desktop_events, T.claim_task, T.time.sleep,
+                    T.TEMPLATE_POLL_GAP)
+        T._accounts.urlopen = fake_urlopen
+        T.fetch_growth_tasks = fake_fetch
+        T._report_desktop_events = fake_report
+        T.claim_task = fake_claim
+        T.time.sleep = lambda _seconds: None
+        T.TEMPLATE_POLL_GAP = 0
+        try:
+            earned = T._progress_one(
+                FakeAccount(), _task("template_5", status="accepted",
+                                     target=5), [], 0)
+        finally:
+            (T._accounts.urlopen, T.fetch_growth_tasks,
+             T._report_desktop_events, T.claim_task, T.time.sleep,
+             T.TEMPLATE_POLL_GAP) = original
+
+        self.assertEqual(earned, 200)
+        groups = [value for value in calls if isinstance(value, list)]
+        self.assertEqual(len(groups), 5)
+        self.assertEqual([e["eventCode"] for e in groups[0]], [
+            "agent_task_created",
+            "agent_task_created_with_template",
+            "template_used",
+            "playbook_prompt_send",
+        ])
+        self.assertEqual(groups[0][0]["template_id"], "42")
+        self.assertEqual(groups[1][1]["templateId"], "43")
+        self.assertEqual(calls[-1], "claim")
+
+    def test_template_waits_for_server_progress_before_claim(self):
+        calls = []
+        state = {"fetch": 0, "reported": False}
+
+        def fake_urlopen(req, timeout=20, proxy=""):
+            if req.full_url == T.TEMPLATE_SCENES_URL:
+                return _Resp({"code": 0, "data": {"scenes": [
+                    {"id": "42", "name": "服务端场景A"},
+                ]}})
+            raise AssertionError(req.full_url)
+
+        def fake_fetch(acc):
+            if not state["reported"]:
+                return [_task("template_5", status="accepted",
+                              current=0, target=1)]
+            state["fetch"] += 1
+            calls.append(("fetch", state["fetch"]))
+            status = "completed" if state["fetch"] >= 2 else "accepted"
+            current = 1 if state["fetch"] >= 2 else 0
+            return [_task("template_5", status=status,
+                          current=current, target=1)]
+
+        def fake_report(acc, events):
+            state["reported"] = True
+            calls.append(("report", None))
+            return True
+
+        def fake_claim(acc, code):
+            self.assertGreaterEqual(state["fetch"], 2)
+            calls.append(("claim", code))
+            return {"ok": True, "credit": 200}
+
+        original = (T._accounts.urlopen, T.fetch_growth_tasks,
+                    T._report_desktop_events, T.claim_task, T.time.sleep,
+                    T.TEMPLATE_POLL_GAP)
+        T._accounts.urlopen = fake_urlopen
+        T.fetch_growth_tasks = fake_fetch
+        T._report_desktop_events = fake_report
+        T.claim_task = fake_claim
+        T.time.sleep = lambda _seconds: None
+        T.TEMPLATE_POLL_GAP = 0
+        try:
+            earned = T._progress_one(
+                FakeAccount(), _task("template_5", status="accepted",
+                                     current=0, target=1), [], 0)
+        finally:
+            (T._accounts.urlopen, T.fetch_growth_tasks,
+             T._report_desktop_events, T.claim_task, T.time.sleep,
+             T.TEMPLATE_POLL_GAP) = original
+
+        self.assertEqual(earned, 200)
+        self.assertEqual([kind for kind, _value in calls],
+                         ["report", "fetch", "fetch", "claim"])
+
+    def test_template_stops_when_server_progress_does_not_advance(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=20, proxy=""):
+            if req.full_url == T.TEMPLATE_SCENES_URL:
+                return _Resp({"code": 0, "data": {"scenes": [
+                    {"id": "42", "name": "服务端场景A"},
+                    {"id": "43", "name": "服务端场景B"},
+                ]}})
+            raise AssertionError(req.full_url)
+
+        def fake_fetch(acc):
+            return [_task("template_5", status="accepted",
+                          current=0, target=5)]
+
+        def fake_report(acc, events):
+            calls.append(events)
+            return True
+
+        original = (T._accounts.urlopen, T.fetch_growth_tasks,
+                    T._report_desktop_events, T.claim_task, T.time.sleep,
+                    T.TEMPLATE_POLL_TRIES, T.TEMPLATE_POLL_GAP)
+        T._accounts.urlopen = fake_urlopen
+        T.fetch_growth_tasks = fake_fetch
+        T._report_desktop_events = fake_report
+        T.claim_task = lambda acc, code: calls.append("claim")
+        T.time.sleep = lambda _seconds: None
+        T.TEMPLATE_POLL_TRIES = 1
+        T.TEMPLATE_POLL_GAP = 0
+        logs = []
+        try:
+            earned = T._progress_one(
+                FakeAccount(), _task("template_5", status="accepted",
+                                     target=5), logs, 0)
+        finally:
+            (T._accounts.urlopen, T.fetch_growth_tasks,
+             T._report_desktop_events, T.claim_task, T.time.sleep,
+             T.TEMPLATE_POLL_TRIES, T.TEMPLATE_POLL_GAP) = original
+
+        self.assertEqual(earned, 0)
+        self.assertEqual(len(calls), 1, "进度未增长时不得继续滥发事件")
+        self.assertNotIn("claim", calls)
+        self.assertTrue(any("未增长" in line for line in logs))
+
+    def test_template_jumps_by_multiple_slots_without_overreporting(self):
+        calls = []
+        state = {"progress": 0}
+
+        def fake_urlopen(req, timeout=20, proxy=""):
+            if req.full_url == T.TEMPLATE_SCENES_URL:
+                return _Resp({"code": 0, "data": {"scenes": [
+                    {"id": "42", "name": "服务端场景A"},
+                    {"id": "43", "name": "服务端场景B"},
+                    {"id": "44", "name": "服务端场景C"},
+                ]}})
+            raise AssertionError(req.full_url)
+
+        def fake_fetch(acc):
+            return [_task("template_5", status="accepted",
+                          current=state["progress"], target=5)]
+
+        def fake_report(acc, events):
+            calls.append(events)
+            # Simulate one event group advancing two server slots.
+            state["progress"] += 2
+            return True
+
+        original = (T._accounts.urlopen, T.fetch_growth_tasks,
+                    T._report_desktop_events, T.claim_task, T.time.sleep,
+                    T.TEMPLATE_POLL_TRIES, T.TEMPLATE_POLL_GAP)
+        T._accounts.urlopen = fake_urlopen
+        T.fetch_growth_tasks = fake_fetch
+        T._report_desktop_events = fake_report
+        T.claim_task = lambda acc, code: {"ok": True, "credit": 200}
+        T.time.sleep = lambda _seconds: None
+        T.TEMPLATE_POLL_TRIES = 1
+        T.TEMPLATE_POLL_GAP = 0
+        try:
+            earned = T._progress_one(
+                FakeAccount(), _task("template_5", status="accepted",
+                                     target=5), [], 0)
+        finally:
+            (T._accounts.urlopen, T.fetch_growth_tasks,
+             T._report_desktop_events, T.claim_task, T.time.sleep,
+             T.TEMPLATE_POLL_TRIES, T.TEMPLATE_POLL_GAP) = original
+
+        self.assertEqual(earned, 200)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][0]["template_id"], "42")
+        self.assertEqual(calls[1][0]["template_id"], "44")
+        self.assertEqual(calls[2][0]["template_id"], "43")
 
 
     def test_new_task_specs_registered(self):

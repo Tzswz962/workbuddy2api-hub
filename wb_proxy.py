@@ -30,6 +30,7 @@ from collections import deque
 import re
 import atexit
 import json
+import math
 import os
 import queue
 import random
@@ -7622,18 +7623,6 @@ def task_progress_entry(uid):
     return entry
 
 
-def credits_remain_of(account):
-    """账号缓存的剩余积分；没有这份数据就返回 None（不是 0）。"""
-    credits = getattr(account, "credits", None)
-    if not isinstance(credits, dict):
-        return None
-    value = credits.get("remain")
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 # ---- 进度落盘 ----
 # 只放内存的话，蓝绿发布会把一百多个账号的进度清零，下一次开面板又要逐个问
 # 上游。这里存成 `usage/task-progress.json`（发布用的 rsync 已排除 usage/），
@@ -14880,6 +14869,95 @@ _SCHEMA_TYPE_MAP = {
 }
 _SCHEMA_VALID_TYPES = {"string", "number", "integer", "boolean", "array", "object", "null"}
 
+# Keyword shapes the upstream Go validator rejects outright with code 11129.
+# Verified one construct at a time against copilot.tencent.com: each of these
+# alone yields 400/11129, and everything else in the list below still passes.
+_SCHEMA_NUMERIC_KEYS = (
+    "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+    "multipleOf", "minLength", "maxLength", "minItems", "maxItems",
+    "minProperties", "maxProperties",
+)
+_SCHEMA_BOOLEAN_KEYS = ("uniqueItems", "deprecated", "readOnly", "writeOnly")
+_SCHEMA_STRING_KEYS = ("description", "title", "format", "pattern")
+
+
+def _coerce_schema_number(value):
+    """Numbers only. Numeric strings are converted; anything else is dropped."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(num):
+            return None
+        return int(num) if num.is_integer() else num
+    return None
+
+
+def _coerce_schema_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
+
+
+def _harden_schema_keywords(s):
+    """Make every keyword's value type acceptable to the upstream validator.
+
+    Steps 1-8 of `_deep_normalize_schema` repair `type`, `properties`,
+    `required` and `items`; they leave the constraint keywords untouched, so a
+    client that serializes numbers as strings reaches the upstream unchanged and
+    the whole request is rejected (code 11129).
+    """
+    for key in _SCHEMA_NUMERIC_KEYS:
+        if key not in s:
+            continue
+        num = _coerce_schema_number(s[key])
+        if num is None:
+            s.pop(key, None)
+        else:
+            s[key] = num
+    for key in _SCHEMA_BOOLEAN_KEYS:
+        if key not in s:
+            continue
+        flag = _coerce_schema_bool(s[key])
+        if flag is None:
+            s.pop(key, None)
+        else:
+            s[key] = flag
+    for key in _SCHEMA_STRING_KEYS:
+        if key not in s:
+            continue
+        value = s[key]
+        if value is None:
+            s.pop(key, None)
+        elif not isinstance(value, str):
+            s[key] = str(value)
+    # additionalProperties is a bool or a nested schema, never a string
+    if "additionalProperties" in s:
+        extra = s["additionalProperties"]
+        if isinstance(extra, dict):
+            _deep_normalize_schema(extra)
+        else:
+            flag = _coerce_schema_bool(extra)
+            if flag is None:
+                s.pop("additionalProperties", None)
+            else:
+                s["additionalProperties"] = flag
+    if "enum" in s and not isinstance(s["enum"], list):
+        s.pop("enum", None)
+    if "examples" in s and not isinstance(s["examples"], list):
+        s.pop("examples", None)
+    # no keyword ever means "null"; the upstream rejects the request outright
+    for key in [k for k, v in s.items() if v is None]:
+        s.pop(key, None)
+    return s
+
 
 def _deep_normalize_schema(s):
     """Recursively clean and normalize JSON Schema for upstream Go validator."""
@@ -14962,6 +15040,7 @@ def _deep_normalize_schema(s):
                 if isinstance(sub, dict):
                     _deep_normalize_schema(sub)
 
+    _harden_schema_keywords(s)
     return s
 
 
@@ -14996,6 +15075,8 @@ def _normalize_tool_parameters(fn):
         p["properties"] = {}
     _deep_normalize_schema(p)
     fn["parameters"] = p
+    if fn.get("description") is not None and not isinstance(fn["description"], str):
+        fn["description"] = str(fn["description"])
 
 
 def normalize_tools(obj):
@@ -28086,6 +28167,7 @@ class Handler(BaseHTTPRequestHandler):
         """把 CodeArts 异常落一条用量行，再回一个可读的 OpenAI 错误。"""
         elapsed = int((time.time() - t_start) * 1000)
         err_type = "invalid_request_error"
+        reset_at = None
         if isinstance(exc, wb_codearts.CodeArtsBadRequest):
             status = 400
         elif isinstance(exc, wb_codearts.CodeArtsAuthError):
@@ -28094,13 +28176,19 @@ class Handler(BaseHTTPRequestHandler):
             status = 409
         elif isinstance(exc, wb_codearts.CodeArtsConflict):
             status = 409
+        elif isinstance(exc, wb_codearts.CodeArtsBusy):
+            # 账号都在忙，不是「没有账号」这种配置错误：429 + reset_at 让
+            # 客户端（DSH 的 retryPolicy 会据此重试）短暂退避，而不是把整轮
+            # 运行判死。
+            status, err_type = 429, "rate_limit_error"
+            reset_at = time.time() + 2
         elif isinstance(exc, wb_codearts.CodeArtsError) and exc.status == 429:
             status, err_type = 429, "rate_limit_error"
         else:
             status = 502
         record_error(model, status, str(exc)[:200], elapsed_ms=elapsed,
                      realm=realm, key=self._key_id())
-        return self._error(status, str(exc), err_type)
+        return self._error(status, str(exc), err_type, reset_at=reset_at)
 
     def _handle_codearts_chat(self, payload, session_key, realm):
         """`/v1/chat/completions` 的 CodeArts 分支。"""
@@ -28149,11 +28237,15 @@ class Handler(BaseHTTPRequestHandler):
                 realm="codearts", effort=effort, allow_web_tools=False)
 
     def _codearts_anthropic_error(self, model, exc, t_start, realm):
+        reset_at = None
         if isinstance(exc, wb_codearts.CodeArtsBadRequest):
             status, etype = 400, "invalid_request_error"
         elif isinstance(exc, (wb_codearts.CodeArtsNotFound,
                               wb_codearts.CodeArtsConflict)):
             status, etype = 409, "invalid_request_error"
+        elif isinstance(exc, wb_codearts.CodeArtsBusy):
+            status, etype = 429, "rate_limit_error"
+            reset_at = time.time() + 2
         elif isinstance(exc, wb_codearts.CodeArtsError) and exc.status == 429:
             status, etype = 429, "rate_limit_error"
         else:
@@ -28161,7 +28253,7 @@ class Handler(BaseHTTPRequestHandler):
         record_error(model, status, str(exc)[:200],
                      elapsed_ms=int((time.time() - t_start) * 1000),
                      realm=realm, key=self._key_id())
-        return self._anthropic_error(status, str(exc), etype)
+        return self._anthropic_error(status, str(exc), etype, reset_at=reset_at)
 
     def _handle_codearts_messages(self, chat_req, session_key, model, want_stream,
                                   fp, t_start):
@@ -28457,89 +28549,6 @@ class Handler(BaseHTTPRequestHandler):
                      fp=fp, account=account.uid, realm=realm,
                      key=self._key_id(), effort=effort)
         return self._json(200, result)
-
-# ---------------------------------------------------------------------------
-# Per-key concurrency tracking (#359)
-# ---------------------------------------------------------------------------
-_key_active_concurrency = {}
-_key_concurrency_lock = threading.Lock()
-# 补丁：per-key 并发排队用的信号量。上游只在超限时直接拒绝，客户端会瞬间拿到
-# 429；这里改成有界等待，和用户批准的行为对齐（WB_CHAT_SLOT_WAIT 秒后仍未
-# 拿到才拒绝）。字典按 key id 懒创建，信号量初值在首次拿到 limit 时绑定。
-_key_semaphores = {}
-_key_semaphore_lock = threading.Lock()
-
-def _acquire_key_slot(key_entry):
-    """Try to acquire a concurrency slot for key_entry. Returns (ok, current, limit).
-
-    补丁：并发占满时不再立即返回 False（客户端会瞬间吃到 429），改用有界信号量
-    排队，最多等 CHAT_SLOT_WAIT_SECONDS 秒。limit 变化时按新值重建信号量。
-    """
-    if not isinstance(key_entry, dict):
-        return True, 0, 0
-    k_id = key_entry.get("id")
-    if not k_id:
-        return True, 0, 0
-    limit = int(key_entry.get("concurrency_limit") or 0)
-    if limit <= 0:
-        return True, 0, 0
-    with _key_concurrency_lock:
-        current = _key_active_concurrency.get(k_id, 0)
-    with _key_semaphore_lock:
-        entry = _key_semaphores.get(k_id)
-        if entry is None or entry[0] != limit:
-            if entry is not None:
-                # limit 被改小：按已占用的数量初始化，避免凭空多出配额
-                sem = threading.BoundedSemaphore(max(1, limit))
-                for _ in range(min(current, limit)):
-                    try:
-                        sem.acquire(blocking=False)
-                    except Exception:
-                        pass
-            else:
-                sem = threading.BoundedSemaphore(max(1, limit))
-                for _ in range(current):
-                    try:
-                        sem.acquire(blocking=False)
-                    except Exception:
-                        pass
-            entry = [limit, sem]
-            _key_semaphores[k_id] = entry
-        sem = entry[1]
-    acquired = sem.acquire(timeout=CHAT_SLOT_WAIT_SECONDS)
-    with _key_concurrency_lock:
-        if acquired:
-            _key_active_concurrency[k_id] = _key_active_concurrency.get(k_id, 0) + 1
-            return True, _key_active_concurrency[k_id], limit
-        return False, _key_active_concurrency.get(k_id, 0), limit
-
-def _release_key_slot(key_entry):
-    """Release a concurrency slot for key_entry.（补丁：同时归还信号量）"""
-    if not isinstance(key_entry, dict):
-        return
-    k_id = key_entry.get("id")
-    if not k_id:
-        return
-    limit = int(key_entry.get("concurrency_limit") or 0)
-    if limit <= 0:
-        return
-    with _key_concurrency_lock:
-        current = _key_active_concurrency.get(k_id, 0)
-        if current > 1:
-            _key_active_concurrency[k_id] = current - 1
-        else:
-            _key_active_concurrency.pop(k_id, None)
-    with _key_semaphore_lock:
-        entry = _key_semaphores.get(k_id)
-        sem = entry[1] if entry else None
-    if sem is not None:
-        try:
-            sem.release()
-        except ValueError:
-            # 释放次数超过初值（limit 被调小过），忽略即可，不能让异常打断请求收尾
-            pass
-
-
 
 def running_version():
     """The version this process reports, e.g. "1.6.19".

@@ -264,5 +264,117 @@ check("bare_tool type set to function", obj["tools"][0].get("type") == "function
 check("bare_tool parameters normalized", obj["tools"][0]["function"]["parameters"].get("properties") == {}, obj)
 
 print()
+print("[14] Constraint keywords sent as strings are coerced (code 11129)")
+fn = {"name": "t14", "parameters": {"type": "object", "properties": {
+    "n": {"type": "integer", "minimum": "1", "maximum": "10"},
+    "s": {"type": "string", "minLength": "1", "maxLength": "9"},
+    "a": {"type": "array", "items": {"type": "string"},
+          "minItems": "1", "maxItems": "5"},
+    "f": {"type": "number", "exclusiveMinimum": "0",
+          "exclusiveMaximum": "1", "multipleOf": "2"},
+    "g": {"type": "number", "minimum": "1.5"},
+}}}
+P._normalize_tool_parameters(fn)
+props = fn["parameters"]["properties"]
+check("minimum '1' -> 1", props["n"].get("minimum") == 1, props["n"])
+check("maximum '10' -> 10", props["n"].get("maximum") == 10, props["n"])
+check("minLength '1' -> 1", props["s"].get("minLength") == 1, props["s"])
+check("maxLength '9' -> 9", props["s"].get("maxLength") == 9, props["s"])
+check("minItems '1' -> 1", props["a"].get("minItems") == 1, props["a"])
+check("maxItems '5' -> 5", props["a"].get("maxItems") == 5, props["a"])
+check("exclusiveMinimum '0' -> 0", props["f"].get("exclusiveMinimum") == 0, props["f"])
+check("exclusiveMaximum '1' -> 1", props["f"].get("exclusiveMaximum") == 1, props["f"])
+check("multipleOf '2' -> 2", props["f"].get("multipleOf") == 2, props["f"])
+check("fractional string keeps its fraction", props["g"].get("minimum") == 1.5, props["g"])
+check("integer stays integer, not float",
+      isinstance(props["n"].get("minimum"), int), props["n"])
+
+print()
+print("[15] Unparseable numbers dropped; boolean keywords coerced")
+fn = {"name": "t15", "parameters": {"type": "object", "properties": {
+    "a": {"type": "integer", "minimum": "abc"},
+    "b": {"type": "string", "maxLength": None},
+    "c": {"type": "array", "items": {"type": "string"}, "uniqueItems": "true"},
+    "d": {"type": "string", "deprecated": "false"},
+}}}
+fn["parameters"]["additionalProperties"] = "false"
+P._normalize_tool_parameters(fn)
+props = fn["parameters"]["properties"]
+check("minimum 'abc' dropped", "minimum" not in props["a"], props["a"])
+check("maxLength None dropped", "maxLength" not in props["b"], props["b"])
+check("uniqueItems 'true' -> True", props["c"].get("uniqueItems") is True, props["c"])
+check("deprecated 'false' -> False", props["d"].get("deprecated") is False, props["d"])
+check("additionalProperties 'false' -> False",
+      fn["parameters"].get("additionalProperties") is False, fn["parameters"])
+
+fn = {"name": "t15b", "parameters": {"type": "object", "properties": {
+    "a": {"type": "number", "minimum": "NaN"},
+    "b": {"type": "number", "maximum": "Infinity"},
+    "c": {"type": "number", "multipleOf": float("inf")},
+}}}
+P._normalize_tool_parameters(fn)
+props = fn["parameters"]["properties"]
+check("NaN string dropped", "minimum" not in props["a"], props["a"])
+check("Infinity string dropped", "maximum" not in props["b"], props["b"])
+check("infinite float dropped", "multipleOf" not in props["c"], props["c"])
+
+print()
+print("[16] enum / examples / string keywords")
+fn = {"name": "t16", "parameters": {"type": "object", "properties": {
+    "a": {"type": "string", "enum": "x"},
+    "b": {"type": "string", "examples": None},
+    "c": {"type": "string", "examples": ["x"]},
+    "d": {"type": "string", "description": 5},
+    "e": {"type": "string", "title": None},
+    "f": {"type": "string", "format": 1},
+}}}
+P._normalize_tool_parameters(fn)
+props = fn["parameters"]["properties"]
+check("enum not a list dropped", "enum" not in props["a"], props["a"])
+check("examples None dropped", "examples" not in props["b"], props["b"])
+check("examples list kept", props["c"].get("examples") == ["x"], props["c"])
+check("description 5 -> '5'", props["d"].get("description") == "5", props["d"])
+check("title None dropped", "title" not in props["e"], props["e"])
+check("format 1 -> '1'", props["f"].get("format") == "1", props["f"])
+
+fn = {"name": "t16b", "description": 7, "parameters": {"type": "object"}}
+P._normalize_tool_parameters(fn)
+check("tool description 7 -> '7'", fn.get("description") == "7", fn)
+
+print()
+print("[17] Nested levels are hardened too")
+fn = {"name": "t17", "parameters": {"type": "object", "properties": {
+    "a": {"type": "string", "default": None},
+    "outer": {"type": "object", "properties": {
+        "inner": {"type": "array", "minItems": "2",
+                  "items": {"type": "object", "properties": {
+                      "n": {"type": "integer", "minimum": "0",
+                            "examples": None}}}}}},
+}}}
+P._normalize_tool_parameters(fn)
+props = fn["parameters"]["properties"]
+check("default None dropped (step 1 already did this)",
+      "default" not in props["a"], props["a"])
+deep = props["outer"]["properties"]["inner"]
+check("nested minItems '2' -> 2", deep.get("minItems") == 2, deep)
+deep_item = deep["items"]["properties"]["n"]
+check("nested minimum '0' -> 0", deep_item.get("minimum") == 0, deep_item)
+check("nested examples None dropped", "examples" not in deep_item, deep_item)
+
+print()
+print("[18] Normalization is idempotent and leaves a valid schema untouched")
+fn = {"name": "t18", "parameters": {"type": "object", "properties": {
+    "city": {"type": "string", "description": "city", "minLength": 1},
+    "days": {"type": "integer", "minimum": 1, "maximum": 7, "default": 3},
+}, "required": ["city"]}}
+P._normalize_tool_parameters(fn)
+first = repr(fn["parameters"])
+P._normalize_tool_parameters(fn)
+check("second pass changes nothing", repr(fn["parameters"]) == first, fn["parameters"])
+check("numeric minimum untouched", fn["parameters"]["properties"]["days"]["minimum"] == 1, fn)
+check("default 3 untouched", fn["parameters"]["properties"]["days"]["default"] == 3, fn)
+check("required untouched", fn["parameters"]["required"] == ["city"], fn)
+
+print()
 print("SUMMARY: PASS=%d FAIL=%d" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)
